@@ -20,13 +20,14 @@
 #include <string>
 #include <thread>
 
-#include "xenia/base/wake_generation.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/wake_generation.h"
+#include "xenia/emulator.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/packet_disassembler.h"
@@ -40,7 +41,6 @@
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
-#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
@@ -62,12 +62,13 @@ DEFINE_bool(
     "1.3 or VK_KHR_dynamic_rendering extension support.",
     "Vulkan");
 
-DEFINE_bool(vulkan_tight_render_area, false,
-            "Shrink each guest render pass's render area to the union of its "
-            "draw scissors (origin kept, 64 px) instead of the whole EDRAM-height "
-            "surface. On tile-based GPUs this cuts the tiles each pass loads, "
-            "stores and replays its draws over.",
-            "Vulkan");
+DEFINE_bool(
+    vulkan_tight_render_area, false,
+    "Shrink each guest render pass's render area to the union of its "
+    "draw scissors (origin kept, 64 px) instead of the whole EDRAM-height "
+    "surface. On tile-based GPUs this cuts the tiles each pass loads, "
+    "stores and replays its draws over.",
+    "Vulkan");
 
 DEFINE_uint32(vulkan_gpu_stall_report_ms, 100,
               "XDroid360: when the oldest pending submission is still running "
@@ -2210,26 +2211,26 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 #else
     localtime_r(&wall_seconds, &wall_local);
 #endif
-    const uint32_t wall_ms = uint32_t(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            wall_now.time_since_epoch())
-            .count() %
-        1000);
+    const uint32_t wall_ms =
+        uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     wall_now.time_since_epoch())
+                     .count() %
+                 1000);
     XELOGI(
         "Frame stats: fps={:.1f} frame_us p50={} p95={} max={} "
-        "gpu_busy_us/frame={} passes/frame={} cmdbufs/frame={} vblank_hz={:.1f} "
+        "gpu_busy_us/frame={} passes/frame={} cmdbufs/frame={} "
+        "vblank_hz={:.1f} "
         "wall={:02}:{:02}:{:02}.{:03}",
         wall_us ? n * 1e6 / double(wall_us) : 0.0, n ? sorted[n / 2] : 0,
         n ? sorted[n * 95 / 100] : 0, n ? sorted[n - 1] : 0,
-        gpu_busy_us / frames, render_passes / frames,
-        command_buffers / frames,
+        gpu_busy_us / frames, render_passes / frames, command_buffers / frames,
         wall_us ? vblanks * 1e6 / double(wall_us) : 0.0, wall_local.tm_hour,
         wall_local.tm_min, wall_local.tm_sec, wall_ms);
     // GE-0: why passes ended, per frame, to choose between the pass-merging
     // items (texture-load/upload splice, barrier hoist, resolve folding).
     static constexpr const char* kPassEndReasonNames[] = {
-        "other", "rt", "barrier", "texload", "upload", "resolve",
-        "transfer", "readback", "query", "swap", "submit"};
+        "other",    "rt",       "barrier", "texload", "upload", "resolve",
+        "transfer", "readback", "query",   "swap",    "submit"};
     static_assert(std::size(kPassEndReasonNames) ==
                   size_t(PassEndReason::kCount));
     std::string pass_ends_line;
@@ -2505,8 +2506,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
             };
             if (use_pwl_gamma_ramp) {
               // output = base + fraction * delta per segment; remap both ends.
-              auto pwl =
-                  reinterpret_cast<reg::DC_LUT_PWL_DATA*>(gamma_ramp_frame_upload);
+              auto pwl = reinterpret_cast<reg::DC_LUT_PWL_DATA*>(
+                  gamma_ramp_frame_upload);
               for (size_t i = 0; i < 128 * 3; ++i) {
                 uint32_t base = pwl[i].base >> 6;
                 uint32_t end = std::min(base + (pwl[i].delta >> 6), 1023u);
@@ -2516,8 +2517,8 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 pwl[i].delta = (new_end - new_base) << 6;
               }
             } else {
-              auto table =
-                  reinterpret_cast<reg::DC_LUT_30_COLOR*>(gamma_ramp_frame_upload);
+              auto table = reinterpret_cast<reg::DC_LUT_30_COLOR*>(
+                  gamma_ramp_frame_upload);
               for (size_t i = 0; i < 256; ++i) {
                 table[i].color_10_red = tone10(table[i].color_10_red);
                 table[i].color_10_green = tone10(table[i].color_10_green);
@@ -2881,11 +2882,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         PushImageMemoryBarrier(
             vulkan_context.image(),
             ui::vulkan::util::InitializeSubresourceRange(),
-            glitch_captured ? VkPipelineStageFlags(
-                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT)
-                            : VkPipelineStageFlags(
-                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
+            glitch_captured
+                ? VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT)
+                : VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
             ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
             VK_ACCESS_SHADER_WRITE_BIT,
             ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
@@ -3346,10 +3346,12 @@ void VulkanCommandProcessor::EndRenderPass() {
       constexpr int32_t kAlign = 64;
       int32_t x0 = 0;
       int32_t y0 = 0;
-      int32_t x1 = std::min<int32_t>(int32_t(tight_area_extent_.width),
-                                     (tight_area_x1_ + kAlign - 1) & ~(kAlign - 1));
-      int32_t y1 = std::min<int32_t>(int32_t(tight_area_extent_.height),
-                                     (tight_area_y1_ + kAlign - 1) & ~(kAlign - 1));
+      int32_t x1 =
+          std::min<int32_t>(int32_t(tight_area_extent_.width),
+                            (tight_area_x1_ + kAlign - 1) & ~(kAlign - 1));
+      int32_t y1 =
+          std::min<int32_t>(int32_t(tight_area_extent_.height),
+                            (tight_area_y1_ + kAlign - 1) & ~(kAlign - 1));
       if (x1 > x0 && y1 > y0) {
         VkRect2D area;
         area.offset.x = x0;
@@ -4497,8 +4499,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         record.index.hash_parse = VulkanDrawBlackbox::HashGuest(
             *memory_, record.index.address, record.index.length, nullptr);
       }
-      record.vertex_range_count = std::min(vfetch_current_queued,
-                                           VulkanDrawBlackbox::kMaxRanges);
+      record.vertex_range_count =
+          std::min(vfetch_current_queued, VulkanDrawBlackbox::kMaxRanges);
       for (uint32_t i = 0; i < record.vertex_range_count; ++i) {
         VulkanDrawBlackbox::Range& range = record.vertex[i];
         range.address = vfetch_addresses[i] << 2;
@@ -5649,10 +5651,9 @@ void VulkanCommandProcessor::OnDispatchBegin(
            group_count_y, group_count_z, groups, frame_current_);
   }
   if (gpu_breadcrumbs_.enabled()) {
-    gpu_breadcrumbs_.OnWorkBegin(command_buffer, kind, group_count_x,
-                                 group_count_y, group_count_z,
-                                 GetCurrentSubmission(), frame_current_,
-                                 dispatch_detail_, detail_count);
+    gpu_breadcrumbs_.OnWorkBegin(
+        command_buffer, kind, group_count_x, group_count_y, group_count_z,
+        GetCurrentSubmission(), frame_current_, dispatch_detail_, detail_count);
   }
 }
 
@@ -5922,9 +5923,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (cvars::vulkan_max_submissions_in_flight) {
     const uint64_t current = GetCurrentSubmission();
     if (current > cvars::vulkan_max_submissions_in_flight) {
-      await_submission = std::max(
-          await_submission,
-          current - uint64_t(cvars::vulkan_max_submissions_in_flight));
+      await_submission =
+          std::max(await_submission,
+                   current - uint64_t(cvars::vulkan_max_submissions_in_flight));
     }
   }
   CheckSubmissionCompletionAndDeviceLoss(await_submission);

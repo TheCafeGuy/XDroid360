@@ -549,7 +549,8 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
     }
-    command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kSubmit);
+    command_processor_.TagPassEnd(
+        VulkanCommandProcessor::PassEndReason::kSubmit);
     command_processor_.SubmitBarriers(true);
     DeferredCommandBuffer& command_buffer =
         command_processor_.deferred_command_buffer();
@@ -1738,7 +1739,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             offsetof(LoadConstants, host_offset),
             sizeof(load_constants.host_offset), &load_constants.host_offset);
       }
-      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
+      command_processor_.TagPassEnd(
+          VulkanCommandProcessor::PassEndReason::kTextureLoad);
       command_processor_.SubmitBarriers(true);
       // Debug: show dispatch info with source offset
       command_processor_.InsertDebugMarker(
@@ -1914,7 +1916,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VK_ACCESS_SHADER_WRITE_BIT, blit_staging.layout,
           VK_IMAGE_LAYOUT_GENERAL);
       blit_staging.layout = VK_IMAGE_LAYOUT_GENERAL;
-      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
+      command_processor_.TagPassEnd(
+          VulkanCommandProcessor::PassEndReason::kTextureLoad);
       command_processor_.SubmitBarriers(true);
 
       command_processor_.BindExternalComputePipeline(
@@ -1998,7 +2001,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
         VK_QUEUE_FAMILY_IGNORED, false);
   }
-  command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
+  command_processor_.TagPassEnd(
+      VulkanCommandProcessor::PassEndReason::kTextureLoad);
   command_processor_.SubmitBarriers(true);
   command_processor_.InsertDebugMarker(
       "Texture Upload: %ux%ux%u fmt:%s mips:%u-%u", width, height,

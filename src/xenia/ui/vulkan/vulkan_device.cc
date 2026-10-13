@@ -1036,9 +1036,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (queue_global_priority_requested) {
     if (device_create_result == VK_ERROR_NOT_PERMITTED_KHR ||
         device_create_result == VK_ERROR_INITIALIZATION_FAILED) {
-      XELOGW("Vulkan queue global priority '{}' refused ({}), using the default",
-             cvars::vulkan_queue_global_priority,
-             vk::to_string(vk::Result(device_create_result)));
+      XELOGW(
+          "Vulkan queue global priority '{}' refused ({}), using the default",
+          cvars::vulkan_queue_global_priority,
+          vk::to_string(vk::Result(device_create_result)));
       for (VkDeviceQueueCreateInfo& queue_create_info : queue_create_infos) {
         queue_create_info.pNext = nullptr;
       }

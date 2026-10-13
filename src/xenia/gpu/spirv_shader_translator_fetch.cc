@@ -780,10 +780,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
         GetSpirvShaderModification().pixel.param_gen_enable &&
         input_fragment_coordinates_ != spv::NoResult) {
-      const std::string& hashes =
-          cvars::deswizzle_identity_ps_hashes.empty()
-              ? title_deswizzle_identity_ps_hashes
-              : cvars::deswizzle_identity_ps_hashes;
+      const std::string& hashes = cvars::deswizzle_identity_ps_hashes.empty()
+                                      ? title_deswizzle_identity_ps_hashes
+                                      : cvars::deswizzle_identity_ps_hashes;
       deswizzle_identity =
           !hashes.empty() &&
           UcodeHashSlotInList(current_shader().ucode_data_hash(),

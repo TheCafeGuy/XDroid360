@@ -127,8 +127,7 @@ static void GuestSpinPark(void* /*raw_context*/) {
   }
   hints = 0;
   writebacks.WaitFor(
-      generation,
-      std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
+      generation, std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
   // The wait itself must not end the spin window.
   last_hint = std::chrono::steady_clock::now();
 }

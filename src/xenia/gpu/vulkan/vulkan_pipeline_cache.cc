@@ -2756,8 +2756,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
 }
 
 void VulkanPipelineCache::WriteVkPipelineCacheLocked() {
-  if (vk_pipeline_cache_ == VK_NULL_HANDLE ||
-      vk_pipeline_cache_path_.empty()) {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device =

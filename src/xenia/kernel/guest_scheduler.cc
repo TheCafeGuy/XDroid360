@@ -929,8 +929,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
     XdroidAudioWatch& watch = xdroid_audio_watch;
     if (next->thread_id() ==
         watch.signaler_tid.load(std::memory_order_relaxed)) {
-      const uint64_t ready = watch.producer_ready_tick.exchange(
-          0, std::memory_order_relaxed);
+      const uint64_t ready =
+          watch.producer_ready_tick.exchange(0, std::memory_order_relaxed);
       if (ready) {
         const uint64_t delay = XdroidNowUs() - ready;
         watch.dispatch_delay_us.fetch_add(delay, std::memory_order_relaxed);

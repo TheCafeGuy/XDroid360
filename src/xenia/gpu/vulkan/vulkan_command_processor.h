@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <thread>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -23,6 +22,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>

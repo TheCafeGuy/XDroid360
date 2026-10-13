@@ -1363,7 +1363,8 @@ bool VulkanRenderTargetCache::Resolve(
                 copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
-          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(
+              VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveCopy);
@@ -1466,7 +1467,8 @@ bool VulkanRenderTargetCache::Resolve(
           command_buffer.CmdVkPushConstants(
               resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
               0, sizeof(depth_clear_constants), &depth_clear_constants);
-          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(
+              VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
@@ -1493,7 +1495,8 @@ bool VulkanRenderTargetCache::Resolve(
                 resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(color_clear_constants), &color_clear_constants);
           }
-          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(
+              VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
@@ -2956,7 +2959,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant),
             &host_depth_store_rectangle_constant);
-        command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTransfer);
+        command_processor_.TagPassEnd(
+            VulkanCommandProcessor::PassEndReason::kTransfer);
         command_processor_.SubmitBarriers(true);
         command_processor_.TagDispatch(
             VulkanGpuBreadcrumbs::WorkKind::kTransfer);
@@ -4208,7 +4212,8 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
           sizeof(uint32_t) * kEdramDumpShaderPushConstantResolveDispatchTile,
           sizeof(dispatch_tile), &dispatch_tile);
 
-      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
+      command_processor_.TagPassEnd(
+          VulkanCommandProcessor::PassEndReason::kResolve);
       command_processor_.SubmitBarriers(true);
       uint32_t threads_x =
           (dispatch.width_tiles * tile_pixels_x + (pixels_per_thread - 1)) /
@@ -4224,7 +4229,8 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
             transient_dest_offset,
             uint32_t(transient_dest_range),
             resolve_push_constants[kEdramDumpShaderPushConstantResolveDestBase],
-            resolve_push_constants[kEdramDumpShaderPushConstantResolveEdramInfo],
+            resolve_push_constants
+                [kEdramDumpShaderPushConstantResolveEdramInfo],
             resolve_push_constants
                 [kEdramDumpShaderPushConstantResolveCoordinateInfo],
             resolve_push_constants[kEdramDumpShaderPushConstantResolveDestInfo],
@@ -4274,8 +4280,8 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         command_buffer.CmdVkPipelineBarrier(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post_barrier, 0,
-            nullptr, 0, nullptr);
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post_barrier, 0, nullptr,
+            0, nullptr);
       }
     }
   }
@@ -4636,12 +4642,10 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
           rt_key.is_depth ? std::max(cvars::xdroid_depth_read_repeat, 1u) : 1;
       for (uint32_t repeat = 0; repeat < repeats; ++repeat) {
         // The native layout has a 1x1 footprint.
-        command_processor_.TagDispatch(
-            VulkanGpuBreadcrumbs::WorkKind::kDump);
+        command_processor_.TagDispatch(VulkanGpuBreadcrumbs::WorkKind::kDump);
         command_buffer.CmdVkDispatch(
             ((native_layout ? 1 : draw_resolution_scale_x()) *
-                 (xenos::kEdramTileWidthSamples >>
-                  uint32_t(rt_key.Is64bpp())) *
+                 (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
                  dispatch.width_tiles +
              (kEdramDumpShaderSamplesPerGroupX - 1)) /
                 kEdramDumpShaderSamplesPerGroupX,

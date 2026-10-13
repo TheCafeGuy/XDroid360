@@ -1033,8 +1033,7 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     uint32_t height, VkSwapchainKHR old_swapchain,
     uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkExtent2D& image_extent_out, bool& is_fifo_out,
-    bool& ui_surface_unusable_out,
-    VkSurfaceTransformFlagBitsKHR& transform_out,
+    bool& ui_surface_unusable_out, VkSurfaceTransformFlagBitsKHR& transform_out,
     VkExtent2D& image_native_extent_out) {
   ui_surface_unusable_out = false;
 
@@ -1656,16 +1655,14 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_source_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     rotate_source_barrier.pNext = nullptr;
     rotate_source_barrier.srcAccessMask = 0;
-    rotate_source_barrier.dstAccessMask =
-        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    rotate_source_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     rotate_source_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     rotate_source_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     rotate_source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.image = paint_context_.rotate_source_image;
-    rotate_source_barrier.subresourceRange =
-        util::InitializeSubresourceRange();
+    rotate_source_barrier.subresourceRange = util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(draw_command_buffer,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
@@ -2242,8 +2239,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.image = paint_context_.rotate_source_image;
-    rotate_source_barrier.subresourceRange =
-        util::InitializeSubresourceRange();
+    rotate_source_barrier.subresourceRange = util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(draw_command_buffer,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
@@ -2297,10 +2293,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_rect_constants.y = -1.0f;
     rotate_rect_constants.width = 2.0f;
     rotate_rect_constants.height = 2.0f;
-    dfn.vkCmdPushConstants(draw_command_buffer, rotate_pipeline_layout,
-                           VK_SHADER_STAGE_VERTEX_BIT, 0,
-                           sizeof(rotate_rect_constants),
-                           &rotate_rect_constants);
+    dfn.vkCmdPushConstants(
+        draw_command_buffer, rotate_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
+        0, sizeof(rotate_rect_constants), &rotate_rect_constants);
     int32_t rotate_constants[4] = {
         int32_t(paint_context_.swapchain_extent.width) - 1,
         int32_t(paint_context_.swapchain_extent.height) - 1,
@@ -2941,8 +2936,7 @@ bool VulkanPresenter::CreateRotateObjects(VkFormat format) {
   image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.subresourceRange = util::InitializeSubresourceRange();
   if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr,
-                            &paint_context_.rotate_source_view) !=
-      VK_SUCCESS) {
+                            &paint_context_.rotate_source_view) != VK_SUCCESS) {
     XELOGE("VulkanPresenter: Failed to create the pre-rotation source view");
     return false;
   }
@@ -2975,8 +2969,9 @@ bool VulkanPresenter::CreateRotateObjects(VkFormat format) {
   VkWriteDescriptorSet descriptor_write;
   descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   descriptor_write.pNext = nullptr;
-  descriptor_write.dstSet = paint_context_.guest_output_descriptor_sets
-      [PaintContext::kGuestOutputDescriptorSetRotateSourceSampled];
+  descriptor_write.dstSet =
+      paint_context_.guest_output_descriptor_sets
+          [PaintContext::kGuestOutputDescriptorSetRotateSourceSampled];
   descriptor_write.dstBinding = 0;
   descriptor_write.dstArrayElement = 0;
   descriptor_write.descriptorCount = 1;

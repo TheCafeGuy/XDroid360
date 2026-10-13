@@ -1146,9 +1146,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
           builder_->makeUintConstant(1));
       builder_->createStore(iterations, var_main_loop_iterations_);
       builder_->createConditionalBranch(
-          builder_->createBinOp(spv::OpULessThan, type_bool_, iterations,
-                                builder_->makeUintConstant(
-                                    uint32_t(max_iterations))),
+          builder_->createBinOp(
+              spv::OpULessThan, type_bool_, iterations,
+              builder_->makeUintConstant(uint32_t(max_iterations))),
           main_loop_header_, main_loop_merge_);
     } else {
       builder_->createBranch(main_loop_header_);
@@ -2709,8 +2709,7 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
               builder_->makeUintConstant(xenos::kVertexIndexMask);
           spv::Id index_uint = builder_->createBinOp(
               spv::OpBitwiseAnd, type_uint_,
-              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
-                                      vertex_index),
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_, vertex_index),
               const_index_mask);
           spv::Id index_min_max[2];
           for (uint32_t i = 0; i < 2; ++i) {

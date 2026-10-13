@@ -15,8 +15,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "xenia/base/cvar.h"

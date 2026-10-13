@@ -35,10 +35,10 @@
 
 #if XE_PLATFORM_ANDROID
 #include <fcntl.h>
-#include <cerrno>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #endif

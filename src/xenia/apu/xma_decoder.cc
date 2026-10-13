@@ -231,9 +231,8 @@ void XmaDecoder::WorkerThreadMain() {
     // A kick enables its contexts before setting work_event_, so sleeping
     // until the next one loses no work.
     if (cvars::xma_worker_poll_ms) {
-      xe::threading::Wait(
-          work_event_.get(), false,
-          std::chrono::milliseconds(cvars::xma_worker_poll_ms));
+      xe::threading::Wait(work_event_.get(), false,
+                          std::chrono::milliseconds(cvars::xma_worker_poll_ms));
     } else {
       xe::threading::Wait(work_event_.get(), false);
     }
