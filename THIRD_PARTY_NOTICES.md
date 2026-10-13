@@ -40,6 +40,9 @@ Highlights:
 - **Other submodules** under `third_party/` (for example wxWidgets, SDL3, MoltenVK, metal-cpp,
   DirectXShaderCompiler, DirectX-Headers, libusb, Catch2, cpplint) belong to upstream's desktop builds
   or tooling. Each keeps its own license file in its directory.
+- **Game patches:** upstream embeds [xenia-canary/game-patches](https://github.com/xenia-canary/game-patches),
+  which has no license file. Android builds do not embed it (`XENIA_EMBED_GAME_PATCHES`, default OFF on
+  Android); users can add patch files to the app's `patches` folder.
 - **Games, firmware, keys:** none are included. Users supply their own legally obtained games.
 
 ## Trademarks
