@@ -25,6 +25,9 @@
 
 // All these overrides are always safe to use as all backends are expected to
 // support triangle lists and line strips.
+// XDroid360 HUD-1 arm H3 (temp, revert-planned), vulkan_command_processor.cc.
+DECLARE_int32(xdroid_vfetch_reupload_max_kb);
+
 DEFINE_bool(
     force_convert_triangle_fans_to_lists, false,
     "For host graphics API downlevel support testing only, force CPU "
@@ -607,14 +610,31 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           }
           break;
         case xenos::PrimitiveType::kLineLoop:
-          // Plus 1 element (if there's anything to draw) in the strip, still
-          // auto-indexed, but the added excess index should be treated as 0 by
-          // the vertex shaders.
+          // Plus 1 element (if there's anything to draw) in the strip, which
+          // must be vertex 0. The DXBC translator maps the excess index to 0
+          // (line_loop_closing_index); the SPIR-V one never did, so the
+          // closing segment went to vertex N, past the loop. Draw the strip
+          // through a converted index buffer ending in 0 instead, which is
+          // correct with either translator (auto-indexed counts fit 16 bits).
           assert_true(host_primitive_type == xenos::PrimitiveType::kLineStrip);
           cacheable.host_draw_vertex_count =
               GetLineLoopStripIndexCount(cacheable.host_draw_vertex_count);
           if (cacheable.host_draw_vertex_count) {
             line_loop_closing_index = cacheable.host_draw_vertex_count - 1;
+            cacheable.index_buffer_type =
+                ProcessedIndexBufferType::kHostConverted;
+            auto host_indices = reinterpret_cast<uint16_t*>(
+                RequestHostConvertedIndexBufferForCurrentFrame(
+                    xenos::IndexFormat::kInt16,
+                    cacheable.host_draw_vertex_count, false, 0,
+                    cacheable.host_index_buffer_handle));
+            if (!host_indices) {
+              return false;
+            }
+            for (uint32_t i = 0; i < line_loop_closing_index; ++i) {
+              host_indices[i] = uint16_t(i);
+            }
+            host_indices[line_loop_closing_index] = 0;
           }
           break;
         case xenos::PrimitiveType::kQuadList:
@@ -1075,6 +1095,12 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
           ProcessedIndexBufferType::kHostBuiltinForDMA) {
     // Request the index buffer memory.
     // TODO(Triang3l): Shared memory request cache.
+    if (cvars::xdroid_vfetch_reupload_max_kb > 0 &&
+        guest_index_buffer_needed_bytes <=
+            uint32_t(cvars::xdroid_vfetch_reupload_max_kb) * 1024) {
+      shared_memory_.XdroidForceReupload(guest_index_base,
+                                         guest_index_buffer_needed_bytes);
+    }
     if (!shared_memory_.RequestRange(guest_index_base,
                                      guest_index_buffer_needed_bytes)) {
       XELOGE(
@@ -1569,10 +1595,13 @@ PrimitiveProcessor::CacheTransaction::~CacheTransaction() {
 
   auto global_lock = processor_.global_critical_region_.Acquire();
 
+  // The invalidation callback zeroes the size if the range was written during
+  // processing, which may have read the old indices.
+  const bool written = !processor_.cache_currently_processing_size_bytes_;
   processor_.cache_currently_processing_base_ = 0;
   processor_.cache_currently_processing_size_bytes_ = 0;
 
-  if (result_type_ == ResultType::kNewSet) {
+  if (result_type_ == ResultType::kNewSet && !written) {
     size_t new_entry_index;
     if (processor_.cache_bucket_free_first_entry_ != SIZE_MAX) {
       new_entry_index = processor_.cache_bucket_free_first_entry_;
@@ -1648,6 +1677,13 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
   uint32_t bucket_l2_bits_index_first = bucket_index_first >> 12;
   uint32_t bucket_l2_bits_index_last = bucket_index_last >> 12;
   auto global_lock = global_critical_region_.Acquire();
+  if (cache_currently_processing_size_bytes_ &&
+      cache_currently_processing_base_ < physical_address_end &&
+      cache_currently_processing_base_ +
+              cache_currently_processing_size_bytes_ >
+          physical_address_start) {
+    cache_currently_processing_size_bytes_ = 0;
+  }
   for (uint32_t bucket_l2_bits_index = bucket_l2_bits_index_first;
        bucket_l2_bits_index <= bucket_l2_bits_index_last;
        ++bucket_l2_bits_index) {
@@ -1717,7 +1753,7 @@ std::pair<uint32_t, uint32_t> PrimitiveProcessor::MemoryInvalidationCallback(
           // the specified range.
           if (entry_key.base < physical_address_end) {
             uint32_t entry_end = entry_key.base + entry_key.GetSizeBytes();
-            if (entry_end > physical_address_end) {
+            if (entry_end > physical_address_start) {
               // Invalidate the entry.
               any_invalidated = true;
               // Remove the entry from the cache map.

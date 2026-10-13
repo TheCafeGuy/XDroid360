@@ -13,6 +13,7 @@
 #include "xenia/base/chrono_steady_cast.h"
 #include "xenia/base/platform.h"
 #include "xenia/base/threading_timer_queue.h"
+#include "xenia/base/wake_generation.h"
 
 #include <fcntl.h>
 #include <pthread.h>
@@ -337,38 +338,16 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
   return pthread_setspecific(handle, reinterpret_cast<void*>(value)) == 0;
 }
 
-// Multi-object waits: each signal bumps a generation and notifies this
-// condvar so WaitMultiple wakes at once; the timeout cap covers a miss.
-static std::mutex g_multi_wait_mutex;
-static std::condition_variable g_multi_wait_cv;
-static std::atomic<uint64_t> g_multi_wait_gen{0};
-static std::atomic<uint32_t> g_multi_waiters{0};
-static void PokeMultiWaiters() {
-  // Bump before reading the count so a waiter that re-checks gen after
-  // registering sees it. Not a guarantee: neither this nor the notify below is
-  // ordered against a waiter mid-park. The waiter's 1ms cap is the real bound.
-  g_multi_wait_gen.fetch_add(1, std::memory_order_release);
-  if (g_multi_waiters.load(std::memory_order_acquire) == 0) {
-    // Nobody is parked, so skip the process-global mutex entirely. This path
-    // runs from the realtime audio callback, where blocking on a lock held by
-    // an ordinary guest thread costs an audio deadline.
-    return;
-  }
-  // Notified without holding the mutex, so a realtime caller never blocks on
-  // it. A wakeup lost to the register/sleep race costs at most the 1ms park
-  // cap the waiter already applies.
-  g_multi_wait_cv.notify_all();
-}
-
-// Scopes the parked-waiter count; a cancelled wait must not leak it.
-struct ScopedMultiWaiter {
-  ScopedMultiWaiter() {
-    g_multi_waiters.fetch_add(1, std::memory_order_release);
-  }
-  ~ScopedMultiWaiter() {
-    g_multi_waiters.fetch_sub(1, std::memory_order_release);
-  }
-};
+// Multi-object waits: each signal bumps a generation that WaitMultiple parks
+// on (a futex on Linux and Android), so it wakes at once. CE-3, after Tim's
+// 6435e7990 (multi-object waits block instead of polling): the old condvar
+// park could lose a poke to the register/sleep race, so it was capped at 1 ms
+// and an idle multi-wait (the audio worker's WaitAny) woke ~1000 times/s. The
+// futex compares the generation atomically with sleeping, so no poke is lost
+// and the cap is only a backstop. Bump is lock-free and makes no syscall
+// while nobody is parked: it runs from the realtime audio callback.
+static WakeGeneration g_multi_wait;
+static void PokeMultiWaiters() { g_multi_wait.Bump(); }
 
 // Parked on from the suspend signal handler, so it must stay async-signal-safe.
 class SuspendGate {
@@ -484,7 +463,7 @@ class SuspendGate {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if !XE_PLATFORM_MAC
+#if !XE_PLATFORM_MAC && !XE_PLATFORM_ANDROID  // Bionic: no robust mutexes.
     // Initialize as robust mutex to handle thread termination gracefully.
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
@@ -504,8 +483,8 @@ class PosixConditionBase {
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if XE_PLATFORM_MAC
-    // Standard locking on macOS (no robust mutex support).
+#if XE_PLATFORM_MAC || XE_PLATFORM_ANDROID
+    // Standard locking on macOS and Bionic (no robust mutex support).
     std::unique_lock<std::mutex> lock(mutex_);
 #else
     // Handle robust mutex locking.
@@ -605,7 +584,7 @@ class PosixConditionBase {
       pthread_testcancel();
 #endif
       // Snapshot the gen before checking so a racing signal isn't missed.
-      uint64_t wait_gen = g_multi_wait_gen.load(std::memory_order_acquire);
+      uint32_t wait_gen = g_multi_wait.Load();
 
       // Check all handles to see if any/all are signaled.
       // Use try_lock to avoid deadlocks from lock ordering issues.
@@ -618,8 +597,8 @@ class PosixConditionBase {
       bool all_locked = true;
 
       for (size_t i = 0; i < handles.size(); ++i) {
-#if XE_PLATFORM_MAC
-        // macOS: no robust mutex support.
+#if XE_PLATFORM_MAC || XE_PLATFORM_ANDROID
+        // macOS and Bionic: no robust mutex support.
         std::unique_lock<std::mutex> lk(handles[i]->mutex_, std::try_to_lock);
         if (!lk.owns_lock()) {
           all_locked = false;
@@ -627,7 +606,7 @@ class PosixConditionBase {
         }
         locks.emplace_back(std::move(lk));
 #else
-        // Linux/Android: robust-aware trylock.
+        // Linux: robust-aware trylock.
         auto native_mutex =
             static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
         int result = pthread_mutex_trylock(native_mutex);
@@ -704,17 +683,11 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      // Park on the shared condvar (any signal wakes us); 1ms caps a lost poke.
+      // Park until any signal (or the timeout, capped at 50 ms as a backstop).
       auto remaining =
-          std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-      auto park = std::min(remaining, std::chrono::milliseconds(1));
-      {
-        ScopedMultiWaiter parked;
-        std::unique_lock<std::mutex> mw_lock(g_multi_wait_mutex);
-        g_multi_wait_cv.wait_for(mw_lock, park, [&] {
-          return g_multi_wait_gen.load(std::memory_order_acquire) != wait_gen;
-        });
-      }
+          std::chrono::duration_cast<std::chrono::microseconds>(end_time - now);
+      g_multi_wait.WaitFor(
+          wait_gen, std::min(remaining, std::chrono::microseconds(50000)));
     }
   }
 
@@ -1141,7 +1114,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   }
 
 #if XE_PLATFORM_ANDROID
-  void SetAndroidPreApi26Name(const std::string_view name) {
+  void SetAndroidPreApi26Name(const std::string_view name) const {
     if (android_pthread_getname_np_) {
       return;
     }
@@ -1490,7 +1463,7 @@ class PosixCondition<Thread> final : public PosixConditionBase {
   // Name accessible via name() on Android before API 26 which added
   // pthread_getname_np.
   mutable std::mutex android_pre_api_26_name_mutex_;
-  char android_pre_api_26_name_[16];
+  mutable char android_pre_api_26_name_[16];
 #endif
 };
 

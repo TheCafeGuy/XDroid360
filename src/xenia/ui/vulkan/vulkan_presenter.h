@@ -333,9 +333,13 @@ class VulkanPresenter final : public Presenter {
           kGuestOutputDescriptorSetGuestOutput0Sampled +
           kGuestOutputMailboxSize,
 
-      kGuestOutputDescriptorSetCount =
+      // The logical-orientation image copied into a pre-rotated swapchain.
+      kGuestOutputDescriptorSetRotateSourceSampled =
           kGuestOutputDescriptorSetIntermediate0Sampled +
           kMaxGuestOutputPaintEffects - 1,
+
+      kGuestOutputDescriptorSetCount =
+          kGuestOutputDescriptorSetRotateSourceSampled + 1,
     };
 
     struct UISetupCommandBuffer {
@@ -374,7 +378,9 @@ class VulkanPresenter final : public Presenter {
         uint32_t height, VkSwapchainKHR old_swapchain,
         uint32_t& present_queue_family_out, VkFormat& image_format_out,
         VkExtent2D& image_extent_out, bool& is_fifo_out,
-        bool& ui_surface_unusable_out);
+        bool& ui_surface_unusable_out,
+        VkSurfaceTransformFlagBitsKHR& transform_out,
+        VkExtent2D& image_native_extent_out);
 
     // Destroys the swapchain and its derivatives, nulls `swapchain` and returns
     // the original swapchain object, if it existed, for use as oldSwapchain if
@@ -437,8 +443,32 @@ class VulkanPresenter final : public Presenter {
     VkSurfaceKHR vulkan_surface = VK_NULL_HANDLE;
     uint32_t present_queue_family = UINT32_MAX;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+    // The logical (painting) extent. Swapchain images have
+    // swapchain_native_extent, which differs for a 90/270 transform.
     VkExtent2D swapchain_extent = {};
     bool swapchain_is_fifo = false;
+
+    // Pre-rotation (DISP-1): when the swapchain is created with the surface's
+    // rotated transform, everything is painted in the logical orientation to
+    // the rotate source image, and one last draw copies it rotated into the
+    // swapchain image, so the compositor scans the image out instead of
+    // rotating it on the GPU (which also preempts the emulator's long GPU
+    // submissions every frame).
+    VkSurfaceTransformFlagBitsKHR swapchain_transform =
+        VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    VkExtent2D swapchain_native_extent = {};
+    // Cvar values the swapchain was created with; a live change of any of them
+    // (tools/device live A/B) makes the connection outdated to recreate it.
+    uint32_t swapchain_creation_cvars = 0;
+    // Reused between connections if the format stays the same.
+    VkRenderPass rotate_source_render_pass = VK_NULL_HANDLE;
+    VkPipeline rotate_pipeline = VK_NULL_HANDLE;
+    VkFormat rotate_format = VK_FORMAT_UNDEFINED;
+    // Connection-specific, logical extent.
+    VkImage rotate_source_image = VK_NULL_HANDLE;
+    VkDeviceMemory rotate_source_memory = VK_NULL_HANDLE;
+    VkImageView rotate_source_view = VK_NULL_HANDLE;
+    VkFramebuffer rotate_source_framebuffer = VK_NULL_HANDLE;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
     std::vector<VkSemaphore> swapchain_image_present_semaphores;
@@ -460,8 +490,12 @@ class VulkanPresenter final : public Presenter {
 
   bool InitializeSurfaceIndependent();
 
+  // fragment_shader overrides the effect's shader, keeping its layout.
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(
-      GuestOutputPaintEffect effect, VkRenderPass render_pass);
+      GuestOutputPaintEffect effect, VkRenderPass render_pass,
+      VkShaderModule fragment_shader = VK_NULL_HANDLE);
+  // Creates the pre-rotation objects for the current swapchain (DISP-1).
+  bool CreateRotateObjects(VkFormat format);
 
   VulkanDevice* vulkan_device_;
   const UISamplers* ui_samplers_;
@@ -476,6 +510,8 @@ class VulkanPresenter final : public Presenter {
   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
   std::array<VkShaderModule, size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_fs_ = {};
+  // Pre-rotation copy, with the bilinear pipeline layout.
+  VkShaderModule guest_output_rotate_fs_ = VK_NULL_HANDLE;
   // Not compatible with the swapchain render pass even if the format is the
   // same due to different dependencies (this is shader read > color
   // attachment > shader read).

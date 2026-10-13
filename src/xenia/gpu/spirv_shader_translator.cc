@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
@@ -42,6 +43,28 @@ DEFINE_bool(
     "Disable RoundingModeRTE capability in SPIR-V shaders. Enable this to "
     "allow shader debugging in RenderDoc, which doesn't support this "
     "capability.",
+    "GPU");
+
+DEFINE_bool(
+    spirv_loop_skip_without_push, true,
+    "Skip a guest loop whose count is zero before pushing its count and aL, "
+    "like the DXBC translator. False restores the old order, where an "
+    "enclosing loop can run away (GPU hang) after a skipped inner loop.",
+    "GPU");
+
+DEFINE_bool(
+    spirv_vertex_index_clamp, true,
+    "Wrap the offset vertex index to its low 24 bits and clamp it to "
+    "VGT_MIN_VTX_INDX / VGT_MAX_VTX_INDX, as the Xenos and the DXBC "
+    "translator do, so a stray index fetches a vertex of the draw rather "
+    "than one from anywhere in memory.",
+    "GPU");
+
+DEFINE_int32(
+    spirv_max_main_loop_iterations, 1 << 17,
+    "Iterations of a shader's guest control flow loop (jumps, loop ends) "
+    "after which an invocation gives up, so a runaway guest loop costs a "
+    "glitch instead of a GPU hang. 0 disables the bound.",
     "GPU");
 
 DEFINE_string(shader_bisect_ps_hash, "",
@@ -856,6 +879,9 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_loop_count_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassFunction, type_uint4_,
         "xe_var_loop_count", const_uint4_0_);
+    var_main_loop_iterations_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+        "xe_var_main_loop_iterations", const_uint_0_);
     var_main_address_register_ = builder_->createVariable(
         spv::NoPrecision, spv::StorageClassFunction, type_int_,
         "xe_var_address_register", const_int_0_);
@@ -1101,7 +1127,32 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
       builder_->getBuildPoint()->addInstruction(
           std::move(main_loop_pc_next_op));
     }
-    builder_->createBranch(main_loop_header_);
+    // Bound the guest control flow: nested guest loops (up to 255 iterations
+    // each, 4 deep) or a backward jump on a condition that never changes
+    // under emulation can run long enough to hang the GPU (kgsl "GPU hang
+    // detected" at the same command offset every frame). On real hardware
+    // those loops end; here, give up after far more iterations than any real
+    // shader takes, leaving the outputs as they are. The bound is per
+    // invocation while the cost is per wave times the waves in flight: at
+    // 2^20, a runaway over a few thousand pixels already outlasts the kgsl
+    // timeout. The default, 2^17, is twice two fully nested 255-iteration
+    // loops (65025 continues), the largest count legal guest code reaches
+    // without a runaway.
+    const int32_t max_iterations = cvars::spirv_max_main_loop_iterations;
+    if (max_iterations > 0) {
+      spv::Id iterations = builder_->createBinOp(
+          spv::OpIAdd, type_uint_,
+          builder_->createLoad(var_main_loop_iterations_, spv::NoPrecision),
+          builder_->makeUintConstant(1));
+      builder_->createStore(iterations, var_main_loop_iterations_);
+      builder_->createConditionalBranch(
+          builder_->createBinOp(spv::OpULessThan, type_bool_, iterations,
+                                builder_->makeUintConstant(
+                                    uint32_t(max_iterations))),
+          main_loop_header_, main_loop_merge_);
+    } else {
+      builder_->createBranch(main_loop_header_);
+    }
 
     // Add the main loop merge block and go back to the function.
     function_main_->addBlock(main_loop_merge_);
@@ -1367,6 +1418,12 @@ void SpirvShaderTranslator::PostTranslation() {
     // after they are fully written, so a PS translated on a creation thread is
     // only consulted once its bindings are complete.
     spirv_shader->bindings_ready_.store(true, std::memory_order_release);
+  } else if (spirv_shader) {
+    // Wait for the translation still publishing the shader's bindings since
+    // this one counts as done on return.
+    while (!spirv_shader->bindings_ready()) {
+      std::this_thread::yield();
+    }
   }
 }
 
@@ -1454,46 +1511,61 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(
 
   spv::Id const_int_8 = builder_->makeIntConstant(8);
 
-  // Push the count to the loop count stack - move XYZ to YZW and set X to the
-  // new iteration count (swizzling the way glslang does it for similar GLSL).
-  spv::Id loop_count_stack_old =
-      builder_->createLoad(var_main_loop_count_, spv::NoPrecision);
   spv::Id loop_count_new =
       builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_, loop_constant,
                             const_int_0_, const_int_8);
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(loop_count_new);
-  for (unsigned int i = 0; i < 3; ++i) {
-    id_vector_temp_.push_back(
-        builder_->createCompositeExtract(loop_count_stack_old, type_uint_, i));
-  }
-  builder_->createStore(
-      builder_->createCompositeConstruct(type_uint4_, id_vector_temp_),
-      var_main_loop_count_);
 
-  // Push aL - keep the same value as in the previous loop if repeating, or the
-  // new one otherwise.
-  spv::Id address_relative_stack_old =
-      builder_->createLoad(var_main_loop_address_, spv::NoPrecision);
-  id_vector_temp_.clear();
-  if (instr.is_repeat) {
-    id_vector_temp_.emplace_back();
-  } else {
-    id_vector_temp_.push_back(builder_->createUnaryOp(
-        spv::OpBitcast, type_int_,
-        builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
-                              loop_constant, const_int_8, const_int_8)));
+  auto push_loop_state = [&]() {
+    // Push the count to the loop count stack - move XYZ to YZW and set X to
+    // the new iteration count (swizzling the way glslang does it for similar
+    // GLSL).
+    spv::Id loop_count_stack_old =
+        builder_->createLoad(var_main_loop_count_, spv::NoPrecision);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(loop_count_new);
+    for (unsigned int i = 0; i < 3; ++i) {
+      id_vector_temp_.push_back(builder_->createCompositeExtract(
+          loop_count_stack_old, type_uint_, i));
+    }
+    builder_->createStore(
+        builder_->createCompositeConstruct(type_uint4_, id_vector_temp_),
+        var_main_loop_count_);
+
+    // Push aL - keep the same value as in the previous loop if repeating, or
+    // the new one otherwise.
+    spv::Id address_relative_stack_old =
+        builder_->createLoad(var_main_loop_address_, spv::NoPrecision);
+    id_vector_temp_.clear();
+    if (instr.is_repeat) {
+      id_vector_temp_.emplace_back();
+    } else {
+      id_vector_temp_.push_back(builder_->createUnaryOp(
+          spv::OpBitcast, type_int_,
+          builder_->createTriOp(spv::OpBitFieldUExtract, type_uint_,
+                                loop_constant, const_int_8, const_int_8)));
+    }
+    for (unsigned int i = 0; i < 3; ++i) {
+      id_vector_temp_.push_back(builder_->createCompositeExtract(
+          address_relative_stack_old, type_int_, i));
+    }
+    if (instr.is_repeat) {
+      id_vector_temp_[0] = id_vector_temp_[1];
+    }
+    builder_->createStore(
+        builder_->createCompositeConstruct(type_int4_, id_vector_temp_),
+        var_main_loop_address_);
+  };
+
+  // Skip the loop without pushing if the count is zero from the beginning, as
+  // the DXBC translator does. The skip label is past the loop end, the only
+  // place that pops, so a push here would leave the zero count on top of the
+  // stack: an enclosing loop's end would then decrement it to 0xFFFFFFFF and
+  // keep iterating (re-entering the skipped loop pushes another zero), and
+  // its aL would be the skipped loop's.
+  const bool push_after_skip = cvars::spirv_loop_skip_without_push;
+  if (!push_after_skip) {
+    push_loop_state();
   }
-  for (unsigned int i = 0; i < 3; ++i) {
-    id_vector_temp_.push_back(builder_->createCompositeExtract(
-        address_relative_stack_old, type_int_, i));
-  }
-  if (instr.is_repeat) {
-    id_vector_temp_[0] = id_vector_temp_[1];
-  }
-  builder_->createStore(
-      builder_->createCompositeConstruct(type_int4_, id_vector_temp_),
-      var_main_loop_address_);
 
   // Break (jump to the skip label) if the loop counter is 0 (since the
   // condition is checked in the end).
@@ -1523,6 +1595,9 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(
       builder_->getBuildPoint()->getId());
   builder_->createBranch(main_loop_continue_);
   builder_->setBuildPoint(&body_block);
+  if (push_after_skip) {
+    push_loop_state();
+  }
 }
 
 void SpirvShaderTranslator::ProcessLoopEndInstruction(
@@ -2625,6 +2700,42 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
                                             uniform_system_constants_,
                                             id_vector_temp_),
                 spv::NoPrecision));
+        if (cvars::spirv_vertex_index_clamp) {
+          // DXBC RemapAndConvertVertexIndices: the GPU only uses the low 24
+          // bits of the offset index, then clamps it to the draw's vertex
+          // range. The tessellation path does the same in its hull shader
+          // and shares the min/max system constant (set for every draw).
+          spv::Id const_index_mask =
+              builder_->makeUintConstant(xenos::kVertexIndexMask);
+          spv::Id index_uint = builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_,
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                      vertex_index),
+              const_index_mask);
+          spv::Id index_min_max[2];
+          for (uint32_t i = 0; i < 2; ++i) {
+            id_vector_temp_.clear();
+            id_vector_temp_.push_back(builder_->makeIntConstant(
+                kSystemConstantTessellationVertexIndexMinMax));
+            id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+            index_min_max[i] = builder_->createBinOp(
+                spv::OpBitwiseAnd, type_uint_,
+                builder_->createLoad(
+                    builder_->createAccessChain(spv::StorageClassUniform,
+                                                uniform_system_constants_,
+                                                id_vector_temp_),
+                    spv::NoPrecision),
+                const_index_mask);
+          }
+          index_uint = builder_->createBinBuiltinCall(
+              type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMax, index_uint,
+              index_min_max[0]);
+          index_uint = builder_->createBinBuiltinCall(
+              type_uint_, ext_inst_glsl_std_450_, GLSLstd450UMin, index_uint,
+              index_min_max[1]);
+          vertex_index =
+              builder_->createUnaryOp(spv::OpBitcast, type_int_, index_uint);
+        }
         WriteVertexIndexToRegister0(vertex_index);
       }
     }

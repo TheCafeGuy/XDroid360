@@ -1,63 +1,57 @@
 name: Bug report
-description: Template for bug reports.
+description: Report a crash, hang, graphical glitch, audio problem or other bug in XDroid360.
 labels: bug
 body:
-  - id: disclaimer
-    type: markdown
+  - type: markdown
     attributes:
       value: |
-        **THIS IS NOT A SUPPORT FORUM!** For support, first read the wiki: https://github.com/xenia-canary/xenia-canary/wiki
-        If your question wasn't answered there or you need help, proceed to #help in the Discord server: https://discord.gg/Q9mxZf9
-
-        Only file issues specific to Xenia Edge. If you're using Xenia Master, Canary, Netplay, etc. file the issue on those bug trackers.
-
-        DO NOT post issues with the macOS port, it's experimental and many games don't work. Once it reaches higher compatibility it will be better supported, for now it is best effort only.
-        
-        If the issue is for a specific game, ONLY file it here if it is a regression in a particular version of Xenia Edge. This means that
-        YOU need to verify it does not occur in some earlier Xenia Edge build or works correctly in Xenia Canary or another Xenia fork.
-        If none of these apply proceed to https://github.com/xenia-canary/game-compatibility#game-compatibility and file the game-specific
-        problem there (chances are someone else already has).
-
-        If the issue is graphical in nature screenshots or videos help. Make sure your screenshots include the title bar of the app so that the
-        build and main config options are clearly identifiable.
-        
+        Only report bugs in XDroid360 builds. Issues in desktop Xenia, Canary or Edge belong on their own trackers.
+        Do not ask for, link to or attach games, disc images, keys or firmware. Such issues are closed and removed.
   - id: validation
     type: checkboxes
     attributes:
       label: Validation
       options:
-      - label: I've read the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ).
+      - label: I use a game I own and dumped myself.
         required: true
-      - label: The Xenia build used is from a Xenia Edge branch. (not Canary/master/netplay/pull requests, etc)
+      - label: I searched existing issues and this one is not reported yet.
         required: true
-      - label: The issue is on Windows or Linux, and NOT macOS which is currently unsupported.
-        required: true
-      - label: This issue isn't for tech support (help with Xenia).
-        required: true
-      - label: If this issue occurs in a specific game, I've identified an earlier build or Xenia fork where the issue does not occur.
-        required: true
-      - label: I've checked if this issue hasn't already been reported.
-        required: true
-      - label: 'My device meets the minimum requirements: https://github.com/xenia-canary/xenia-canary/wiki/Quickstart#system-requirements'
-        required: true
-      - label: '(If building) I have read the building doc: https://github.com/xenia-canary/xenia-canary/blob/master/docs/building.md'
-  - id: problem
-    type: textarea
+  - id: build
+    type: input
     attributes:
-      label: Describe what's going wrong
+      label: Build
+      description: Build hash shown in the app or logged at boot (`XDroid360: build <hash>`).
     validations:
       required: true
-  - id: what-should-happen
-    type: textarea
+  - id: device
+    type: input
     attributes:
-      label: Describe what should happen
+      label: Device and Android version
+      placeholder: e.g. Snapdragon 8 Gen 3 phone, Android 15
     validations:
       required: true
-  - id: callstack
+  - id: driver
+    type: input
+    attributes:
+      label: GPU driver
+      placeholder: system driver, or Turnip version
+    validations:
+      required: true
+  - id: game
+    type: input
+    attributes:
+      label: Game and title ID
+      placeholder: e.g. Ace Combat 6 (4E4D07D1)
+  - id: description
     type: textarea
     attributes:
-      label: If applicable, provide a callstack here, especially for crashes
-  - id: logfile
+      label: What happened, and what you expected
+      description: Steps to reproduce. Screenshots or videos help for graphical bugs.
+    validations:
+      required: true
+  - id: log
     type: textarea
     attributes:
-      label: If applicable, upload a logfile and link it here
+      label: Log
+      description: Attach the log file, or paste the relevant part.
+      render: text

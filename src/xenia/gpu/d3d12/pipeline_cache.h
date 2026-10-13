@@ -180,6 +180,11 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     return reinterpret_cast<const Pipeline*>(handle)->is_placeholder.load(
         std::memory_order_acquire);
   }
+  // Whether the real pipeline is still being created, so awaiting it can help.
+  bool IsPipelineCreationPending(void* handle) const {
+    return reinterpret_cast<const Pipeline*>(handle)->creation_pending.load(
+        std::memory_order_acquire);
+  }
   // Loads the current pipeline state once and reports whether it is a
   // placeholder, and whether that placeholder is the ucode interpreter one.
   // A placeholder draw must bind this concrete PSO instead of the swappable
@@ -558,6 +563,9 @@ class PipelineCache : public GuestSpirvShaderCache::Host {
     // ran before its shaders finished translating has no DXIL to create from,
     // and the entry would otherwise skip its draws for the rest of the session.
     std::atomic<bool> creation_failed{false};
+    // Set while the entry is in the creation queue, cleared once its result,
+    // real or failed, is stored.
+    std::atomic<bool> creation_pending{false};
 
     // Whether the next draw should rebuild this entry from live state.
     bool wants_rebuild() const {

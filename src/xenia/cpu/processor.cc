@@ -455,6 +455,40 @@ Function* Processor::DefineBuiltin(const std::string_view name,
   return function;
 }
 
+void Processor::SetGuestHook(uint32_t address, Function* builtin,
+                             GuestHookKind kind) {
+  std::lock_guard<std::mutex> lock(guest_hooks_mutex_);
+  guest_hooks_[address] = std::make_pair(builtin, kind);
+  if (kind == GuestHookKind::kInstruction) {
+    guest_instruction_hooks_[address] = builtin;
+  } else {
+    guest_instruction_hooks_.erase(address);
+  }
+}
+
+void Processor::GetInstructionHooks(
+    uint32_t start, uint32_t end,
+    std::vector<std::pair<uint32_t, Function*>>& out) {
+  out.clear();
+  std::lock_guard<std::mutex> lock(guest_hooks_mutex_);
+  for (auto it = guest_instruction_hooks_.lower_bound(start);
+       it != guest_instruction_hooks_.end() && it->first <= end; ++it) {
+    out.emplace_back(it->first, it->second);
+  }
+}
+
+bool Processor::GetGuestHook(uint32_t address, Function** builtin_out,
+                             GuestHookKind* kind_out) {
+  std::lock_guard<std::mutex> lock(guest_hooks_mutex_);
+  auto it = guest_hooks_.find(address);
+  if (it == guest_hooks_.end()) {
+    return false;
+  }
+  *builtin_out = it->second.first;
+  *kind_out = it->second.second;
+  return true;
+}
+
 Function* Processor::QueryFunction(uint32_t address) {
   auto entry = entry_table_.Get(address);
   if (!entry) {

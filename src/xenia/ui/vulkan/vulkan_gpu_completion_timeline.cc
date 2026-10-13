@@ -10,16 +10,36 @@
 #include "xenia/ui/vulkan/vulkan_gpu_completion_timeline.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <iterator>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <pthread.h>
+#endif
+
+DEFINE_uint32(vulkan_fence_poll_interval_ms, 4,
+              "Without vulkan_async_fence_waiter, poll submission fences at "
+              "most this often (ms). 0 = on every check.",
+              "Vulkan");
+DEFINE_bool(
+    vulkan_async_fence_waiter, false,
+    "Wait on Vulkan submission fences on a dedicated thread instead of polling "
+    "them with vkGetFenceStatus on the submitting thread. Helps drivers where "
+    "a fence status query sleeps in the kernel (Turnip on kgsl).",
+    "Vulkan");
 
 namespace xe {
 namespace ui {
 namespace vulkan {
 
 VulkanGPUCompletionTimeline::~VulkanGPUCompletionTimeline() {
+  StopWaiter();
+
 #ifndef NDEBUG
   assert_zero(fences_acquired_);
 #endif
@@ -126,6 +146,65 @@ VkResult VulkanGPUCompletionTimeline::AcquireFenceAndSubmit(
 }
 
 void VulkanGPUCompletionTimeline::UpdateCompletedSubmission() {
+  if (waiter_enabled_) {
+    if (waiter_lost_.load(std::memory_order_acquire)) {
+      if (!waiter_lost_reported_) {
+        waiter_lost_reported_ = true;
+        if (vulkan_device_->SetLost()) {
+          vulkan_device_->LogFaultInfo();
+        }
+      }
+      return;
+    }
+    const uint64_t done = waiter_completed_.load(std::memory_order_acquire);
+    while (!pending_submission_fences_.empty() &&
+           pending_submission_fences_.front().first <= done) {
+      SetCompletedSubmission(pending_submission_fences_.front().first);
+      free_fences_.push_back(pending_submission_fences_.front().second);
+      pending_submission_fences_.pop_front();
+    }
+    return;
+  }
+  if (completion_hint_) {
+    const uint32_t hint = *completion_hint_;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    while (!pending_submission_fences_.empty() &&
+           int32_t(hint - uint32_t(pending_submission_fences_.front().first)) >=
+               0) {
+      const VkResult fence_status =
+          vulkan_device_->functions().vkGetFenceStatus(
+              vulkan_device_->device(),
+              pending_submission_fences_.front().second);
+      if (fence_status != VK_SUCCESS) {
+        if (fence_status == VK_ERROR_DEVICE_LOST) {
+          XELOGE(
+              "VulkanGPUCompletionTimeline[{}]: DEVICE_LOST polling fence for "
+              "submission {} ({} fences pending)",
+              name_, pending_submission_fences_.front().first,
+              pending_submission_fences_.size());
+          if (vulkan_device_->SetLost()) {
+            vulkan_device_->LogFaultInfo();
+          }
+        }
+        break;
+      }
+      SetCompletedSubmission(pending_submission_fences_.front().first);
+      free_fences_.push_back(pending_submission_fences_.front().second);
+      pending_submission_fences_.pop_front();
+    }
+    return;
+  }
+  // Single-threaded alternative to the waiter: poll at most every
+  // vulkan_fence_poll_interval_ms, so the submitting thread rarely enters the
+  // (sleeping) fence status query. Blocking awaits are unaffected.
+  if (cvars::vulkan_fence_poll_interval_ms) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_poll_time_ <
+        std::chrono::milliseconds(cvars::vulkan_fence_poll_interval_ms)) {
+      return;
+    }
+    last_poll_time_ = now;
+  }
   while (!pending_submission_fences_.empty()) {
     const VkResult fence_status = vulkan_device_->functions().vkGetFenceStatus(
         vulkan_device_->device(), pending_submission_fences_.front().second);
@@ -149,8 +228,122 @@ void VulkanGPUCompletionTimeline::UpdateCompletedSubmission() {
   }
 }
 
+void VulkanGPUCompletionTimeline::OnFenceSubmitted(const uint64_t submission,
+                                                   const VkFence fence) {
+  if (!waiter_decided_) {
+    waiter_decided_ = true;
+    waiter_enabled_ = cvars::vulkan_async_fence_waiter;
+    if (waiter_enabled_) {
+      waiter_thread_ = std::thread([this]() { WaiterMain(); });
+    }
+  }
+  if (!waiter_enabled_) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(waiter_mutex_);
+    waiter_queue_.emplace_back(submission, fence);
+  }
+  waiter_cv_.notify_one();
+}
+
+void VulkanGPUCompletionTimeline::WaiterMain() {
+#if defined(__linux__) || defined(__ANDROID__)
+  pthread_setname_np(pthread_self(), "VkFenceWaiter");
+#endif
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  const VkDevice device = vulkan_device_->device();
+  std::unique_lock<std::mutex> lock(waiter_mutex_);
+  while (true) {
+    waiter_cv_.wait(lock, [this]() {
+      return waiter_stop_.load(std::memory_order_relaxed) ||
+             !waiter_queue_.empty();
+    });
+    if (waiter_stop_.load(std::memory_order_relaxed)) {
+      break;
+    }
+    const std::pair<uint64_t, VkFence> front = waiter_queue_.front();
+    lock.unlock();
+    VkResult result;
+    do {
+      // Bounded so that a stop request is noticed.
+      result = dfn.vkWaitForFences(device, 1, &front.second, VK_TRUE,
+                                   UINT64_C(50000000));
+    } while (result == VK_TIMEOUT &&
+             !waiter_stop_.load(std::memory_order_relaxed));
+    lock.lock();
+    if (result == VK_SUCCESS) {
+      waiter_queue_.pop_front();
+      waiter_completed_.store(front.first, std::memory_order_release);
+    } else if (result != VK_TIMEOUT) {
+      XELOGE(
+          "VulkanGPUCompletionTimeline[{}]: fence waiter vkWaitForFences -> {} "
+          "(submission {})",
+          name_, vk::to_string(vk::Result(result)), front.first);
+      waiter_lost_.store(true, std::memory_order_release);
+      completed_cv_.notify_all();
+      waiter_cv_.wait(lock, [this]() {
+        return waiter_stop_.load(std::memory_order_relaxed);
+      });
+      break;
+    }
+    completed_cv_.notify_all();
+  }
+}
+
+void VulkanGPUCompletionTimeline::StopWaiter() {
+  if (!waiter_thread_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(waiter_mutex_);
+    waiter_stop_.store(true, std::memory_order_relaxed);
+  }
+  waiter_cv_.notify_all();
+  waiter_thread_.join();
+}
+
+bool VulkanGPUCompletionTimeline::WaitSubmissionFor(
+    const uint64_t awaited_submission, const uint32_t timeout_ms) {
+  if (waiter_enabled_) {
+    std::unique_lock<std::mutex> lock(waiter_mutex_);
+    return completed_cv_.wait_for(
+        lock, std::chrono::milliseconds(timeout_ms),
+        [this, awaited_submission]() {
+          return waiter_completed_.load(std::memory_order_acquire) >=
+                     awaited_submission ||
+                 waiter_lost_.load(std::memory_order_acquire);
+        });
+  }
+  VkFence fence = VK_NULL_HANDLE;
+  for (const auto& pending : pending_submission_fences_) {
+    if (pending.first > awaited_submission) {
+      break;
+    }
+    fence = pending.second;
+  }
+  if (fence == VK_NULL_HANDLE) {
+    return true;
+  }
+  return vulkan_device_->functions().vkWaitForFences(
+             vulkan_device_->device(), 1, &fence, VK_TRUE,
+             uint64_t(timeout_ms) * 1000000) != VK_TIMEOUT;
+}
+
 void VulkanGPUCompletionTimeline::AwaitSubmissionImpl(
     const uint64_t awaited_submission) {
+  if (waiter_enabled_) {
+    {
+      std::unique_lock<std::mutex> lock(waiter_mutex_);
+      completed_cv_.wait(lock, [this, awaited_submission]() {
+        return waiter_completed_.load(std::memory_order_acquire) >=
+                   awaited_submission ||
+               waiter_lost_.load(std::memory_order_acquire);
+      });
+    }
+    UpdateCompletedSubmission();
+    return;
+  }
   // According to the Vulkan 1.4.335 specification:
   // "The first synchronization scope includes every batch submitted in the same
   // queue submission command. Fence signal operations that are defined by

@@ -188,6 +188,9 @@ class XexModule : public xe::cpu::Module {
   }
 
   const uint32_t base_address() const { return base_address_; }
+  // Bounds of the code sections ([low, high)), once loaded.
+  uint32_t code_low_address() const { return low_address_; }
+  uint32_t code_high_address() const { return high_address_; }
   const bool is_dev_kit() const { return is_dev_kit_; }
 
   // Section type of the image page containing `address`.

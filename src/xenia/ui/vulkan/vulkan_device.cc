@@ -10,6 +10,7 @@
 #include "xenia/ui/vulkan/vulkan_device.h"
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 
@@ -18,6 +19,16 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+// XDroid360: kgsl logged "Preemption Fault: cur=2 ... next=1"
+// in our context right after a notification / HUD redraw asked for the GPU at
+// a higher ring; the failed preemption wedged the whole GPU. A high global
+// priority puts our queue on a ring that system UI work does not preempt.
+DEFINE_string(vulkan_queue_global_priority, "high",
+              "Vulkan queue global priority (VK_KHR/EXT_global_priority): "
+              "\"\" (driver default), low, medium, high, realtime. Falls back "
+              "to the default if the driver refuses it.",
+              "Vulkan");
 
 namespace xe {
 namespace ui {
@@ -194,6 +205,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   bool ext_1_3_EXT_subgroup_size_control = false;
   bool ext_KHR_fragment_shader_barycentric = false;
   bool ext_NV_fragment_shader_barycentric = false;
+  bool ext_KHR_global_priority = false;
+  bool ext_EXT_global_priority = false;
+  if (with_gpu_emulation && !cvars::vulkan_queue_global_priority.empty()) {
+    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_global_priority)
+    XE_UI_VULKAN_LOCAL_EXTENSION(EXT_global_priority)
+  }
   if (with_gpu_emulation) {
     // #15.
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1,
@@ -238,6 +255,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (get_physical_device_properties2_supported) {
       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_device_fault)
     }
+    // #180. GPU breadcrumbs (vulkan_gpu_breadcrumbs); no feature struct.
+    XE_UI_VULKAN_STRUCT_EXTENSION(AMD_buffer_marker)
     // #179. Import guest RAM as device memory for a zero-copy shared-memory
     // buffer that aliases guest RAM.
     if (get_physical_device_properties2_supported) {
@@ -657,6 +676,34 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     queue_create_info.queueCount = uint32_t(queue_family.queues.size());
     queue_create_info.pQueuePriorities = queue_priorities.data();
   }
+  VkDeviceQueueGlobalPriorityCreateInfoKHR queue_global_priority_info = {
+      VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR};
+  bool queue_global_priority_requested = false;
+  if (ext_KHR_global_priority || ext_EXT_global_priority) {
+    const std::string& priority_name = cvars::vulkan_queue_global_priority;
+    VkQueueGlobalPriorityKHR priority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+    bool priority_valid = true;
+    if (priority_name == "low") {
+      priority = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR;
+    } else if (priority_name == "medium") {
+      priority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+    } else if (priority_name == "high") {
+      priority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
+    } else if (priority_name == "realtime") {
+      priority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+    } else {
+      priority_valid = false;
+      XELOGW("Unknown vulkan_queue_global_priority '{}', using the default",
+             priority_name);
+    }
+    if (priority_valid) {
+      queue_global_priority_info.globalPriority = priority;
+      for (VkDeviceQueueCreateInfo& queue_create_info : queue_create_infos) {
+        queue_create_info.pNext = &queue_global_priority_info;
+      }
+      queue_global_priority_requested = true;
+    }
+  }
   device_create_info.queueCreateInfoCount = uint32_t(queue_create_infos.size());
   device_create_info.pQueueCreateInfos = queue_create_infos.data();
 
@@ -984,8 +1031,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Create the device.
 
-  const VkResult device_create_result = ifn.vkCreateDevice(
+  VkResult device_create_result = ifn.vkCreateDevice(
       physical_device, &device_create_info, nullptr, &device->device_);
+  if (queue_global_priority_requested) {
+    if (device_create_result == VK_ERROR_NOT_PERMITTED_KHR ||
+        device_create_result == VK_ERROR_INITIALIZATION_FAILED) {
+      XELOGW("Vulkan queue global priority '{}' refused ({}), using the default",
+             cvars::vulkan_queue_global_priority,
+             vk::to_string(vk::Result(device_create_result)));
+      for (VkDeviceQueueCreateInfo& queue_create_info : queue_create_infos) {
+        queue_create_info.pNext = nullptr;
+      }
+      device_create_result = ifn.vkCreateDevice(
+          physical_device, &device_create_info, nullptr, &device->device_);
+    } else if (device_create_result == VK_SUCCESS) {
+      XELOGI("Vulkan queue global priority: {}",
+             cvars::vulkan_queue_global_priority);
+    }
+  }
   if (device_create_result != VK_SUCCESS) {
     XELOGE(
         "Failed to create a Vulkan logical device from the physical device "
@@ -1065,6 +1128,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         ifn.vkGetDeviceProcAddr(device->device_, "vkGetDeviceFaultInfoEXT"));
     if (!device->vkGetDeviceFaultInfoEXT_) {
       device->extensions_.ext_EXT_device_fault = false;
+    }
+  }
+  if (device->extensions_.ext_AMD_buffer_marker) {
+    device->vkCmdWriteBufferMarkerAMD_ = PFN_vkCmdWriteBufferMarkerAMD(
+        ifn.vkGetDeviceProcAddr(device->device_, "vkCmdWriteBufferMarkerAMD"));
+    if (!device->vkCmdWriteBufferMarkerAMD_) {
+      device->extensions_.ext_AMD_buffer_marker = false;
     }
   }
 

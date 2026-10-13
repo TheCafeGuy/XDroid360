@@ -551,8 +551,8 @@ bool D3D12SharedMemory::UploadRanges(
   for (uint32_t i = 0; i < num_upload_page_ranges; ++i) {
     uint32_t range_base = upload_page_ranges[i].first << page_size_log2();
     uint32_t range_size = upload_page_ranges[i].second << page_size_log2();
-    if (command_processor_.EnsureMemexportRangeInDeviceBuffer(range_base,
-                                                              range_size)) {
+    if (command_processor_.EnsureMemexportRangeInDeviceBuffer(
+            range_base, range_size, true)) {
       MakeRangeValid(range_base, range_size, false);
       continue;
     }

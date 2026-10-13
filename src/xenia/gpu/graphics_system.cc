@@ -150,14 +150,6 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
           kernel_state_, 128 * 1024, 0,
           [this]() {
             uint64_t last_frame_time = Clock::QueryGuestTickCount();
-    // Sleep for 90% of the vblank duration on Windows/macOS, spin for 10%
-    // Linux uses full sleep duration due to scheduler quantum issues
-#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
-            constexpr double duration_scalar = 0.90;
-#elif XE_PLATFORM_LINUX
-            constexpr double duration_scalar = 1.0;
-#endif
-
             while (frame_limiter_worker_running_) {
               // If there is no title running then there is no need for guest
               // frame limiter thread.
@@ -175,13 +167,8 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
               bool refresh_cap_enabled = cvars::guest_display_refresh_cap;
 
               if (refresh_cap_enabled) {
-                const uint32_t vblank_hz = GetGuestVblankRateHz();
-                const uint64_t sleep_ns = static_cast<uint64_t>(
-                    (1000000000.0 / static_cast<double>(vblank_hz)) *
-                    duration_scalar);
-
-#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
-                // Windows/macOS: time-gating + 90% sleep + 10% spin
+                const uint32_t vblank_hz =
+                    GetGuestVblankRateHz() * GetFastForwardMultiplier();
                 const uint64_t tick_freq = Clock::guest_tick_frequency();
                 const uint64_t target_duration_ticks = tick_freq / vblank_hz;
                 const uint64_t current_time = Clock::QueryGuestTickCount();
@@ -195,16 +182,32 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                     last_frame_time += target_duration_ticks;
                   }
                   MarkVblank();
+#if XE_PLATFORM_WIN32 || XE_PLATFORM_MAC
+                  // Sleep for 90% of the period, spin for the rest.
+                  const uint64_t sleep_ns = static_cast<uint64_t>(
+                      900000000.0 / (vblank_hz * Clock::guest_time_scalar()));
 #if XE_PLATFORM_MAC
                   threading::NanoSleepPrecise(sleep_ns);
 #else
                   threading::NanoSleep(sleep_ns);
 #endif
+#endif
                 }
-#elif XE_PLATFORM_LINUX
-                // Linux: simplified timing to avoid oversleeping
-                MarkVblank();
-                threading::NanoSleep(sleep_ns);
+#if XE_PLATFORM_LINUX
+                else {
+                  // Sleep to the deadline, so a late wake-up shortens the
+                  // next sleep instead of stretching the period.
+                  int64_t sleep_ns = static_cast<int64_t>(
+                      (target_duration_ticks - time_delta) * 1000000000.0 /
+                      (tick_freq * Clock::guest_time_scalar()));
+                  // XDroid360: the guest clock may be slowed only for a
+                  // moment (xdroid_time_coupling); re-check it every 2 ms
+                  // so restoring it does not leave a vblank sleeping late.
+                  if (Clock::guest_time_scalar() < 1.0) {
+                    sleep_ns = std::min<int64_t>(sleep_ns, 2000000);
+                  }
+                  threading::NanoSleep(sleep_ns);
+                }
 #endif
               } else {
                 // Unlimited mode (guest_display_refresh_cap=false) - fire
@@ -221,8 +224,14 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
   frame_limiter_worker_thread_->set_can_debugger_suspend(true);
   frame_limiter_worker_thread_->set_name("GPU Frame limiter");
   frame_limiter_worker_thread_->Create();
+  // Linux only sleeps, so kLowest (nice 15) would just add wake-up latency.
+#if XE_PLATFORM_LINUX
+  frame_limiter_worker_thread_->thread()->set_priority(
+      threading::ThreadPriority::kNormal);
+#else
   frame_limiter_worker_thread_->thread()->set_priority(
       threading::ThreadPriority::kLowest);
+#endif
   if (cvars::trace_gpu_stream) {
     BeginTracing();
   }
@@ -256,6 +265,9 @@ void GraphicsSystem::Shutdown() {
   provider_.reset();
 }
 
+GraphicsSystem::HostGpuLossHandler GraphicsSystem::host_gpu_loss_handler_ =
+    nullptr;
+
 void GraphicsSystem::OnHostGpuLossFromAnyThread(
     [[maybe_unused]] bool is_responsible) {
   // TODO(Triang3l): Somehow gain exclusive ownership of the Provider (may be
@@ -274,6 +286,9 @@ void GraphicsSystem::OnHostGpuLossFromAnyThread(
 
   config::SaveConfig();
 
+  if (host_gpu_loss_handler_) {
+    host_gpu_loss_handler_();
+  }
   xe::FatalError("Graphics device lost (probably due to an internal error)");
 }
 
@@ -394,6 +409,8 @@ void GraphicsSystem::MarkVblank() {
     vblank_period_ticks_.store(now - prev, std::memory_order_release);
   }
 
+  vblank_count_.fetch_add(1, std::memory_order_relaxed);
+
   // Increment vblank counter (so the game sees us making progress).
   command_processor_->increment_counter();
 
@@ -401,6 +418,7 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  command_processor_->NotifyVblank();
 }
 
 void GraphicsSystem::ClearCaches() {

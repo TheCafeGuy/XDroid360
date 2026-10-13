@@ -87,6 +87,7 @@ node_modules/
 /build-vs/
 /build-arm64/
 /build-x64/
+/build-host/
 
 # Downloaded Slang shader compiler (xenia-build.py ensure_slangc)
 /.slang/
@@ -97,6 +98,14 @@ node_modules/
 # CMake user-specific overrides + compile commands export
 CMakeUserPresets.json
 /compile_commands.json
+
+# ==============================================================================
+# XDroid360 Android frontend (machine-local, never commit)
+# ==============================================================================
+local.properties
+.gradle/
+xdroid-app/build/
+xdroid-core/build/
 
 # ==============================================================================
 # Local-only paths
@@ -119,3 +128,11 @@ CMakeUserPresets.json
 /cache0
 /devkit
 recent.toml
+
+xdroid-core/.cxx/
+xdroid-app/.cxx/
+
+/.cache/
+
+# Exported APKs for testers
+out/

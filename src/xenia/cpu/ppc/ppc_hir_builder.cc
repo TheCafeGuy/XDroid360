@@ -120,11 +120,30 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
   // Always mark entry with label.
   label_list_[0] = NewLabel();
 
+  // Native hook registered for this guest function (Processor::SetGuestHook).
+  {
+    Function* hook = nullptr;
+    Processor::GuestHookKind hook_kind;
+    if (frontend_->processor()->GetGuestHook(start_address_, &hook,
+                                             &hook_kind)) {
+      CallExtern(hook);
+      if (hook_kind == Processor::GuestHookKind::kReplace) {
+        Return();
+        return Finalize();
+      }
+    }
+  }
+
   uint32_t start_address = function_->address();
   uint32_t end_address = function_->end_address();
+  // Native hooks before instructions inside the body (kInstruction), by
+  // address; one at the start already ran as the entry hook above.
+  std::vector<std::pair<uint32_t, Function*>> instruction_hooks;
+  frontend_->processor()->GetInstructionHooks(start_address + 4, end_address,
+                                              instruction_hooks);
+  size_t next_instruction_hook = 0;
   for (uint32_t address = start_address, offset = 0; address <= end_address;
        address += 4, offset++) {
-    trace_info_.dest_count = 0;
     uint32_t code = xe::load_and_swap<uint32_t>(module->TranslateCode(address));
     auto opcode = LookupOpcode(code);
     auto& opcode_info = GetOpcodeInfo(opcode);
@@ -178,6 +197,14 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
     }
 
     MaybeBreakOnInstruction(address);
+
+    // After the label, so branches to this instruction also run the hook.
+    if (next_instruction_hook < instruction_hooks.size() &&
+        instruction_hooks[next_instruction_hook].first == address) {
+      ContextBarrier();
+      CallExtern(instruction_hooks[next_instruction_hook].second);
+      ++next_instruction_hook;
+    }
 
     InstrData i;
     i.address = address;
@@ -342,10 +369,6 @@ Value* PPCHIRBuilder::LoadLR() {
 void PPCHIRBuilder::StoreLR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, lr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 64;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCTR() {
@@ -355,10 +378,6 @@ Value* PPCHIRBuilder::LoadCTR() {
 void PPCHIRBuilder::StoreCTR(Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, ctr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 65;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadCR() {
@@ -479,10 +498,6 @@ Value* PPCHIRBuilder::LoadFPSCR() {
 void PPCHIRBuilder::StoreFPSCR(Value* value) {
   assert_true(value->type == INT32_TYPE);
   StoreContext(offsetof(PPCContext, fpscr), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 67;
-  trace_reg.value = value;
 }
 
 // Writes FX, FEX, VX and OX, the four bits CR1 mirrors. FEX needs the exception
@@ -746,10 +761,6 @@ Value* PPCHIRBuilder::LoadCA() {
 void PPCHIRBuilder::StoreCA(Value* value) {
   assert_true(value->type == INT8_TYPE);
   StoreContext(offsetof(PPCContext, xer_ca), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 66;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadSAT() {
@@ -759,10 +770,6 @@ Value* PPCHIRBuilder::LoadSAT() {
 void PPCHIRBuilder::StoreSAT(Value* value) {
   value = Truncate(value, INT8_TYPE);
   StoreContext(offsetof(PPCContext, vscr_sat), value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 44;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
@@ -772,10 +779,6 @@ Value* PPCHIRBuilder::LoadGPR(uint32_t reg) {
 void PPCHIRBuilder::StoreGPR(uint32_t reg, Value* value) {
   assert_true(value->type == INT64_TYPE);
   StoreContext(offsetof(PPCContext, r) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
@@ -785,10 +788,6 @@ Value* PPCHIRBuilder::LoadFPR(uint32_t reg) {
 void PPCHIRBuilder::StoreFPR(uint32_t reg, Value* value) {
   assert_true(value->type == FLOAT64_TYPE);
   StoreContext(offsetof(PPCContext, f) + reg * 8, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = reg + 32;
-  trace_reg.value = value;
 }
 
 Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
@@ -798,10 +797,6 @@ Value* PPCHIRBuilder::LoadVR(uint32_t reg) {
 void PPCHIRBuilder::StoreVR(uint32_t reg, Value* value) {
   assert_true(value->type == VEC128_TYPE);
   StoreContext(offsetof(PPCContext, v) + reg * 16, value);
-
-  auto& trace_reg = trace_info_.dests[trace_info_.dest_count++];
-  trace_reg.reg = 128 + reg;
-  trace_reg.value = value;
 }
 
 void PPCHIRBuilder::SetReturnAddress(Value* value) {

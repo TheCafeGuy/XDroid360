@@ -33,6 +33,16 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // Position of the arguments of the most recently written command, valid
+  // until Reset, for patching a command after recording it.
+  size_t last_command_arguments_offset() const {
+    return last_arguments_offset_;
+  }
+  // Rewrites the render area of a kVkBeginRendering (dynamic_rendering) or
+  // kVkBeginRenderPass command recorded at arguments_offset.
+  void PatchRenderArea(size_t arguments_offset, bool dynamic_rendering,
+                       const VkRect2D& render_area);
+
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
                             VkSubpassContents contents) {
@@ -272,6 +282,23 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
+  void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
+                              VkBuffer dst_buffer, uint32_t region_count,
+                              const VkBufferImageCopy* regions) {
+    const size_t header_size =
+        xe::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
+        WriteCommand(Command::kVkCopyImageToBuffer,
+                     header_size + sizeof(VkBufferImageCopy) * region_count));
+    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(args_ptr);
+    args.src_image = src_image;
+    args.src_image_layout = src_image_layout;
+    args.dst_buffer = dst_buffer;
+    args.region_count = region_count;
+    std::memcpy(args_ptr + header_size, regions,
+                sizeof(VkBufferImageCopy) * region_count);
+  }
+
   void CmdVkFillBuffer(VkBuffer dst_buffer, VkDeviceSize dst_offset,
                        VkDeviceSize size, uint32_t data) {
     auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
@@ -280,6 +307,18 @@ class DeferredCommandBuffer {
     args.dst_offset = dst_offset;
     args.size = size;
     args.data = data;
+  }
+
+  // VK_AMD_buffer_marker, skipped on replay if the device has no such command.
+  void CmdVkWriteBufferMarkerAMD(VkPipelineStageFlagBits pipeline_stage,
+                                 VkBuffer dst_buffer, VkDeviceSize dst_offset,
+                                 uint32_t marker) {
+    auto& args = *reinterpret_cast<ArgsVkWriteBufferMarkerAMD*>(WriteCommand(
+        Command::kVkWriteBufferMarkerAMD, sizeof(ArgsVkWriteBufferMarkerAMD)));
+    args.pipeline_stage = pipeline_stage;
+    args.dst_buffer = dst_buffer;
+    args.dst_offset = dst_offset;
+    args.marker = marker;
   }
 
   VkImageBlit* CmdBlitImageEmplace(VkImage src_image,
@@ -336,14 +375,10 @@ class DeferredCommandBuffer {
                 regions, sizeof(VkImageBlit) * region_count);
   }
 
+  // Out of line: the command processor wraps every dispatch in breadcrumbs
+  // and logs absurd sizes (STAB-S1).
   void CmdVkDispatch(uint32_t group_count_x, uint32_t group_count_y,
-                     uint32_t group_count_z) {
-    auto& args = *reinterpret_cast<ArgsVkDispatch*>(
-        WriteCommand(Command::kVkDispatch, sizeof(ArgsVkDispatch)));
-    args.group_count_x = group_count_x;
-    args.group_count_y = group_count_y;
-    args.group_count_z = group_count_z;
-  }
+                     uint32_t group_count_z);
 
   void CmdVkDraw(uint32_t vertex_count, uint32_t instance_count,
                  uint32_t first_vertex, uint32_t first_instance) {
@@ -510,7 +545,9 @@ class DeferredCommandBuffer {
     kVkClearColorImage,
     kVkCopyBuffer,
     kVkCopyBufferToImage,
+    kVkCopyImageToBuffer,
     kVkFillBuffer,
+    kVkWriteBufferMarkerAMD,
     kVkBlitImage,
     kVkCopyImage,
     kVkDispatch,
@@ -647,6 +684,15 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
   };
 
+  struct ArgsVkCopyImageToBuffer {
+    VkImage src_image;
+    VkImageLayout src_image_layout;
+    VkBuffer dst_buffer;
+    uint32_t region_count;
+    // Followed by aligned VkBufferImageCopy[].
+    static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
+  };
+
   struct ArgsVkCopyBufferToImage {
     VkBuffer src_buffer;
     VkImage dst_image;
@@ -661,6 +707,13 @@ class DeferredCommandBuffer {
     VkDeviceSize dst_offset;
     VkDeviceSize size;
     uint32_t data;
+  };
+
+  struct ArgsVkWriteBufferMarkerAMD {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkBuffer dst_buffer;
+    VkDeviceSize dst_offset;
+    uint32_t marker;
   };
 
   struct ArgsVkBlitImage {
@@ -767,6 +820,7 @@ class DeferredCommandBuffer {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  size_t last_arguments_offset_ = 0;
 };
 
 }  // namespace vulkan

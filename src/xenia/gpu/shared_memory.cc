@@ -685,6 +685,46 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
                         (page_last - page_first + 1) << page_size_log2_);
 }
 
+bool SharedMemory::XdroidRangeValid(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return true;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    if (!(system_page_flags_valid_[page >> 6] & (uint64_t(1) << (page & 63)))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void SharedMemory::XdroidForceReupload(uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  bool any = false;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    if ((system_page_flags_valid_and_gpu_written_[page >> 6] & bit) ||
+        !(system_page_flags_valid_[page >> 6] & bit)) {
+      continue;
+    }
+    system_page_flags_valid_[page >> 6] &= ~bit;
+    dirty_blocks_ |= 1u << ((page >> 6) >> 6);
+    any = true;
+  }
+  if (any) {
+    FireWatches(page_first, page_last, false);
+  }
+}
+
 void SharedMemory::PrepareForTraceDownload() {
   ReleaseTraceDownloadRanges();
   assert_true(trace_download_ranges_.empty());

@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -383,6 +384,13 @@ class PhysicalHeap : public BaseHeap {
                         bool invalidate_unwatched = false,
                         bool contents_discarded = false);
 
+  // For a fault on a read-watched page, with the global lock held once: calls
+  // the read callbacks with it released, so waiting on the GPU there stalls
+  // only the faulting thread. The watch stays armed, so TriggerCallbacks, under
+  // the lock again, still decides the access.
+  void ProvideReadWatchedPage(global_unique_lock_type& global_lock_locked_once,
+                              uint32_t virtual_address, bool is_write);
+
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
   uint32_t SystemPagenumToGuestPagenum(uint32_t num) const {
@@ -629,11 +637,6 @@ class Memory {
   // result of a write access violation, so the shortest common range returned
   // by all the invalidation callbacks (clamped to a sane range and also not to
   // touch pages with provider callbacks) is unprotected.
-  //
-  // - Data providers:
-  //
-  // TODO(Triang3l): Implement data providers - more complicated because they
-  // will need to be able to release the global lock.
 
   // Returns start and length of the smallest physical memory region surrounding
   // the watched region that can be safely unwatched, if it doesn't matter,
@@ -661,8 +664,9 @@ class Memory {
   // Called on the first CPU access of a page armed as a read watch (via
   // EnablePhysicalMemoryAccessCallbacks with data providers). The page is
   // downgraded and unwatched right after, so it fires once per arm. A write
-  // that drops read watches calls it too, before the write proceeds. It runs in
-  // the fault handler under the global critical region, so it may wait only for
+  // that drops read watches calls it too, before the write proceeds. A fault
+  // calls it twice, first without the global critical region, where waiting
+  // stalls only the faulting thread, then under it, where it may wait only for
   // what needs no other thread to progress, like already submitted GPU work.
   typedef void (*PhysicalMemoryReadCallback)(void* context_ptr,
                                              uint32_t physical_address_start,
@@ -821,6 +825,9 @@ class Memory {
       physical_memory_invalidation_callbacks_;
   std::vector<std::pair<PhysicalMemoryReadCallback, void*>*>
       physical_memory_read_callbacks_;
+  // Held shared across read callbacks called without the global lock, so
+  // unregistering waits for them to return.
+  std::shared_mutex physical_memory_read_callback_calls_mutex_;
 };
 
 }  // namespace xe

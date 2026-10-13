@@ -130,6 +130,13 @@ class CommandProcessor {
   virtual ~CommandProcessor();
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+  // Wakes a WAIT_REG_MEM sleeping out the guest-specified poll interval,
+  // after the vblank interrupt callback ran (it usually satisfies the wait).
+  void NotifyVblank() {
+    if (vblank_event_) {
+      vblank_event_->Set();
+    }
+  }
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -600,6 +607,7 @@ class CommandProcessor {
   uint32_t read_ptr_writeback_ptr_ = 0;
 
   std::unique_ptr<xe::threading::Event> write_ptr_index_event_;
+  std::unique_ptr<xe::threading::Event> vblank_event_;
   std::atomic<uint32_t> write_ptr_index_;
 
   uint64_t bin_select_ = 0xFFFFFFFFull;

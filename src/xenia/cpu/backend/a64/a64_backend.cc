@@ -283,6 +283,15 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
 
   code_offsets.body = getSize();
 
+  // Host C code runs with the AAPCS64 default FPCR (round to nearest, no
+  // flush-to-zero), not the guest's scalar mode: mtfsf can put rounding
+  // controls or FPSCR.NI (FZ) in fpcr_fpu, which host code must not inherit.
+  Xbyak_aarch64::Label host_fpcr_ready;
+  mrs(x11, 3, 3, 4, 4, 0);  // mrs x11, FPCR
+  cbz(x11, host_fpcr_ready);
+  msr(3, 3, 4, 4, 0, xzr);
+  L(host_fpcr_ready);
+
   // Call host function.
   // AAPCS64: x0=first arg. We set x0=context (from x20).
   mov(x9, x0);   // x9 = target function (scratch)

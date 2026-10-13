@@ -322,14 +322,17 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         false, true, false, false, false, source_texture_parameters,
         spv::ImageOperandsMaskNone);
     if (key.is_depth) {
-      source_texture_parameters.sampler =
-          builder.createLoad(source_stencil_texture, spv::NoPrecision);
-      spv::Id source_stencil = builder.createCompositeExtract(
-          builder.createTextureCall(
-              spv::NoPrecision, builder.makeVectorType(type_uint, 4), false,
-              true, false, false, false, source_texture_parameters,
-              spv::ImageOperandsMaskNone),
-          type_uint, 0);
+      spv::Id source_stencil = builder.makeUintConstant(0);
+      if (!key.skip_stencil) {
+        source_texture_parameters.sampler =
+            builder.createLoad(source_stencil_texture, spv::NoPrecision);
+        source_stencil = builder.createCompositeExtract(
+            builder.createTextureCall(
+                spv::NoPrecision, builder.makeVectorType(type_uint, 4), false,
+                true, false, false, false, source_texture_parameters,
+                spv::ImageOperandsMaskNone),
+            type_uint, 0);
+      }
       spv::Id source_depth32 =
           builder.createCompositeExtract(source_vec4, type_float, 0);
       switch (key.GetDepthFormat()) {

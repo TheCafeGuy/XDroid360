@@ -53,6 +53,9 @@ union EdramDumpShaderKey {
     // is written in the group-packed layout, out of a windowed binding, so the
     // destination base push constant is unused there.
     uint32_t direct_resolve : 1;
+    // STAB-S1 forensic (temp): a depth source skips its stencil fetch and
+    // packs stencil 0.
+    uint32_t skip_stencil : 1;
   };
 
   EdramDumpShaderKey() : key(0) { static_assert_size(*this, sizeof(key)); }

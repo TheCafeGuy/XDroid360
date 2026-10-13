@@ -640,8 +640,8 @@ bool VulkanSharedMemory::UploadRanges(
   for (uint32_t i = 0; i < num_upload_ranges; ++i) {
     uint32_t range_base = upload_page_ranges[i].first << page_size_log2();
     uint32_t range_size = upload_page_ranges[i].second << page_size_log2();
-    if (command_processor_.EnsureMemexportRangeInDeviceBuffer(range_base,
-                                                              range_size)) {
+    if (command_processor_.EnsureMemexportRangeInDeviceBuffer(
+            range_base, range_size, true)) {
       MakeRangeValid(range_base, range_size, false);
       continue;
     }
@@ -664,6 +664,7 @@ bool VulkanSharedMemory::UploadRanges(
                          << page_size_log2()));
   // Submit barriers (may end render pass) before pushing debug marker so
   // EndRenderPass is not inside the SharedMem Upload marker.
+  command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kUpload);
   command_processor_.SubmitBarriers(true);
 
   // Calculate total upload size for debug marker.

@@ -52,6 +52,9 @@ class GuestScheduler {
   // after).
   void EnsureStarted();
   void Shutdown();
+  // The host app paused emulation (guest threads suspended): the watchdog
+  // sleeps until resumed instead of ticking every quantum (CE-4).
+  void SetHostPaused(bool paused);
 
   // Adds |thread| to its CPU's ready queue by guest affinity and wakes that
   // CPU. Idempotent and safe to call from any host thread. A thread already
@@ -66,6 +69,13 @@ class GuestScheduler {
   // Re-links a ready thread into its correct priority level after a priority
   // change. No-op if not queued.
   void RequeueForPriority(XThread* thread);
+
+  // XDroid360 (AUD-2): 0 running, 1 ready, 2 blocked, 3 other.
+  int XdroidThreadState(XThread* thread);
+  // Moves a ready |thread| to the head of its ready list and asks the fiber
+  // running on its CPU to yield at its next safepoint, so it runs next.
+  // Returns false if it was not ready.
+  bool XdroidBoostReady(XThread* thread);
 
   // Moves a ready thread to the CPU its guest affinity now names, which the
   // dispatch loop only does once the old CPU dequeues it.
@@ -337,6 +347,7 @@ class GuestScheduler {
 
   std::atomic<bool> started_{false};
   std::atomic<bool> shutting_down_{false};
+  std::atomic<bool> host_paused_{false};
   // Set once Shutdown has joined the dispatch threads and reclaimed every
   // leftover fiber. TerminateThread then frees threads directly.
   std::atomic<bool> stopped_{false};

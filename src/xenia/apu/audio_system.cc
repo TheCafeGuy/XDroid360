@@ -9,6 +9,12 @@
 
 #include "xenia/apu/audio_system.h"
 
+#include <algorithm>
+#include <chrono>
+
+#include <string>
+#include <vector>
+
 #include <limits>
 
 #include "xenia/apu/apu_flags.h"
@@ -25,6 +31,17 @@
 #include "xenia/base/threading.h"
 #include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xdroid_wait_probe.h"
+
+#if XE_PLATFORM_ANDROID
+#include <fcntl.h>
+#include <cerrno>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
+#endif
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -38,15 +55,98 @@
 // and let the normal AudioSystem handling take it, to prevent duplicate
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
-DEFINE_uint32(apu_max_queued_frames, 8,
+// XDroid360: 16 (85 ms) rather than 8. Guest mixer responses on Android
+// stall 20-77 ms now and then under load (measured 2026-10-07, AC6), which
+// emptied an 8-frame queue and was heard as dropouts; 16 absorbs them.
+DEFINE_uint32(apu_max_queued_frames, 16,
               "Allows changing max buffered audio frames to reduce audio "
               "delay. Lowering this value might cause performance issues. "
               "Value range: [4-64]",
               "APU");
 UPDATE_from_uint32(apu_max_queued_frames, 2024, 8, 31, 20, 64);
+// Configs saved with the old default of 8 move to 16.
+UPDATE_from_uint32(apu_max_queued_frames, 2026, 10, 9, 13, 8);
+
+// XDroid360: pace the pump from the output's consumption instead of a
+// timer. The driver releases a client's semaphore each time the device
+// consumes a frame, so waiting on it yields one guest callback per consumed
+// frame: no clock drift between the timer and the DAC, no slots lost when a
+// pump runs late, and no precise-sleep spinning. Drivers that release slots in
+// large bursts can turn it off to get the timer-paced pump.
+DEFINE_bool(apu_consumer_paced, true,
+            "Run the guest audio callback each time the output consumes a "
+            "frame (no pump timer).",
+            "APU");
+
+DEFINE_int32(xdroid_audio_worker_nice, 0,
+             "XDroid360 (AUD-2 arm D1): nice value for the audio worker thread "
+             "that runs the guest audio callback (0 = leave it; -16 to -19 is "
+             "Android's audio class). Applied live by the worker, read back "
+             "and logged.",
+             "XDroid360");
 
 namespace xe {
 namespace apu {
+
+#if XE_PLATFORM_ANDROID
+namespace {
+// XDroid360 AUD-2: where the guest audio callback's wall time goes, from the
+// calling thread's own counters: CPU time, time runnable but waiting for a
+// core (schedstat run delay), and the rest (blocked or sleeping).
+struct CallbackSplit {
+  uint64_t cpu_ns = 0;
+  uint64_t runq_ns = 0;
+};
+CallbackSplit ReadCallbackSplit() {
+  static thread_local int fd = -2;
+  if (fd == -2) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat",
+                  int(gettid()));
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      XELOGW("XDroid360: audio pump: no {} - run delay not measured", path);
+    }
+  }
+  CallbackSplit split;
+  timespec ts;
+  if (!clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) {
+    split.cpu_ns = uint64_t(ts.tv_sec) * 1000000000ull + uint64_t(ts.tv_nsec);
+  }
+  if (fd >= 0) {
+    char text[96];
+    ssize_t length = pread(fd, text, sizeof(text) - 1, 0);
+    if (length > 0) {
+      text[length] = '\0';
+      char* end = nullptr;
+      std::strtoull(text, &end, 10);  // On-CPU time, same as above.
+      split.runq_ns = std::strtoull(end, nullptr, 10);
+    }
+  }
+  return split;
+}
+// Applies xdroid_audio_worker_nice to the calling thread when it changes.
+void ApplyWorkerNice() {
+  static thread_local int32_t applied = 0;
+  static thread_local bool logged = false;
+  const int32_t wanted = cvars::xdroid_audio_worker_nice;
+  if (wanted == applied && logged) {
+    return;
+  }
+  if (wanted != applied) {
+    if (setpriority(PRIO_PROCESS, 0, wanted)) {
+      XELOGW("XDroid360: audio worker nice {} refused (errno {})", wanted,
+             errno);
+    }
+    applied = wanted;
+  }
+  logged = true;
+  errno = 0;
+  XELOGI("XDroid360: audio worker nice now {} (asked {})",
+         getpriority(PRIO_PROCESS, 0), wanted);
+}
+}  // namespace
+#endif
 
 AudioSystem::AudioSystem(cpu::Processor* processor)
     : memory_(processor->memory()),
@@ -102,6 +202,12 @@ void AudioSystem::WorkerThreadMain() {
   // Initialize driver and ringbuffer.
   Initialize();
 
+  if (cvars::apu_consumer_paced) {
+    ConsumerPacedWorkerLoop();
+    worker_running_ = false;
+    return;
+  }
+
   // The host mixer releases a client's semaphore on its own coarse cadence,
   // but Xenos audio subsystem operates at 5.333ms interval (see
   // xaudio2_audio_driver.cc) Interval scales inversely with guest_time_scalar.
@@ -118,7 +224,7 @@ void AudioSystem::WorkerThreadMain() {
     size_t client_index = kMaximumClientCount;
     uint64_t earliest_pump_us = std::numeric_limits<uint64_t>::max();
     {
-      auto global_lock = global_critical_region_.Acquire();
+      std::lock_guard<std::mutex> clients_lock(clients_mutex_);
 
       for (size_t i = 0; i < kMaximumClientCount; ++i) {
         if (!clients_[i].in_use ||
@@ -134,8 +240,14 @@ void AudioSystem::WorkerThreadMain() {
         const uint64_t min_us =
             scalar > 0.0 ? static_cast<uint64_t>(kAudioPumpInterval / scalar)
                          : kAudioPumpInterval;
-        clients_[client_index].next_pump_us =
-            (earliest_pump_us > now ? earliest_pump_us : now) + min_us;
+        // Counted from the deadline, so a late pump is made up and the host
+        // queue absorbs the stall, until it falls further behind than the
+        // queue holds.
+        uint64_t next_pump_us = earliest_pump_us + min_us;
+        if (now > earliest_pump_us + min_us * queued_frames_) {
+          next_pump_us = now + min_us;
+        }
+        clients_[client_index].next_pump_us = next_pump_us;
       }
     }
 
@@ -182,29 +294,172 @@ void AudioSystem::WorkerThreadMain() {
       continue;
     }
 
-    // UnregisterClient waits on this after clearing in_use.
-    std::lock_guard<std::mutex> cb_lk(clients_[client_index].callback_mutex);
-
-    uint32_t client_callback = 0;
-    uint32_t client_callback_arg = 0;
-    {
-      auto global_lock = global_critical_region_.Acquire();
-      if (clients_[client_index].in_use) {
-        client_callback = clients_[client_index].callback;
-        client_callback_arg = clients_[client_index].wrapped_callback_arg;
-      }
-    }
-
-    if (client_callback) {
-      SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
-      uint64_t args[] = {client_callback_arg};
-      processor_->Execute(worker_thread_->thread_state(), client_callback, args,
-                          xe::countof(args));
-    }
+    RunClientCallback(client_index);
   }
   worker_running_ = false;
 
   // TODO(benvanik): call module API to kill?
+}
+
+void AudioSystem::RunClientCallback(size_t client_index) {
+  // UnregisterClient waits on this after clearing in_use.
+  std::lock_guard<std::mutex> cb_lk(clients_[client_index].callback_mutex);
+  uint32_t client_callback = 0;
+  uint32_t client_callback_arg = 0;
+  {
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+    if (clients_[client_index].in_use) {
+      client_callback = clients_[client_index].callback;
+      client_callback_arg = clients_[client_index].wrapped_callback_arg;
+    }
+  }
+  if (client_callback) {
+    SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
+    // XDroid360 AUD-2: audio underruns show producer gaps of 70-150 ms. Split
+    // them into a guest callback that runs long (blocked in guest code) and a
+    // worker that did not call it in time (no output slot freed). Only the
+    // worker thread gets here. One line per second at most.
+    thread_local uint64_t last_start_us = 0;
+    thread_local uint64_t window_start_us = 0;
+    thread_local uint64_t max_took_us = 0;
+    thread_local uint64_t max_gap_us = 0;
+    thread_local uint64_t total_took_us = 0;
+    thread_local uint32_t calls = 0;
+    // Callbacks slower than the 5.33 ms of audio they produce.
+    thread_local uint32_t slow_calls = 0;
+    const auto host_us = [] {
+      return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count());
+    };
+#if XE_PLATFORM_ANDROID
+    ApplyWorkerNice();
+    thread_local uint64_t total_cpu_us = 0;
+    thread_local uint64_t total_runq_us = 0;
+    const CallbackSplit split_before = ReadCallbackSplit();
+    // Forensic (AUD-2, temp): which guest waits the blocked time is spent in.
+    thread_local kernel::XdroidWaitProbe wait_probe;
+    kernel::xdroid_wait_probe = &wait_probe;
+#endif
+    const uint64_t start_us = host_us();
+    if (last_start_us) {
+      max_gap_us = std::max(max_gap_us, start_us - last_start_us);
+    }
+    last_start_us = start_us;
+    uint64_t args[] = {client_callback_arg};
+    processor_->Execute(worker_thread_->thread_state(), client_callback, args,
+                        xe::countof(args));
+    const uint64_t end_us = host_us();
+    const uint64_t took_us = end_us - start_us;
+#if XE_PLATFORM_ANDROID
+    kernel::xdroid_wait_probe = nullptr;
+    const CallbackSplit split_after = ReadCallbackSplit();
+    total_cpu_us += (split_after.cpu_ns - split_before.cpu_ns) / 1000;
+    total_runq_us += (split_after.runq_ns - split_before.runq_ns) / 1000;
+#endif
+    max_took_us = std::max(max_took_us, took_us);
+    total_took_us += took_us;
+    slow_calls += took_us > 5333;
+    ++calls;
+    // Every 10 s: the gap follows the device burst (40 ms in power_saving),
+    // so it alone is no stall; the callback cost decides whether the pump
+    // refills a burst in time.
+    if (!window_start_us) {
+      window_start_us = end_us;
+    } else if (end_us - window_start_us >= 10000000) {
+      XELOGI(
+          "XDroid360: audio pump {} calls in {} ms: guest callback mean {} us, "
+          "max {} ms, {} slower than 5.33 ms; gap between calls max {} ms",
+          calls, (end_us - window_start_us) / 1000,
+          calls ? total_took_us / calls : 0, max_took_us / 1000, slow_calls,
+          max_gap_us / 1000);
+#if XE_PLATFORM_ANDROID
+      // Mean per call: on a core, runnable but waiting for one, and the rest
+      // (blocked in a wait or sleeping).
+      const uint64_t mean_us = calls ? total_took_us / calls : 0;
+      const uint64_t cpu_us = calls ? total_cpu_us / calls : 0;
+      const uint64_t runq_us = calls ? total_runq_us / calls : 0;
+      XELOGI(
+          "XDroid360: audio pump split per call: cpu {} us, run queue {} us, "
+          "blocked {} us",
+          cpu_us, runq_us,
+          mean_us > cpu_us + runq_us ? mean_us - cpu_us - runq_us : 0);
+      std::string waits;
+      for (const auto& entry : wait_probe.entries) {
+        if (entry.count) {
+          waits += fmt::format(" [lr {:08X} kind {} n {} {} us]", entry.lr,
+                               entry.kind, entry.count, entry.total_us);
+        }
+      }
+      XELOGI("XDroid360: audio pump guest waits: {} us per call in waits{}",
+             calls ? wait_probe.total_us / calls : 0, waits);
+      wait_probe.Reset();
+      auto& watch = kernel::xdroid_audio_watch;
+      const uint64_t signals = watch.signals.exchange(0);
+      const uint64_t latency = watch.signal_latency_us.exchange(0);
+      XELOGI(
+          "XDroid360: audio producer: {} signals, {} us from wait start to "
+          "signal, signaler thread {:X} lr {:08X}; at wait start it was "
+          "running {} ready {} blocked {} unknown {}; boosts {}",
+          signals, signals ? latency / signals : 0, watch.signaler_tid.load(),
+          watch.signaler_lr.load(), watch.producer_state[0].exchange(0),
+          watch.producer_state[1].exchange(0),
+          watch.producer_state[2].exchange(0),
+          watch.producer_state[3].exchange(0), watch.boosts.exchange(0));
+      const uint64_t dispatches = watch.dispatches.exchange(0);
+      XELOGI(
+          "XDroid360: audio producer ready-to-run delay: mean {} us, max {} "
+          "us over {} wakes",
+          dispatches ? watch.dispatch_delay_us.exchange(0) / dispatches : 0,
+          watch.dispatch_delay_max_us.exchange(0), dispatches);
+      total_cpu_us = 0;
+      total_runq_us = 0;
+#endif
+      window_start_us = end_us;
+      max_took_us = 0;
+      max_gap_us = 0;
+      total_took_us = 0;
+      calls = 0;
+      slow_calls = 0;
+    }
+  }
+}
+
+void AudioSystem::ConsumerPacedWorkerLoop() {
+  std::vector<xe::threading::WaitHandle*> handles;
+  std::vector<size_t> handle_clients;
+  while (worker_running_) {
+    handles.clear();
+    handle_clients.clear();
+    handles.push_back(pending_work_event_.get());
+    handle_clients.push_back(kMaximumClientCount);
+    {
+      std::lock_guard<std::mutex> clients_lock(clients_mutex_);
+      for (size_t i = 0; i < kMaximumClientCount; ++i) {
+        if (clients_[i].in_use) {
+          handles.push_back(client_semaphores_[i].get());
+          handle_clients.push_back(i);
+        }
+      }
+    }
+    // A slot frees up every ~5.3 ms while the output runs. Registering or
+    // unregistering a client sets pending_work_event_, so the list is rebuilt
+    // without a timeout and the thread sleeps while no client exists.
+    auto [result, index] =
+        xe::threading::WaitAny(handles.data(), handles.size(), true);
+    if (result != xe::threading::WaitResult::kSuccess) {
+      continue;
+    }
+    if (index == 0) {
+      // Registration change, pause or shutdown.
+      if (paused_) {
+        pause_fence_.Signal();
+        xe::threading::Wait(resume_event_.get(), false);
+      }
+      continue;
+    }
+    RunClientCallback(handle_clients[index]);
+  }
 }
 
 int AudioSystem::FindFreeClient() {
@@ -230,14 +485,13 @@ void AudioSystem::Shutdown() {
 
   // Unregister all active clients to shut down their audio drivers before
   // the semaphores are destroyed with this AudioSystem.
+  uint32_t wrapped_callback_args[kMaximumClientCount] = {};
   {
-    auto global_lock = global_critical_region_.Acquire();
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
     for (size_t i = 0; i < kMaximumClientCount; ++i) {
       if (clients_[i].in_use) {
         DestroyDriver(clients_[i].driver);
-        if (clients_[i].wrapped_callback_arg) {
-          memory()->SystemHeapFree(clients_[i].wrapped_callback_arg);
-        }
+        wrapped_callback_args[i] = clients_[i].wrapped_callback_arg;
         clients_[i].driver = nullptr;
         clients_[i].callback = 0;
         clients_[i].callback_arg = 0;
@@ -246,14 +500,29 @@ void AudioSystem::Shutdown() {
       }
     }
   }
+  // Outside clients_mutex_, as the heap takes the global lock.
+  for (uint32_t wrapped_callback_arg : wrapped_callback_args) {
+    if (wrapped_callback_arg) {
+      memory()->SystemHeapFree(wrapped_callback_arg);
+    }
+  }
 }
 
 X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
                                      size_t* out_index) {
-  auto global_lock = global_critical_region_.Acquire();
+  // Outside clients_mutex_, as the heap takes the global lock.
+  uint32_t ptr = memory()->SystemHeapAlloc(0x4);
+  xe::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
+
+  std::unique_lock<std::mutex> clients_lock(clients_mutex_);
 
   auto index = FindFreeClient();
   assert_true(index >= 0);
+  if (index < 0) {
+    clients_lock.unlock();
+    memory()->SystemHeapFree(ptr);
+    return X_STATUS_UNSUCCESSFUL;
+  }
 
   auto client_semaphore = client_semaphores_[index].get();
   auto ret = client_semaphore->Release(queued_frames_, nullptr);
@@ -264,15 +533,14 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
   if (XFAILED(result)) {
     XELOGE("AudioSystem::RegisterClient: CreateDriver failed for index={}",
            index);
+    clients_lock.unlock();
+    memory()->SystemHeapFree(ptr);
     return result;
   }
   assert_not_null(driver);
   XELOGI(
       "AudioSystem::RegisterClient: driver created for index={}, driver={:p}",
       index, (void*)driver);
-
-  uint32_t ptr = memory()->SystemHeapAlloc(0x4);
-  xe::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index].driver = driver;
   clients_[index].callback = callback;
@@ -300,7 +568,7 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg,
 void AudioSystem::SubmitFrame(size_t index, float* samples) {
   SCOPE_profile_cpu_f("apu");
 
-  auto global_lock = global_critical_region_.Acquire();
+  std::lock_guard<std::mutex> clients_lock(clients_mutex_);
   assert_true(index < kMaximumClientCount);
   if (index >= kMaximumClientCount || !clients_[index].in_use ||
       !clients_[index].driver) {
@@ -350,7 +618,7 @@ void AudioSystem::UnregisterClient(size_t index) {
   assert_true(index < kMaximumClientCount);
   AudioDriver* driver_to_destroy;
   {
-    auto global_lock = global_critical_region_.Acquire();
+    std::lock_guard<std::mutex> clients_lock(clients_mutex_);
     XELOGI(
         "AudioSystem::UnregisterClient: index={}, driver={:p}", index,
         index < kMaximumClientCount ? (void*)clients_[index].driver : nullptr);
@@ -366,8 +634,10 @@ void AudioSystem::UnregisterClient(size_t index) {
     clients_[index].frames_processed.store(0);
     clients_[index].frames_dropped.store(0);
   }
+  // Drop the client's semaphore from the worker's wait list.
+  pending_work_event_->Set();
 
-  // Wait for any in-flight callback; can't hold global lock (callback
+  // Wait for any in-flight callback; can't hold clients_mutex_ (callback
   // re-enters).
   {
     std::lock_guard<std::mutex> lk(clients_[index].callback_mutex);

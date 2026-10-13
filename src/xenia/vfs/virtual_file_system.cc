@@ -8,6 +8,9 @@
  */
 
 #include "xenia/vfs/virtual_file_system.h"
+
+#include <cerrno>
+
 #include "xenia/kernel/xam/content_manager.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 
@@ -399,6 +402,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
   return result;
 }
 
+namespace {
+X_STATUS WriteErrorStatus() {
+  return errno == ENOSPC ? X_STATUS_DISK_FULL : X_STATUS_UNSUCCESSFUL;
+}
+}  // namespace
+
 X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
                                                std::filesystem::path base_path,
                                                std::atomic<uint64_t>& progress,
@@ -437,6 +446,9 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
     return 1;
   }
   constexpr size_t write_buffer_size = 4_MiB;
+  // A short read or a failed write (disk full) must fail the extraction
+  // instead of leaving a truncated file behind a success status.
+  X_STATUS status = X_STATUS_SUCCESS;
 
   if (entry->can_map()) {
     auto map = entry->OpenMapped(xe::MappedMemory::Mode::kRead);
@@ -446,7 +458,10 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
 
     while (remaining_size > 0) {
       const auto bytes_to_read = std::min(write_buffer_size, remaining_size);
-      fwrite(map->data() + offset, bytes_to_read, 1, file);
+      if (fwrite(map->data() + offset, bytes_to_read, 1, file) != 1) {
+        status = WriteErrorStatus();
+        break;
+      }
       offset += bytes_to_read;
       remaining_size -= bytes_to_read;
       progress += bytes_to_read;
@@ -459,22 +474,42 @@ X_STATUS VirtualFileSystem::ExtractContentFile(Entry* entry,
 
     while (remaining_size > 0) {
       size_t bytes_read = 0;
-      in_file->ReadSync(std::span<uint8_t>(buffer, write_buffer_size), offset,
-                        &bytes_read);
-      fwrite(buffer, bytes_read, 1, file);
+      const X_STATUS read_status = in_file->ReadSync(
+          std::span<uint8_t>(buffer, write_buffer_size), offset, &bytes_read);
+      if (read_status != X_STATUS_SUCCESS) {
+        status = read_status;
+        break;
+      }
+      if (bytes_read == 0) {
+        // Without this, a short read loops forever.
+        status = X_STATUS_END_OF_FILE;
+        break;
+      }
+      if (fwrite(buffer, bytes_read, 1, file) != 1) {
+        status = WriteErrorStatus();
+        break;
+      }
       offset += bytes_read;
       remaining_size -= bytes_read;
       progress += bytes_read;
     }
   }
 
-  fclose(file);
+  if (fclose(file) != 0 && status == X_STATUS_SUCCESS) {
+    status = WriteErrorStatus();
+  }
   in_file->Destroy();
+  if (status != X_STATUS_SUCCESS) {
+    // Callers that extract on demand skip files that already exist, so a
+    // truncated one would be used as is on the next run.
+    std::error_code error_code;
+    std::filesystem::remove(dest_name, error_code);
+  }
 
   if (buffer) {
     delete[] buffer;
   }
-  return 0;
+  return status;
 }
 
 X_STATUS VirtualFileSystem::ExtractContentFiles(
@@ -497,7 +532,11 @@ X_STATUS VirtualFileSystem::ExtractContentFiles(
       queue.push(entry.get());
     }
 
-    ExtractContentFile(entry, base_path, progress);
+    const X_STATUS status = ExtractContentFile(entry, base_path, progress);
+    // Not XFAILED: the open/mkdir errors above return small positive codes.
+    if (status != X_STATUS_SUCCESS) {
+      return status;
+    }
   }
   return X_STATUS_SUCCESS;
 }

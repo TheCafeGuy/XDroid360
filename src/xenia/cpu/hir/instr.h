@@ -179,6 +179,10 @@ if both are constant, return nullptr, nullptr
   }
   bool IsFake() const;
 
+  // The label a BRANCH, BRANCH_TRUE or BRANCH_FALSE jumps to; null for any
+  // other instruction.
+  Label* BranchLabel() const;
+
   // gets previous instr, skipping instrs like COMMENT, OPCODE_CONTEXT_BARRIER,
   // OPCODE_SOURCE_OFFSET
   const hir::Instr* GetNonFakePrev() const;

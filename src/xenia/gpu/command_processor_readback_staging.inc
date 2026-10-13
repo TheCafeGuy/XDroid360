@@ -27,6 +27,9 @@
 //   void PrepareReadbackStagingEviction()
 //     Called once before an eviction's first destroy, for backends that drain
 //     rather than defer.
+// And, anywhere in the class body:
+//   std::vector<MemexportStagedRange> memexport_staged_
+//     Staged export ranges by slot key, guest address, length and slot offset.
 // No include guard: injected into a class body.
 
 // Age eviction alone only runs at frame close, so a title that never swaps
@@ -105,12 +108,13 @@ ReadbackStagingSlot* FindReadbackStagingSlot(uint64_t key) {
 // Copies length bytes out of a staging buffer into guest RAM at address. The
 // GPU copy into the staging buffer must already have completed.
 void ReadbackStagingToGuestRam(const ReadbackStagingBuffer& buffer,
-                               uint32_t address, uint32_t length) {
+                               uint32_t source_offset, uint32_t address,
+                               uint32_t length) {
   if (buffer.mapped == nullptr || !length) {
     return;
   }
   uint8_t* dest = memory_->TranslatePhysical(address);
-  uint8_t* source = static_cast<uint8_t*>(buffer.mapped);
+  uint8_t* source = static_cast<uint8_t*>(buffer.mapped) + source_offset;
   // vastcpy's non-temporal stores need both pointers and the length to be
   // cache-line aligned.
   uintptr_t unaligned = reinterpret_cast<uintptr_t>(dest) |
@@ -119,6 +123,42 @@ void ReadbackStagingToGuestRam(const ReadbackStagingBuffer& buffer,
     std::memcpy(dest, source, length);
   } else {
     memory::vastcpy(dest, source, length);
+  }
+}
+
+// Trims staged export output a later resolve overwrote, keeping the rest.
+void DropStagedMemexportOutput(uint32_t address, uint32_t length) {
+  if (!length) {
+    return;
+  }
+  uint64_t end = uint64_t(address) + length;
+  for (size_t i = 0; i < memexport_staged_.size();) {
+    MemexportStagedRange staged = memexport_staged_[i];
+    uint64_t staged_end = uint64_t(staged.address) + staged.length;
+    if (staged_end <= address || staged.address >= end) {
+      ++i;
+      continue;
+    }
+    // Split in place, copy out order decides overlapping ranges.
+    bool head = staged.address < address;
+    if (head) {
+      memexport_staged_[i].length = address - staged.address;
+      ++i;
+    }
+    if (staged_end > end) {
+      MemexportStagedRange tail = staged;
+      tail.offset += uint32_t(end - staged.address);
+      tail.address = uint32_t(end);
+      tail.length = uint32_t(staged_end - end);
+      if (head) {
+        memexport_staged_.insert(memexport_staged_.begin() + i, tail);
+      } else {
+        memexport_staged_[i] = tail;
+      }
+      ++i;
+    } else if (!head) {
+      memexport_staged_.erase(memexport_staged_.begin() + i);
+    }
   }
 }
 

@@ -515,6 +515,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // https://github.com/KhronosGroup/SPIRV-Headers/blob/c43a43c7cc3af55910b9bec2a71e3e8a622443cf/include/spirv/spir-v.xml#L79
   static constexpr uint32_t kSpirvMagicToolId = 26;
 
+  // XDroid360: the running title's built-in deswizzle_identity_ps_hashes,
+  // used while the cvar is empty. Set before the title's shaders are
+  // translated; kept out of the cvar so it never lands in the config file.
+  static void SetTitleDeswizzleIdentityPsHashes(std::string hashes);
+
   struct Features {
     explicit Features(const ui::vulkan::VulkanDevice* vulkan_device);
     explicit Features(bool all = false);
@@ -1324,6 +1329,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_predicate_;
   // uint4.
   spv::Id var_main_loop_count_;
+  // Iterations of the main control flow loop, to bound runaway guest loops.
+  spv::Id var_main_loop_iterations_;
   // int4.
   spv::Id var_main_loop_address_;
   // int.

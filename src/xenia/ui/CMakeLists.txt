@@ -13,6 +13,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Android")
     "${CMAKE_CURRENT_SOURCE_DIR}/*_wx.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/wx_locale.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/wx_locale.h"
+    # Only the wx UI uses it, and it includes wx headers.
+    "${CMAKE_CURRENT_SOURCE_DIR}/icon_decode.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/icon_decode.h"
   )
   list(APPEND _ui_exclude ${_wx_exclude})
 endif()

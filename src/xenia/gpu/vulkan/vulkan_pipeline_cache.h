@@ -11,6 +11,7 @@
 #define XENIA_GPU_VULKAN_VULKAN_PIPELINE_STATE_CACHE_H_
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -82,6 +83,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // unlike the separate is_placeholder flag which is cleared a few
     // instructions after the real pipeline is swapped in.
     std::atomic<VkPipeline> placeholder_pipeline{VK_NULL_HANDLE};
+    // Set while the entry is in the creation queue, cleared once its result,
+    // real or failed, is stored.
+    std::atomic<bool> creation_pending{false};
 
     Pipeline(const PipelineLayoutProvider* pipeline_layout_provider)
         : pipeline_layout(pipeline_layout_provider) {}
@@ -95,7 +99,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
           uses_interpreter(
               other.uses_interpreter.load(std::memory_order_acquire)),
           placeholder_pipeline(
-              other.placeholder_pipeline.load(std::memory_order_acquire)) {}
+              other.placeholder_pipeline.load(std::memory_order_acquire)),
+          creation_pending(
+              other.creation_pending.load(std::memory_order_acquire)) {}
 
     // Move constructor
     Pipeline(Pipeline&& other) noexcept
@@ -106,7 +112,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
           uses_interpreter(
               other.uses_interpreter.load(std::memory_order_acquire)),
           placeholder_pipeline(
-              other.placeholder_pipeline.load(std::memory_order_acquire)) {}
+              other.placeholder_pipeline.load(std::memory_order_acquire)),
+          creation_pending(
+              other.creation_pending.load(std::memory_order_acquire)) {}
 
     // Deleted copy assignment to prevent accidental copying
     Pipeline& operator=(const Pipeline&) = delete;
@@ -581,6 +589,13 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
 
   // VkPipelineCache persistence path.
   std::filesystem::path vk_pipeline_cache_path_;
+  // Periodic VkPipelineCache saves (see MaybeSaveVkPipelineCache).
+  void WriteVkPipelineCacheLocked();
+  void MaybeSaveVkPipelineCache();
+  std::mutex vk_pipeline_cache_save_mutex_;
+  std::atomic<uint32_t> vk_pipeline_cache_unsaved_{0};
+  std::chrono::steady_clock::time_point vk_pipeline_cache_last_save_ =
+      std::chrono::steady_clock::now();
 };
 
 }  // namespace vulkan

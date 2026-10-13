@@ -767,3 +767,30 @@ TEST_CASE("STORE_VECTOR_LEFT_MEMCPY_HEAD", "[memory]") {
     test.memory->SystemHeapFree(guest_addr);
   }
 }
+
+// Float MAX/MIN are not constant-folded, so both operands can reach the
+// backend as constants.
+TEST_CASE("MAX_MIN_FLOAT_BOTH_CONSTANT", "[instr]") {
+  TestFunction test([](HIRBuilder& b) {
+    StoreFPR(b, 3,
+             b.Max(b.LoadConstantFloat64(1.0), b.LoadConstantFloat64(2.0)));
+    StoreFPR(b, 4,
+             b.Min(b.LoadConstantFloat64(-1.0), b.LoadConstantFloat64(-2.0)));
+    StoreFPR(b, 5,
+             b.Convert(b.Max(b.LoadConstantFloat32(1.0f),
+                             b.LoadConstantFloat32(2.0f)),
+                       FLOAT64_TYPE));
+    StoreFPR(b, 6,
+             b.Convert(b.Min(b.LoadConstantFloat32(-1.0f),
+                             b.LoadConstantFloat32(-2.0f)),
+                       FLOAT64_TYPE));
+    b.Return();
+  });
+  test.Run([](PPCContext* ctx) {},
+           [](PPCContext* ctx) {
+             REQUIRE(ctx->f[3] == 2.0);
+             REQUIRE(ctx->f[4] == -2.0);
+             REQUIRE(ctx->f[5] == 2.0);
+             REQUIRE(ctx->f[6] == -2.0);
+           });
+}

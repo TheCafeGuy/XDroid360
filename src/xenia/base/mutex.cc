@@ -8,6 +8,9 @@
  */
 
 #include "xenia/base/mutex.h"
+
+#include <cstring>
+
 #if XE_PLATFORM_WIN32 == 1
 #include "xenia/base/platform_win.h"
 #elif XE_PLATFORM_LINUX == 1
@@ -28,7 +31,13 @@ namespace {
 // with no syscall and is unique among live threads. It is only ever compared
 // for equality here, to detect recursive acquisition by the current owner.
 inline uint64_t xe_current_thread_id() {
-  return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_self()));
+  // pthread_t is an integer on glibc and Bionic and a pointer on macOS: copy
+  // its bits instead of casting, which is valid for all of them.
+  static_assert(sizeof(pthread_t) <= sizeof(uint64_t));
+  const pthread_t self = pthread_self();
+  uint64_t id = 0;
+  std::memcpy(&id, &self, sizeof(self));
+  return id;
 }
 }  // namespace
 #endif

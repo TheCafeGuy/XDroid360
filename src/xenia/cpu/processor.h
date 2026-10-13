@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -131,6 +132,20 @@ class Processor {
   Module* LookupModule(uint32_t address);
   Function* LookupFunction(Module* module, uint32_t address);
   Function* ResolveFunction(uint32_t address);
+
+  // Native hooks on guest functions, applied when the function is translated,
+  // so they must be registered before it is first compiled (e.g. from
+  // Emulator::on_launch). kEntry calls the builtin on entry and then runs the
+  // guest function unchanged; kReplace calls the builtin instead of the body;
+  // kInstruction calls the builtin before the instruction at |address|, which
+  // may be anywhere in a function (at its start it acts as kEntry).
+  enum class GuestHookKind { kEntry, kReplace, kInstruction };
+  void SetGuestHook(uint32_t address, Function* builtin, GuestHookKind kind);
+  bool GetGuestHook(uint32_t address, Function** builtin_out,
+                    GuestHookKind* kind_out);
+  // kInstruction hooks in [start, end] (inclusive), by address.
+  void GetInstructionHooks(uint32_t start, uint32_t end,
+                           std::vector<std::pair<uint32_t, Function*>>& out);
   // |expand| appends more addresses to resolve from each resolved function.
   size_t ResolveFunctionsInParallel(
       std::vector<uint32_t> addresses,
@@ -337,6 +352,11 @@ class Processor {
   ExportResolver* export_resolver_ = nullptr;
 
   EntryTable entry_table_;
+  std::mutex guest_hooks_mutex_;
+  std::unordered_map<uint32_t, std::pair<Function*, GuestHookKind>>
+      guest_hooks_;
+  // kInstruction hooks again, sorted for range lookups at translation.
+  std::map<uint32_t, Function*> guest_instruction_hooks_;
   xe::global_critical_region global_critical_region_;
   ExecutionState execution_state_ = ExecutionState::kPaused;
   std::vector<std::unique_ptr<Module>> modules_;

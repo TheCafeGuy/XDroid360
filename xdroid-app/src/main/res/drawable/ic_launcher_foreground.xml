@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Launcher icon foreground, converted from XDroid360-icono.svg (108 x 108,
+     safe zone 18..90). The background is @color/ic_launcher_background. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+  <path
+      android:pathData="M50.94 75.79A22 22 0 0 1 32.21 57.06M57.06 32.21A22 22 0 0 1 75.79 50.94"
+      android:strokeColor="#1F5C6B"
+      android:strokeWidth="5" />
+  <path
+      android:pathData="M32.21 50.94A22 22 0 0 1 50.94 32.21M75.79 57.06A22 22 0 0 1 57.06 75.79"
+      android:strokeColor="#7CF29A"
+      android:strokeWidth="10"
+      android:strokeAlpha="0.22" />
+  <path
+      android:pathData="M32.21 50.94A22 22 0 0 1 50.94 32.21M75.79 57.06A22 22 0 0 1 57.06 75.79"
+      android:strokeColor="#7CF29A"
+      android:strokeWidth="5" />
+  <group
+      android:translateX="54"
+      android:translateY="32"
+      android:rotation="90"
+      android:scaleX="0.07"
+      android:scaleY="0.07">
+    <path
+        android:pathData="M0 -171.7L3.4 -169.3L5.9 -164.1L9.4 -147.3L12.1 -115.8L13.6 -71.8L26.6 -71.5L28.4 -42.1L32.2 -35.1L34.2 -5.5L117.6 77.9L117.6 84.7L105.6 105.4L72 97.4L38.5 97.4L38 105.9L37.5 114.7L46.8 125.9L53.2 126.4L78 158.7L78.3 160.4L77.2 163.4L72.5 171.7L59 169.9L50 167.9L41.3 165.9L33 163.9L30.3 161.9L27.3 155.9L24.5 149.9L24.5 148.9L1.6 148.9L1.6 134.9L-1.6 134.9L-1.6 148.9L-24.5 148.9L-24.5 149.9L-27.3 155.9L-30.3 161.9L-33 163.9L-41.3 165.9L-50 167.9L-59 169.9L-72.5 171.7L-77.2 163.4L-78.3 160.4L-78 158.7L-53.2 126.4L-46.8 125.9L-37.5 114.7L-38 105.9L-38.5 97.4L-72 97.4L-105.6 105.4L-117.6 84.7L-117.6 77.9L-34.2 -5.5L-32.2 -35.1L-28.4 -42.1L-26.6 -71.5L-13.6 -71.8L-12.1 -115.8L-9.4 -147.3L-5.9 -164.1L-3.4 -169.3Z"
+        android:fillColor="#C9CFD6" />
+    <path
+        android:pathData="M34.2 -5.5L117.6 77.9L117.6 84.7L105.6 105.4L72 97.4ZM-34.2 -5.5L-117.6 77.9L-117.6 84.7L-105.6 105.4L-72 97.4ZM50 126.2L78 158.7L78.3 160.4L77.2 163.4L72.5 171.7L62 170.3ZM-50 126.2L-78 158.7L-78.3 160.4L-77.2 163.4L-72.5 171.7L-62 170.3Z"
+        android:fillColor="#2B3A8C" />
+    <path
+        android:pathData="M2.5 140H22.5V148.9H2.5ZM-2.5 140H-22.5V148.9H-2.5Z"
+        android:fillColor="#0B3440" />
+    <path
+        android:pathData="M-9,-79.4A9,37 0 1,0 9,-79.4A9,37 0 1,0 -9,-79.4Z"
+        android:fillColor="#0B3440" />
+  </group>
+  <group
+      android:translateX="54"
+      android:translateY="76"
+      android:rotation="-90"
+      android:scaleX="0.07"
+      android:scaleY="0.07">
+    <path
+        android:pathData="M0 -171.7L3.4 -169.3L5.9 -164.1L9.4 -147.3L12.1 -115.8L13.6 -71.8L26.6 -71.5L28.4 -42.1L32.2 -35.1L34.2 -5.5L117.6 77.9L117.6 84.7L105.6 105.4L72 97.4L38.5 97.4L38 105.9L37.5 114.7L46.8 125.9L53.2 126.4L78 158.7L78.3 160.4L77.2 163.4L72.5 171.7L59 169.9L50 167.9L41.3 165.9L33 163.9L30.3 161.9L27.3 155.9L24.5 149.9L24.5 148.9L1.6 148.9L1.6 134.9L-1.6 134.9L-1.6 148.9L-24.5 148.9L-24.5 149.9L-27.3 155.9L-30.3 161.9L-33 163.9L-41.3 165.9L-50 167.9L-59 169.9L-72.5 171.7L-77.2 163.4L-78.3 160.4L-78 158.7L-53.2 126.4L-46.8 125.9L-37.5 114.7L-38 105.9L-38.5 97.4L-72 97.4L-105.6 105.4L-117.6 84.7L-117.6 77.9L-34.2 -5.5L-32.2 -35.1L-28.4 -42.1L-26.6 -71.5L-13.6 -71.8L-12.1 -115.8L-9.4 -147.3L-5.9 -164.1L-3.4 -169.3Z"
+        android:fillColor="#C9CFD6" />
+    <path
+        android:pathData="M57 17.3L117.6 77.9L117.6 84.7L105.6 105.4L72 97.4L61 97.4Z"
+        android:fillColor="#E0342B" />
+    <path
+        android:pathData="M2.5 140H22.5V148.9H2.5ZM-2.5 140H-22.5V148.9H-2.5Z"
+        android:fillColor="#0B3440" />
+    <path
+        android:pathData="M-9,-79.4A9,37 0 1,0 9,-79.4A9,37 0 1,0 -9,-79.4Z"
+        android:fillColor="#0B3440" />
+  </group>
+</vector>

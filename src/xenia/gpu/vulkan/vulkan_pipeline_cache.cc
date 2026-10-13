@@ -636,6 +636,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
   // interpreter placeholder the shaders aren't translated yet, so their binding
   // counts read as 0 and this yields the minimal (no-texture) layout - the
   // creation thread upgrades it to the real layout after translation.
+  // Translation state is read before the layout as a creation thread may
+  // finish a shader in between. A shader taken as translated then has its
+  // bindings in the layout (xenia-edge 562e06ff9).
+  bool vertex_shader_translated = vertex_shader->is_translated();
+  bool pixel_shader_translated = pixel_shader && pixel_shader->is_translated();
   const PipelineLayoutProvider* pipeline_layout =
       GetGuestGraphicsPipelineLayout(vertex_shader, pixel_shader);
   if (!pipeline_layout) {
@@ -738,7 +743,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
     // shaders) and is upgraded to the real one on the creation thread.
     pipeline_pair.second.uses_interpreter.store(use_interpreter,
                                                 std::memory_order_release);
-    bool make_placeholder = use_interpreter || vertex_shader->is_translated();
+    bool make_placeholder = use_interpreter || vertex_shader_translated;
     if (make_placeholder) {
       // Set is_placeholder BEFORE creating the pipeline to avoid a race with
       // the creation thread checking this flag.
@@ -794,11 +799,14 @@ bool VulkanPipelineCache::ConfigurePipeline(
         tessellation_control_shader;
     creation_arguments.render_pass = render_pass;
     creation_arguments.render_pass_key = render_pass_key;
+    pipeline_pair.second.creation_pending.store(true,
+                                                std::memory_order_relaxed);
     creation_queue_.Push(creation_arguments);
   } else {
     // Sync mode (no creation threads / async off / no pixel shader): translate
     // on this thread and create the pipeline immediately.
-    if (!vertex_shader->is_translated()) {
+    if (!vertex_shader_translated ||
+        (pixel_shader && !pixel_shader_translated)) {
       if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
         return false;
       }
@@ -2135,8 +2143,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
             }
           }
         }
+        // Not writing an output leaves the target undefined, not unchanged.
         color_blend_attachment.colorWriteMask =
-            VkColorComponentFlags(color_rt.color_write_mask);
+            fragment_shader_override != VK_NULL_HANDLE &&
+                    fragment_shader_override == placeholder_pixel_shader_
+                ? 0
+                : VkColorComponentFlags(color_rt.color_write_mask);
       }
     }
     color_blend_state.attachmentCount = 32 - xe::lzcnt(color_rts_used);
@@ -2328,6 +2340,8 @@ void VulkanPipelineCache::StoreCreatedPipeline(
       creation_arguments.pipeline->second.is_placeholder.store(
           false, std::memory_order_release);
     }
+    creation_arguments.pipeline->second.creation_pending.store(
+        false, std::memory_order_release);
     return;
   }
   // Record the placeholder handle before publishing it, so a draw that observes
@@ -2360,11 +2374,14 @@ void VulkanPipelineCache::StoreCreatedPipeline(
   if (!creating_placeholder) {
     creation_arguments.pipeline->second.is_placeholder.store(
         false, std::memory_order_release);
+    MaybeSaveVkPipelineCache();
     XELOGI("Pipeline created for VS {:016X}, PS {:016X}",
            creation_arguments.vertex_shader->shader().ucode_data_hash(),
            creation_arguments.pixel_shader
                ? creation_arguments.pixel_shader->shader().ucode_data_hash()
                : 0);
+    creation_arguments.pipeline->second.creation_pending.store(
+        false, std::memory_order_release);
   }
 }
 
@@ -2483,6 +2500,9 @@ void VulkanPipelineCache::InitializeShaderStorage(
     std::error_code ec;
     std::filesystem::create_directories(shader_storage_local_root, ec);
   }
+  // Creation threads may save the cache periodically (MaybeSaveVkPipelineCache)
+  // while it is replaced here.
+  std::unique_lock<std::mutex> save_lock(vk_pipeline_cache_save_mutex_);
   vk_pipeline_cache_path_ =
       shader_storage_local_root /
       fmt::format("{:08X}.vk.bin", shader_storage_title_id_);
@@ -2531,6 +2551,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
     dfn.vkCreatePipelineCache(device, &pipeline_cache_create_info, nullptr,
                               &vk_pipeline_cache_);
   }
+  save_lock.unlock();
 
   // Create pipelines from stored descriptions.
   if (!pipeline_stored_descriptions.empty()) {
@@ -2684,6 +2705,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
       creation_arguments.render_pass_key = pipeline_description.render_pass_key;
       if (creation_queue_.has_threads()) {
         // Nothing is drawing these yet, so they publish as they are built.
+        creation_arguments.pipeline->second.creation_pending.store(
+            true, std::memory_order_relaxed);
         creation_queue_.PushUnordered(creation_arguments);
       } else {
         // No creation threads - create synchronously.
@@ -2732,32 +2755,80 @@ void VulkanPipelineCache::InitializeShaderStorage(
   }
 }
 
+void VulkanPipelineCache::WriteVkPipelineCacheLocked() {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE ||
+      vk_pipeline_cache_path_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device =
+      command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  size_t cache_size = 0;
+  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
+                                 nullptr) != VK_SUCCESS ||
+      !cache_size) {
+    return;
+  }
+  std::vector<uint8_t> cache_data(cache_size);
+  if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
+                                 cache_data.data()) != VK_SUCCESS) {
+    return;
+  }
+  // Write a temporary file and rename it over the old one, so a process
+  // killed mid-write keeps the previous complete cache.
+  std::filesystem::path temp_path = vk_pipeline_cache_path_;
+  temp_path += ".tmp";
+  FILE* cache_file = xe::filesystem::OpenFile(temp_path, "wb");
+  if (!cache_file) {
+    return;
+  }
+  const bool written =
+      fwrite(cache_data.data(), 1, cache_size, cache_file) == cache_size;
+  fclose(cache_file);
+  std::error_code ec;
+  if (written) {
+    std::filesystem::rename(temp_path, vk_pipeline_cache_path_, ec);
+  }
+  if (!written || ec) {
+    std::filesystem::remove(temp_path, ec);
+    return;
+  }
+  XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
+}
+
+void VulkanPipelineCache::MaybeSaveVkPipelineCache() {
+  // Android usually ends sessions by killing the process, which never reaches
+  // ShutdownShaderStorage, so save while running: after enough new pipelines,
+  // at most every 30 seconds.
+  constexpr uint32_t kMinNewPipelines = 32;
+  constexpr auto kMinInterval = std::chrono::seconds(30);
+  if (vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed) + 1 <
+      kMinNewPipelines) {
+    return;
+  }
+  // Never make a creation thread wait for another one's save.
+  std::unique_lock<std::mutex> lock(vk_pipeline_cache_save_mutex_,
+                                    std::try_to_lock);
+  if (!lock.owns_lock()) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now - vk_pipeline_cache_last_save_ < kMinInterval) {
+    return;
+  }
+  vk_pipeline_cache_last_save_ = now;
+  vk_pipeline_cache_unsaved_.store(0, std::memory_order_relaxed);
+  WriteVkPipelineCacheLocked();
+}
+
 void VulkanPipelineCache::ShutdownShaderStorage() {
   // Save VkPipelineCache to disk before shutting down storage.
-  if (vk_pipeline_cache_ != VK_NULL_HANDLE &&
-      !vk_pipeline_cache_path_.empty()) {
-    const ui::vulkan::VulkanDevice* const vulkan_device =
-        command_processor_.GetVulkanDevice();
-    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-    const VkDevice device = vulkan_device->device();
-
-    size_t cache_size = 0;
-    if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                   nullptr) == VK_SUCCESS &&
-        cache_size > 0) {
-      std::vector<uint8_t> cache_data(cache_size);
-      if (dfn.vkGetPipelineCacheData(device, vk_pipeline_cache_, &cache_size,
-                                     cache_data.data()) == VK_SUCCESS) {
-        if (FILE* cache_file =
-                xe::filesystem::OpenFile(vk_pipeline_cache_path_, "wb")) {
-          fwrite(cache_data.data(), 1, cache_size, cache_file);
-          fclose(cache_file);
-          XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
-        }
-      }
-    }
+  {
+    std::lock_guard<std::mutex> lock(vk_pipeline_cache_save_mutex_);
+    WriteVkPipelineCacheLocked();
+    vk_pipeline_cache_path_.clear();
   }
-  vk_pipeline_cache_path_.clear();
 
   // Shut down the storage writer (closes files, stops write thread).
   storage_writer_.ShutdownShaderStorage();

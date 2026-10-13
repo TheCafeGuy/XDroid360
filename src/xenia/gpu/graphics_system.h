@@ -60,6 +60,10 @@ class CommandProcessor;
 
 class GraphicsSystem {
  public:
+  // Vblanks so far (FP-1: the Frame stats line reports the rate per window).
+  uint64_t vblank_count() const {
+    return vblank_count_.load(std::memory_order_relaxed);
+  }
   virtual ~GraphicsSystem();
 
   virtual std::string name() const = 0;
@@ -83,6 +87,15 @@ class GraphicsSystem {
   // May be called from any thread any number of times, even during recovery
   // from a device loss.
   void OnHostGpuLossFromAnyThread(bool is_responsible);
+
+  // Called once, on the reporting thread, when the host GPU is lost and
+  // in-process recovery is not possible (for example to save a crash report
+  // and leave cleanly on a platform without device recreation). Without a
+  // handler the loss is a fatal error.
+  using HostGpuLossHandler = void (*)();
+  static void SetHostGpuLossHandler(HostGpuLossHandler handler) {
+    host_gpu_loss_handler_ = handler;
+  }
 
   RegisterFile* register_file() { return register_file_; }
   CommandProcessor* command_processor() const {
@@ -159,6 +172,7 @@ class GraphicsSystem {
   // 0 before the first vblank fires.
   std::atomic<uint64_t> last_vblank_guest_tick_{0};
   std::atomic<uint64_t> vblank_period_ticks_{0};
+  std::atomic<uint64_t> vblank_count_{0};
 
   RegisterFile* register_file_;
   std::unique_ptr<CommandProcessor> command_processor_;
@@ -171,6 +185,7 @@ class GraphicsSystem {
  private:
   std::unique_ptr<ui::Presenter> presenter_;
 
+  static HostGpuLossHandler host_gpu_loss_handler_;
   std::atomic_flag host_gpu_loss_reported_;
 };
 

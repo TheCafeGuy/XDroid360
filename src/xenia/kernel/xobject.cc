@@ -14,11 +14,14 @@
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/cpu/ppc/ppc_context.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
+#include "xenia/kernel/xdroid_wait_probe.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xevent.h"
@@ -30,6 +33,13 @@
 #include "xenia/kernel/xsymboliclink.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
+
+DEFINE_bool(xdroid_audio_producer_boost, false,
+            "XDroid360 (AUD-2 arm): when the guest audio callback starts "
+            "waiting, run the guest thread that last signaled its wait next: "
+            "now if it is ready, or as soon as it becomes ready if it is "
+            "blocked. Live.",
+            "XDroid360");
 
 namespace xe {
 namespace kernel {
@@ -247,12 +257,14 @@ void WaitExit(X_KTHREAD* kthread, X_STATUS result) {
 // the single object waited on, null for a multi-wait. |self| is the waiting
 // fiber, resolved by the caller before the first yield: a thread_local read
 // after one resolves against the dispatch thread the fiber entered on, which
-// by then may be running another fiber or none.
+// by then may be running another fiber or none. |poll| is told whether the
+// waiter has blocked, as only a thread taken out of a wait is boosted.
 template <typename PollFn>
 X_STATUS CooperativeWait(GuestScheduler* scheduler, XThread* self,
                          X_KTHREAD* kthread, XObject* wait_object,
                          bool alertable, uint64_t deadline_ms, PollFn&& poll,
                          bool interruptible = true) {
+  bool parked = false;
   while (true) {
     // Alertable waits return on a queued user APC (the cooperative equivalent
     // of a host alertable-wait wake), then the caller runs xeProcessUserApcs.
@@ -271,7 +283,7 @@ X_STATUS CooperativeWait(GuestScheduler* scheduler, XThread* self,
     } else if (self) {
       wait_epoch = self->cooperative_wait_set_epoch();
     }
-    std::optional<X_STATUS> resolved = poll();
+    std::optional<X_STATUS> resolved = poll(parked);
     if (resolved) {
       WaitExit(self, kthread, *resolved);
       return *resolved;
@@ -282,6 +294,7 @@ X_STATUS CooperativeWait(GuestScheduler* scheduler, XThread* self,
     }
     scheduler->BlockCurrentThread(deadline_ms, wait_epoch, alertable,
                                   interruptible);
+    parked = true;
   }
 }
 
@@ -400,7 +413,74 @@ std::vector<XObject::SignalRecord> XObject::RecentCooperativeSignals(
   return out;
 }
 
+// AUD-2 forensic: a signal of an object the probed thread is waiting on.
+static void XdroidNoteSignal(const XObject* object) {
+  XdroidAudioWatch& watch = xdroid_audio_watch;
+  const uint64_t start = watch.wait_start_us.load(std::memory_order_acquire);
+  if (!start) {
+    return;
+  }
+  for (const auto& waited : watch.objects) {
+    if (waited.load(std::memory_order_relaxed) == object) {
+      watch.signals.fetch_add(1, std::memory_order_relaxed);
+      watch.signal_latency_us.fetch_add(XdroidNowUs() - start,
+                                        std::memory_order_relaxed);
+      watch.signaler_tid.store(XThread::GetCurrentThreadId(),
+                               std::memory_order_relaxed);
+      watch.signaler_lr.store(XdroidCurrentGuestLr(),
+                              std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+// AUD-2: the probed thread starts waiting on |objects|.
+static void XdroidAudioWaitBegin(KernelState* kernel_state,
+                                 XObject* const* objects, uint32_t count) {
+  if (!xdroid_wait_probe) {
+    return;
+  }
+  XdroidAudioWatch& watch = xdroid_audio_watch;
+  for (int i = 0; i < XdroidAudioWatch::kObjects; ++i) {
+    watch.objects[i].store(uint32_t(i) < count ? objects[i] : nullptr,
+                           std::memory_order_relaxed);
+  }
+  watch.wait_start_us.store(XdroidNowUs(), std::memory_order_release);
+  const uint32_t tid = watch.signaler_tid.load(std::memory_order_relaxed);
+  if (!tid || !GuestScheduler::enabled()) {
+    watch.producer_state[3].fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  auto producer = kernel_state->GetThreadByID(tid);
+  if (!producer) {
+    watch.producer_state[3].fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  GuestScheduler* scheduler = kernel_state->guest_scheduler();
+  const int state = scheduler->XdroidThreadState(producer.get());
+  watch.producer_state[state].fetch_add(1, std::memory_order_relaxed);
+  if (!cvars::xdroid_audio_producer_boost) {
+    return;
+  }
+  if (state == 1 && scheduler->XdroidBoostReady(producer.get())) {
+    watch.boosts.fetch_add(1, std::memory_order_relaxed);
+  } else if (state == 2) {
+    watch.boost_pending_tid.store(tid, std::memory_order_release);
+  }
+}
+
+static void XdroidAudioWaitEnd() {
+  if (xdroid_wait_probe) {
+    xdroid_audio_watch.wait_start_us.store(0, std::memory_order_release);
+  }
+}
+
+struct XdroidAudioWaitScope {
+  ~XdroidAudioWaitScope() { XdroidAudioWaitEnd(); }
+};
+
 void XObject::WakeCooperativeWaiters() {
+  XdroidNoteSignal(this);
   cooperative_signal_epoch_.fetch_add(1);
   RecordCooperativeSignal(this);
   // Wake only the CPUs that can act on this signal instead of every CPU with
@@ -447,9 +527,18 @@ xe::threading::WaitHandle* XObject::GetWaitHandleForCurrentThread(size_t slot) {
   return GetWaitHandle();
 }
 
+uint32_t XdroidCurrentGuestLr() {
+  cpu::ThreadState* thread_state = cpu::ThreadState::Get();
+  return thread_state ? uint32_t(thread_state->context()->lr) : 0;
+}
+
 X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                        uint32_t alertable, uint64_t* opt_timeout,
                        bool interruptible) {
+  XdroidScopedWait xdroid_wait{static_cast<uint32_t>(type())};
+  XObject* xdroid_self = this;
+  XdroidAudioWaitBegin(kernel_state(), &xdroid_self, 1);
+  XdroidAudioWaitScope xdroid_wait_scope;
   auto wait_handle = GetWaitHandleForCurrentThread(0);
   if (!wait_handle) {
     // Object doesn't support waiting.
@@ -476,7 +565,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
     }
     X_STATUS status = CooperativeWait(
         scheduler, self, kthread, this, alertable != 0, deadline_ms,
-        [&]() -> std::optional<X_STATUS> {
+        [&](bool parked) -> std::optional<X_STATUS> {
           // Released by a pulse that already reset the host primitive.
           if (cooperative_pulse_epoch() != entry_pulse_epoch) {
             if (self) {
@@ -493,7 +582,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
                                           std::chrono::milliseconds(0));
           switch (poll) {
             case xe::threading::WaitResult::kSuccess: {
-              if (self) {
+              if (self && parked) {
                 self->BoostOnWake(priority_increment());
               }
               WaitCallback();
@@ -569,6 +658,7 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode,
 X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object,
                                 uint32_t wait_reason, uint32_t processor_mode,
                                 uint32_t alertable, uint64_t* opt_timeout) {
+  XdroidScopedWait xdroid_wait(102);
   if (GuestScheduler::enabled() && XThread::GetCurrentFiberThread()) {
     auto* scheduler = wait_object->kernel_state()->guest_scheduler();
     auto* self = XThread::GetCurrentThread();
@@ -593,7 +683,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object,
     }
     X_STATUS status = CooperativeWait(
         scheduler, self, kthread, wait_object, alertable != 0, deadline_ms,
-        [&]() -> std::optional<X_STATUS> {
+        [&](bool parked) -> std::optional<X_STATUS> {
           // Released by a pulse that already reset the host primitive.
           if (wait_object->cooperative_pulse_epoch() != entry_pulse_epoch) {
             if (self) {
@@ -611,7 +701,7 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object,
               alertable ? true : false, std::chrono::milliseconds(0));
           switch (poll) {
             case xe::threading::WaitResult::kSuccess: {
-              if (self) {
+              if (self && parked) {
                 self->BoostOnWake(wait_object->priority_increment());
               }
               wait_object->WaitCallback();
@@ -674,6 +764,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                                uint32_t wait_type, uint32_t wait_reason,
                                uint32_t processor_mode, uint32_t alertable,
                                uint64_t* opt_timeout) {
+  XdroidScopedWait xdroid_wait(100);
+  if (count) {
+    XdroidAudioWaitBegin(objects[0]->kernel_state(), objects, count);
+  }
+  XdroidAudioWaitScope xdroid_wait_scope;
   static constexpr uint32_t kMaxWaitHandles = 64;
   xe::threading::WaitHandle* wait_handles[kMaxWaitHandles];
   // Both the handle array and the stand-in pool are sized for this.
@@ -733,7 +828,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
     }
     return CooperativeWait(
         scheduler, self, kthread, nullptr, alertable != 0, deadline_ms,
-        [&]() -> std::optional<X_STATUS> {
+        [&](bool parked) -> std::optional<X_STATUS> {
           resolve_handles();
           if (wait_type) {
             // WaitAny only: WaitAll needs every object signaled at once, which
@@ -756,7 +851,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
             switch (r.first) {
               case xe::threading::WaitResult::kSuccess: {
                 objects[r.second]->WaitCallback();
-                if (self) {
+                if (self && parked) {
                   self->BoostOnWake(objects[r.second]->priority_increment());
                 }
                 X_STATUS status = objects[r.second]->AcquireStatus();
@@ -791,7 +886,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                   boost_increment = objects[i]->priority_increment();
                 }
               }
-              if (self) {
+              if (self && parked) {
                 self->BoostOnWake(boost_increment);
               }
               return status;

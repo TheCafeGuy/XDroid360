@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <thread>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +38,9 @@
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_shader_translator.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
+#include "xenia/gpu/vulkan/vulkan_draw_blackbox.h"
+#include "xenia/gpu/vulkan/vulkan_glitch_recorder.h"
+#include "xenia/gpu/vulkan/vulkan_gpu_breadcrumbs.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_primitive_processor.h"
@@ -225,15 +230,57 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
 
+  // GE-0 (XDroid360): why the next EndRenderPass ends a pass. Set right before
+  // a SubmitBarriers / EndRenderPass call; consumed (reset to kOther) by the
+  // next EndRenderPass, and by a SubmitBarriers that ends nothing.
+  enum class PassEndReason : uint8_t {
+    kOther,
+    kRtChange,
+    kBarrier,
+    kTextureLoad,
+    kUpload,
+    kResolve,
+    kTransfer,
+    kReadback,
+    kQuery,
+    kSwap,
+    kSubmit,
+    kCount,
+  };
+  void TagPassEnd(PassEndReason reason) { pass_end_reason_ = reason; }
+
+  // STAB-S1: every GPU hang of 2026-10-11 stopped between render passes with
+  // the shader processor busy, so compute dispatches get breadcrumbs too.
+  // Callers name the next dispatch; DeferredCommandBuffer::CmdVkDispatch
+  // calls the hooks around it.
+  void TagDispatch(VulkanGpuBreadcrumbs::WorkKind kind) {
+    dispatch_kind_ = kind;
+  }
+  // Inputs of the next dispatch for the hang report, word 0 its pipeline key.
+  // Only worth building while breadcrumbs are on.
+  bool gpu_breadcrumbs_enabled() const { return gpu_breadcrumbs_.enabled(); }
+  void TagDispatchDetail(const uint32_t* detail, uint32_t count) {
+    dispatch_detail_count_ =
+        std::min(count, VulkanGpuBreadcrumbs::kWorkDetailWords);
+    std::memcpy(dispatch_detail_, detail,
+                sizeof(uint32_t) * dispatch_detail_count_);
+  }
+  void OnDispatchBegin(DeferredCommandBuffer& command_buffer,
+                       uint32_t group_count_x, uint32_t group_count_y,
+                       uint32_t group_count_z);
+  void OnDispatchEnd(DeferredCommandBuffer& command_buffer);
+
   // If [base_bytes, base_bytes + size_bytes) holds memexport output (which
   // under two-buffer routing lives in the host-imported buffer aliasing guest
-  // RAM), copies it into the device-local buffer so a following device-buffer
-  // read - a texture load - sees it. No-op for non-memexport ranges (already in
-  // the device buffer) and when the host buffer is unavailable. Called by the
+  // RAM), copies the pages holding it into the device-local buffer so a
+  // following device-buffer read - a texture load - sees it, or all of the
+  // range with whole_range. No-op for non-memexport ranges (already in the
+  // device buffer) and when the host buffer is unavailable. Called by the
   // texture cache before loading a texture. Ends the render pass.
   // Returns whether it copied, so an upload of the same range can be skipped.
   bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
-                                          uint32_t size_bytes);
+                                          uint32_t size_bytes,
+                                          bool whole_range = false);
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -367,8 +414,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
     uint64_t key;
     uint32_t address;
     uint32_t length;
+    // Where address lies in the slot's buffer.
+    uint32_t offset;
   };
   std::vector<MemexportStagedRange> memexport_staged_;
+  // For EnsureMemexportRangeInDeviceBuffer.
+  std::vector<VkBufferCopy> memexport_copy_regions_;
 
   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                  uint32_t frontbuffer_height) override;
@@ -580,8 +631,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const draw_util::HostDepthPolygonOffset* host_depth_polygon_offset);
   bool UpdateBindings(const VulkanShader* vertex_shader,
                       const VulkanShader* pixel_shader,
-                      bool interpreter_placeholder = false,
-                      bool placeholder_pixel_shader = false);
+                      bool interpreter_placeholder,
+                      bool placeholder_pixel_shader);
   // Allocates a descriptor set and fills one or two VkWriteDescriptorSet
   // structure instances (for images and samplers).
   // The descriptor set layout must be the one for the given is_vertex,
@@ -616,6 +667,38 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::array<SubmissionSummary, kSubmissionHistorySize> submission_history_{};
   size_t submission_history_next_ = 0;
   SubmissionSummary submission_in_progress_{};
+  // Per-draw GPU markers locating a GPU hang (vulkan_gpu_breadcrumbs).
+  VulkanGpuBreadcrumbs gpu_breadcrumbs_;
+  VulkanGlitchRecorder glitch_recorder_;
+  // HUD-1 per-draw state ring (xdroid_draw_blackbox, temp).
+  VulkanDrawBlackbox draw_blackbox_;
+  // GPU stall reports (vulkan_gpu_stall_report_ms): one per stuck
+  // submission, capped per session.
+  static constexpr uint32_t kMaxStallReports = 32;
+  // GPU thread watchdog (vulkan_gpu_stall_watchdog_ms): the stall report above
+  // only runs while this thread awaits a submission, but in the hangs that
+  // kill the app it blocks earlier (acquiring a swapchain image whose previous
+  // paint never finished), so a separate thread watches a heartbeat and
+  // reports while the GPU is still stuck. Lock-free.
+  void StallWatchdogLoop();
+  std::thread stall_watchdog_thread_;
+  std::atomic<bool> stall_watchdog_quit_{false};
+  // Steady-clock milliseconds of the last swap or submission end.
+  std::atomic<uint64_t> gpu_thread_heartbeat_ms_{0};
+  uint64_t stall_reported_submission_ = 0;
+  uint32_t stall_reports_ = 0;
+  // Host frame times of the current stats window (IssueSwap).
+  static constexpr uint32_t kStatsWindowFrames = 60;
+  std::array<uint32_t, kStatsWindowFrames> stats_frame_us_{};
+  uint32_t stats_frame_count_ = 0;
+  std::chrono::steady_clock::time_point stats_last_swap_{};
+  // Tight render area of the open guest render pass.
+  bool tight_area_pending_ = false;
+  bool tight_area_dynamic_ = false;
+  bool tight_area_valid_ = false;
+  size_t tight_area_args_offset_ = 0;
+  VkExtent2D tight_area_extent_{};
+  int32_t tight_area_x1_ = 0, tight_area_y1_ = 0;
 
   void LogRecentSubmissions(const char* context);
 
@@ -668,6 +751,16 @@ class VulkanCommandProcessor final : public CommandProcessor {
   uint64_t render_passes_total_ = 0;
   uint64_t render_passes_window_start_ = 0;
   uint32_t render_pass_window_frames_ = 0;
+  uint64_t vblank_window_start_ = 0;
+  PassEndReason pass_end_reason_ = PassEndReason::kOther;
+  VulkanGpuBreadcrumbs::WorkKind dispatch_kind_ =
+      VulkanGpuBreadcrumbs::WorkKind::kCount;
+  uint32_t dispatch_detail_[VulkanGpuBreadcrumbs::kWorkDetailWords] = {};
+  uint32_t dispatch_detail_count_ = 0;
+  uint32_t large_dispatch_logs_ = 0;
+  std::array<uint64_t, size_t(PassEndReason::kCount)> pass_ends_total_ = {};
+  std::array<uint64_t, size_t(PassEndReason::kCount)> pass_ends_window_start_ =
+      {};
 
   // A timestamp pair per in-flight submission, so the summed GPU busy time is
   // comparable against the Metal backend's completion-handler figure.
@@ -804,6 +897,13 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // kMaxFramesInFlight pairs of gamma ramps if in host-visible memory and
   // uploaded directly, one otherwise.
   VkDeviceMemory gamma_ramp_buffer_memory_ = VK_NULL_HANDLE;
+  // Display tone strength the uploaded gamma ramps were built with.
+  float gamma_ramp_tone_strength_ = 0.0f;
+  // Host-coherent word overwritten with each submission's index at its end,
+  // for VulkanGPUCompletionTimeline::SetCompletionHint.
+  VkBuffer completion_hint_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory completion_hint_memory_ = VK_NULL_HANDLE;
+  volatile uint32_t* completion_hint_mapping_ = nullptr;
   VkBuffer gamma_ramp_buffer_ = VK_NULL_HANDLE;
   // kMaxFramesInFlight pairs, only when the gamma ramp buffer is not
   // host-visible.

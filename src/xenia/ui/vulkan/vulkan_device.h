@@ -237,6 +237,9 @@ class VulkanDevice {
     // VK_EXT_device_fault (#342). For driver-side fault description after
     // VK_ERROR_DEVICE_LOST.
     bool ext_EXT_device_fault = false;
+    // VK_AMD_buffer_marker (#180). GPU breadcrumbs for locating a GPU hang
+    // (vulkan_gpu_breadcrumbs).
+    bool ext_AMD_buffer_marker = false;
     // VK_EXT_external_memory_host (#179). Imports guest RAM as device memory so
     // the shared-memory buffer can alias guest RAM directly (zero-copy).
     bool ext_EXT_external_memory_host = false;
@@ -364,6 +367,11 @@ class VulkanDevice {
   // once. No-op if the extension is not enabled or the query fails.
   void LogFaultInfo();
 
+  // VK_AMD_buffer_marker command, null if the extension is not enabled.
+  PFN_vkCmdWriteBufferMarkerAMD cmd_write_buffer_marker_amd() const {
+    return vkCmdWriteBufferMarkerAMD_;
+  }
+
   VkResult SubmitAndUpdateLost(const VkQueue queue, const uint32_t submit_count,
                                const VkSubmitInfo* const submits,
                                const VkFence fence) {
@@ -403,6 +411,9 @@ class VulkanDevice {
   // VK_EXT_device_fault function pointer, loaded only if the extension is
   // enabled. Null otherwise.
   PFN_vkGetDeviceFaultInfoEXT vkGetDeviceFaultInfoEXT_ = nullptr;
+  // VK_AMD_buffer_marker function pointer, loaded only if the extension is
+  // enabled. Null otherwise.
+  PFN_vkCmdWriteBufferMarkerAMD vkCmdWriteBufferMarkerAMD_ = nullptr;
   // VK_EXT_external_memory_host function pointer, loaded only if the extension
   // is enabled. Null otherwise.
   PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =

@@ -12,6 +12,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -445,6 +446,11 @@ void VdSwap_entry(
     lpdword_t frontbuffer_ptr,  // ptr to frontbuffer address
     lpdword_t texture_format_ptr, lpdword_t color_space_ptr, lpdword_t width,
     lpdword_t height) {
+  // XDroid360 (HUD-1): title code may hold the swap back briefly.
+  if (auto on_guest_swap = gpu::GetXdroidGpuHooks().on_guest_swap.load(
+          std::memory_order_acquire)) {
+    on_guest_swap();
+  }
   // All of these parameters are REQUIRED.
   assert(buffer_ptr);
   assert(fetch_ptr);

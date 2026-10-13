@@ -697,6 +697,12 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
               ma_y_result[0] =
                   builder_->createTriOp(spv::OpSelect, type_float_, y_is_neg,
                                         operand_neg[2], operand[2]);
+            }
+            // The face id is needed whenever W is written, X or not - else
+            // the merge phi below gets no value from this branch (invalid
+            // SPIR-V, the pipeline fails and the draw is lost). DXBC writes it
+            // under the W mask too.
+            if (used_result_components & 0b1000) {
               // id = y < 0.0 ? 3.0 : 2.0
               ma_y_result[3] =
                   builder_->createTriOp(spv::OpSelect, type_float_, y_is_neg,
@@ -1365,6 +1371,9 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
     case ucode::AluScalarOpcode::kSetpClr:
       builder_->createStore(builder_->makeBoolConstant(false),
                             var_main_predicate_);
+      // Like every other predicate write (and the DXBC translator): later
+      // (p0) instructions and jumps in the same exec must re-check p0.
+      predicate_written = true;
       return builder_->makeFloatConstant(FLT_MAX);
     case ucode::AluScalarOpcode::kSetpRstr: {
       spv::Id a = GetOperandComponents(operand_storage[0],

@@ -134,3 +134,6 @@
 	path = third_party/mesa
 	url = https://gitlab.freedesktop.org/has207/mesa.git
 	ignore = dirty
+[submodule "third_party/libadrenotools"]
+	path = third_party/libadrenotools
+	url = https://github.com/bylaws/libadrenotools.git

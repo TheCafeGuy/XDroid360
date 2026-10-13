@@ -12,8 +12,10 @@
 #include <cstdarg>
 #include <cstring>
 
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
@@ -2353,13 +2355,9 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type,
 }
 
 bool D3D12CommandProcessor::EnsureMemexportRangeInDeviceBuffer(
-    uint32_t base_bytes, uint32_t size_bytes) {
+    uint32_t base_bytes, uint32_t size_bytes, bool whole_range) {
   if (!cvars::memexport_enable || shared_memory_->GetHostBuffer() == nullptr ||
-      !size_bytes || base_bytes >= SharedMemory::kBufferSize) {
-    return false;
-  }
-  size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
-  if (!IsMemexportRange(base_bytes, size_bytes)) {
+      !GatherMemexportCopyRuns(base_bytes, size_bytes, whole_range)) {
     return false;
   }
   // Transition the host buffer to a copy source (ordering the memexport writes,
@@ -2370,9 +2368,11 @@ bool D3D12CommandProcessor::EnsureMemexportRangeInDeviceBuffer(
   shared_memory_->UseHostAsCopySource();
   shared_memory_->UseAsCopyDestination();
   SubmitBarriers();
-  deferred_command_list_.D3DCopyBufferRegion(
-      shared_memory_->GetBuffer(), base_bytes, shared_memory_->GetHostBuffer(),
-      base_bytes, size_bytes);
+  for (const auto& run : memexport_copy_runs_) {
+    deferred_command_list_.D3DCopyBufferRegion(
+        shared_memory_->GetBuffer(), run.first, shared_memory_->GetHostBuffer(),
+        run.first, run.second);
+  }
   return true;
 }
 
@@ -2617,6 +2617,21 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   const bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  memexport_ranges_.clear();
+  if (memexport_used_vertex) {
+    draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+  }
+  if (memexport_used_pixel) {
+    draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
+  }
+  // Exports land in guest RAM through the host buffer.
+  if (cvars::memexport_enable && shared_memory_->GetHostBuffer() != nullptr) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      ProvideResolveOutputForGpuWrite(memexport_range.base_address_dwords << 2,
+                                      memexport_range.size_bytes);
+    }
+  }
+
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2714,6 +2729,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  // An async pipeline stand-in (a placeholder, or skipping the draw) is only
+  // fine for a pass redrawn every frame. Wait for the real pipeline instead for
+  // a render target not drawn recently (maybe a one-off render to a texture), a
+  // small one (generated data) or memexport, whose output isn't redone.
+  bool draw_target_recurring =
+      render_target_cache_->TrackLastUpdateDrawTarget(frame_current_);
+  bool draw_target_small = render_target_cache_->IsLastUpdateDrawTargetSmall();
+  bool stand_in_allowed =
+      draw_target_recurring && !draw_target_small && !memexport_used;
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -2814,8 +2838,23 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
           return false;
         }
       }
-    } else if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) ==
-               nullptr) {
+    } else if (!stand_in_allowed &&
+               pipeline_cache_->IsPipelineCreationPending(pipeline_handle)) {
+      uint64_t await_start = xe::Clock::QueryHostTickCount();
+      pipeline_cache_->AwaitRealD3D12PipelineByHandle(pipeline_handle);
+      XELOGI(
+          "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
+          "{:016X}, {:.2f} ms",
+          render_target_cache_->GetLastUpdateDrawTargetName(),
+          draw_target_small        ? "small render target"
+          : !draw_target_recurring ? "not drawn recently"
+                                   : "memexport",
+          vertex_shader->ucode_data_hash(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+          double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
+              double(xe::Clock::QueryHostTickFrequency()));
+    }
+    if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
       // No pipeline and no placeholder available (async_shader_skip_draws with
       // no interpreter stand-in, bindful async, or a failed placeholder) - skip
       // the draw until the real pipeline is ready.
@@ -3020,19 +3059,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
       }
     }
   }
-  // Gather memexport ranges and ensure the heaps for them are resident, and
-  // also load the data surrounding the export and to fill the regions that
-  // won't be modified by the shaders.
-  memexport_ranges_.clear();
-  if (memexport_used_vertex) {
-    draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
-  }
-  if (memexport_used_pixel) {
-    draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
-  }
-  // Host-routed producers write output to host_buffer_ (guest RAM), not the
-  // device buffer, so this upload is redundant. It also drops the draw when the
-  // guest committed only part of the declared capacity, so skip it.
+  // Ensure the heaps for the memexport ranges are resident, and also load the
+  // data surrounding the export and to fill the regions that won't be modified
+  // by the shaders. Host-routed producers write output to host_buffer_ (guest
+  // RAM), not the device buffer, so this upload is redundant. It also drops the
+  // draw when the guest committed only part of the declared capacity, so skip
+  // it.
   if (!route_to_host) {
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       if (!shared_memory_->RequestRange(
@@ -3277,7 +3309,7 @@ void D3D12CommandProcessor::StageMemexportReadback() {
     std::erase_if(memexport_staged_, [key](const MemexportStagedRange& staged) {
       return staged.key == key;
     });
-    memexport_staged_.push_back({key, base_bytes, size_bytes});
+    memexport_staged_.push_back({key, base_bytes, size_bytes, 0});
     // The fence and coherency waits are driven by the page marks.
     MarkMemexportPagesWritten(base_bytes, size_bytes);
   }
@@ -3306,7 +3338,8 @@ void D3D12CommandProcessor::FlushMemexportStagingReadback() {
     if (!length) {
       continue;
     }
-    ReadbackStagingToGuestRam(slot->buffer, staged.address, length);
+    ReadbackStagingToGuestRam(slot->buffer, staged.offset, staged.address,
+                              length);
   }
   memexport_staged_.clear();
 }

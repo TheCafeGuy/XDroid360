@@ -188,8 +188,12 @@ target_include_directories(glslang-spirv PUBLIC glslang)
 # (Windows-on-ARM runs x64 fine via Prism, and macOS handles its own
 # x86_64↔arm64 via Rosetta — both directions are unaffected).
 set(_xe_use_host_shader_cc FALSE)
-if(WIN32 AND CMAKE_CROSSCOMPILING AND XE_TARGET_AARCH64
-    AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+if((WIN32 AND CMAKE_CROSSCOMPILING AND XE_TARGET_AARCH64
+     AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64") OR
+   # Android NDK cross-compile: same problem, the ARM64 tool can't run on
+   # the x64 host. XDroid360 prebuilds it with MinGW-w64 into
+   # build/host_tools/<Config>/ (host x64 binaries) and reuses it here.
+   (CMAKE_SYSTEM_NAME STREQUAL "Android"))
   set(_xe_use_host_shader_cc TRUE)
 endif()
 
@@ -430,7 +434,10 @@ endif()
 else()  # _xe_use_host_shader_cc: x64→ARM64 cross-compile, use native build's binary
 
 # Native x64 build lives at <repo>/build/ (xenia-build.py: get_build_dir(None)).
-set(_xe_host_shader_cc_dir "${CMAKE_SOURCE_DIR}/build/host_tools")
+# NOTE: PROJECT_SOURCE_DIR (the xenia root), not CMAKE_SOURCE_DIR, so this
+# also resolves when driven from a wrapper project (e.g. the XDroid360
+# Gradle glue, whose top-level project lives elsewhere).
+set(_xe_host_shader_cc_dir "${PROJECT_SOURCE_DIR}/build/host_tools")
 set(_xe_host_shader_cc_any "")
 foreach(_cfg Release Checked Debug)
   if(EXISTS "${_xe_host_shader_cc_dir}/${_cfg}/xenia-shader-cc.exe")
@@ -493,6 +500,29 @@ add_library(pugixml STATIC
 )
 target_include_directories(pugixml PUBLIC pugixml/src)
 
+# Nested configure-time probes (snappy/zlib-ng header generation below) must
+# reuse the current generator + toolchain. Without them they fall back to the
+# platform default (NMake on Windows), which fails when cross-compiling
+# (e.g. Android NDK) or without VS installed.
+set(_xe_nested_configure_args "")
+if(CMAKE_GENERATOR)
+  list(APPEND _xe_nested_configure_args -G "${CMAKE_GENERATOR}")
+endif()
+if(CMAKE_TOOLCHAIN_FILE)
+  list(APPEND _xe_nested_configure_args
+    -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE})
+endif()
+if(DEFINED ANDROID_ABI)
+  list(APPEND _xe_nested_configure_args -DANDROID_ABI=${ANDROID_ABI})
+endif()
+if(DEFINED ANDROID_PLATFORM)
+  list(APPEND _xe_nested_configure_args -DANDROID_PLATFORM=${ANDROID_PLATFORM})
+endif()
+if(CMAKE_MAKE_PROGRAM)
+  list(APPEND _xe_nested_configure_args
+    -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+endif()
+
 # ==============================================================================
 # snappy
 # ==============================================================================
@@ -505,6 +535,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/snappy/snappy-stubs-public.h")
   endif()
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_nested_configure_args}
       -DSNAPPY_BUILD_TESTS=OFF
       -DSNAPPY_BUILD_BENCHMARKS=OFF
       ${_snappy_avx_flag}
@@ -551,7 +582,7 @@ target_compile_definitions(zstd PRIVATE
   XXH_NAMESPACE=ZSTD_
   ZSTD_LEGACY_SUPPORT=0
 )
-if(XE_TARGET_X86_64 AND NOT MSVC)
+if(XE_TARGET_X86_64 AND NOT MSVC AND NOT XDROID_HOST_TOOLS_BUILD)
   enable_language(ASM)
   target_sources(zstd PRIVATE zstd/lib/decompress/huf_decompress_amd64.S)
 else()
@@ -587,6 +618,7 @@ endforeach()
 if(_zlibng_needs_configure)
   execute_process(
     COMMAND ${CMAKE_COMMAND}
+      ${_xe_nested_configure_args}
       -DZLIB_ENABLE_TESTS=OFF
       -DWITH_GTEST=OFF
       ${CMAKE_CURRENT_SOURCE_DIR}/zlib-ng
@@ -688,6 +720,10 @@ endif()
 # ==============================================================================
 # SDL3
 # ==============================================================================
+# Android: skipped entirely. The only in-tree consumers (xenia-apu-sdl,
+# xenia-hid-sdl) are desktop-only; the Android build uses native audio/input
+# drivers from the frontend glue. Saves a ~60s configure + hundreds of TUs.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
 # Build SDL3 from source on every platform using upstream's own CMake. Xenia
 # drives windowing/rendering/GPU directly, so the SDL subsystems we don't
 # consume are switched off. Only audio + joystick/gamepad/haptic + events are
@@ -781,6 +817,7 @@ if(MSVC)
     endif()
   endforeach()
 endif()
+endif()  # NOT Android (SDL3 skipped)
 
 # ==============================================================================
 # FFmpeg — upstream source lives in the FFmpeg submodule; xenia's static

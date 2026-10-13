@@ -9,9 +9,13 @@
 
 #include "xenia/cpu/backend/a64/a64_sequences.h"
 
+#include <chrono>
+#include <ctime>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
 #include "xenia/cpu/backend/a64/a64_op.h"
@@ -25,6 +29,38 @@
 
 DECLARE_bool(emit_mmio_aware_stores_for_recorded_exception_addresses);
 DECLARE_bool(emit_inline_mmio_checks);
+
+// XDroid360: guest spin-waits (db16cyc sleds, e.g. AC6's main
+// thread polling for GPU progress) kept a big core 80-90% busy at the 30 FPS
+// cap. Every 128th db16cyc on a thread sleeps this long; a waiting loop then
+// idles most of the time while still noticing its condition within
+// microseconds. 0 = upstream behavior (isb only).
+DEFINE_uint32(guest_spin_sleep_us, 0,
+              "Sleep this many microseconds every 128 guest db16cyc spin "
+              "hints on a thread (0 = never sleep, upstream behavior).",
+              "CPU");
+
+// XDroid360 CE-7: park a guest spin-wait on the GPU write-back generation
+// instead of spinning. AC6's main thread polls a fence that the GPU command
+// processor writes back and burns a big core (~80%) at the 30 FPS cap. After
+// guest_spin_park_hints db16cyc hints in quick succession with no write-back,
+// the thread sleeps until the next write-back or guest_spin_park_timeout_us,
+// so a spin that waits on another CPU thread instead is only slowed, never
+// stalled. 0 = off (upstream isb). 1 = park. 2 = call the helper but never
+// park (the "B" arm of a live A/B: the same code without parking). Chosen
+// when code is translated; switching between 1 and 2 works live.
+DEFINE_uint32(guest_spin_park, 0,
+              "Park guest spin-waits (db16cyc) on GPU write-backs: 0 = off, "
+              "1 = park, 2 = helper without parking (A/B).",
+              "CPU");
+DEFINE_uint32(guest_spin_park_hints, 32,
+              "Consecutive db16cyc hints without a GPU write-back before a "
+              "guest spin-wait parks.",
+              "CPU");
+DEFINE_uint32(guest_spin_park_timeout_us, 200,
+              "Longest a parked guest spin-wait sleeps without a GPU "
+              "write-back.",
+              "CPU");
 
 DEFINE_bool(inline_loadclock, false,
             "Directly read cached guest clock without calling the LoadClock "
@@ -58,9 +94,56 @@ static bool IsPossibleMMIOInstruction(A64Emitter& e, const hir::Instr* i) {
 // ============================================================================
 // OPCODE_DELAY_EXECUTION
 // ============================================================================
+static void GuestSpinPause(void* /*raw_context*/) {
+  thread_local uint32_t spin_hints = 0;
+  if (!(++spin_hints & 127)) {
+    timespec duration = {0, long(cvars::guest_spin_sleep_us) * 1000};
+    nanosleep(&duration, nullptr);
+  }
+}
+
+// Lock-free (a futex wait on a generation counter): safe inside a scheduler
+// watchdog region. Hints count as one spin only while they arrive within
+// kSpinWindow of each other, so scattered db16cyc in normal code never park.
+static void GuestSpinPark(void* /*raw_context*/) {
+  thread_local uint32_t hints = 0;
+  thread_local uint32_t seen_generation = 0;
+  thread_local std::chrono::steady_clock::time_point last_hint;
+  constexpr auto kSpinWindow = std::chrono::microseconds(50);
+  if (cvars::guest_spin_park != 1) {
+    return;
+  }
+  xe::threading::WakeGeneration& writebacks =
+      xe::threading::GuestGpuWritebackGeneration();
+  const uint32_t generation = writebacks.Load();
+  const auto now = std::chrono::steady_clock::now();
+  if (generation != seen_generation || now - last_hint > kSpinWindow) {
+    seen_generation = generation;
+    hints = 0;
+  }
+  last_hint = now;
+  if (++hints < cvars::guest_spin_park_hints) {
+    return;
+  }
+  hints = 0;
+  writebacks.WaitFor(
+      generation,
+      std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
+  // The wait itself must not end the spin window.
+  last_hint = std::chrono::steady_clock::now();
+}
+
 struct DELAY_EXECUTION
     : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    if (cvars::guest_spin_park) {
+      e.CallNativeSafe(reinterpret_cast<void*>(GuestSpinPark));
+      return;
+    }
+    if (cvars::guest_spin_sleep_us) {
+      e.CallNativeSafe(reinterpret_cast<void*>(GuestSpinPause));
+      return;
+    }
     // db16cyc throttles a guest spin loop. yield is the literal translation
     // but NOPs on Cortex-X/A7xx, so the sled cost nothing; isb is the usual
     // stand-in - a pipeline flush with no guest-observable effect. Coalesce

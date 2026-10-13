@@ -33,6 +33,41 @@
 
 DECLARE_bool(vulkan_dynamic_rendering);
 
+DEFINE_bool(vulkan_render_target_format_list, false,
+            "Give mutable-format color render targets their exact view format "
+            "list (render + ownership transfer) so the driver can keep "
+            "framebuffer compression (UBWC on Turnip). Read when a render "
+            "target is created (UBWC-1, PES-1).",
+            "Vulkan");
+DEFINE_bool(
+    vulkan_direct_resolve_transient_dest, false,
+    "When the whole shared memory buffer can't be bound as one storage buffer "
+    "(maxStorageBufferRange too small, as on Turnip), still resolve render "
+    "targets directly into shared memory through a per-resolve descriptor "
+    "instead of the EDRAM dump + copy round trip. Read on every resolve "
+    "(live-switchable).",
+    "Vulkan");
+DEFINE_bool(
+    vulkan_direct_resolve_transient_depth, false,
+    "Let the transient-dest direct resolve take depth render targets too. "
+    "Off: depth resolves take the EDRAM round trip - on Turnip (A750) every "
+    "logged GPU hang was a 2x MSAA depth direct resolve (STAB-S1 stab2 and "
+    "IS-2), while ~800k color ones never hung. Live-switchable.",
+    "Vulkan");
+DEFINE_uint32(xdroid_depth_read_repeat, 1,
+              "STAB-S1 forensic (temp): issue every compute dispatch that "
+              "reads a depth render target (dump or direct resolve) this many "
+              "times, to raise the hang rate for A/B arms. Live-switchable.",
+              "Vulkan");
+DEFINE_bool(xdroid_depth_read_skip_stencil, false,
+            "STAB-S1 forensic (temp): depth dumps and direct resolves skip the "
+            "stencil fetch (stencil reads as 0). Live-switchable.",
+            "Vulkan");
+DEFINE_bool(vulkan_direct_resolve_post_barrier, false,
+            "STAB-S1 test arm (temp): a full memory barrier after every "
+            "direct resolve dispatch. Live-switchable.",
+            "Vulkan");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -1328,7 +1363,10 @@ bool VulkanRenderTargetCache::Resolve(
                 copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
+          command_processor_.TagDispatch(
+              VulkanGpuBreadcrumbs::WorkKind::kResolveCopy);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y,
                                        1);
 
@@ -1428,7 +1466,10 @@ bool VulkanRenderTargetCache::Resolve(
           command_buffer.CmdVkPushConstants(
               resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
               0, sizeof(depth_clear_constants), &depth_clear_constants);
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
+          command_processor_.TagDispatch(
+              VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
           command_buffer.CmdVkDispatch(clear_group_count.first,
                                        clear_group_count.second, 1);
         }
@@ -1452,7 +1493,10 @@ bool VulkanRenderTargetCache::Resolve(
                 resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(color_clear_constants), &color_clear_constants);
           }
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
+          command_processor_.TagDispatch(
+              VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
           command_buffer.CmdVkDispatch(clear_group_count.first,
                                        clear_group_count.second, 1);
         }
@@ -1982,6 +2026,23 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  }
+  // UBWC-1: a mutable-format image without a view format list may be any
+  // format, so Turnip (like most tilers) disables framebuffer compression on
+  // it. Only the render and ownership-transfer views exist (below), so the
+  // list is exact - as the texture cache already does for its images.
+  VkFormat view_formats[2] = {image_create_info.format, transfer_format};
+  VkImageFormatListCreateInfo image_format_list_create_info;
+  if (cvars::vulkan_render_target_format_list &&
+      (image_create_info.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) &&
+      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+    image_format_list_create_info.sType =
+        VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+    image_format_list_create_info.pNext = image_create_info.pNext;
+    image_format_list_create_info.viewFormatCount =
+        uint32_t(xe::countof(view_formats));
+    image_format_list_create_info.pViewFormats = view_formats;
+    image_create_info.pNext = &image_format_list_create_info;
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     XELOGE("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -2895,7 +2956,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant),
             &host_depth_store_rectangle_constant);
+        command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTransfer);
         command_processor_.SubmitBarriers(true);
+        command_processor_.TagDispatch(
+            VulkanGpuBreadcrumbs::WorkKind::kTransfer);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
         MarkEdramBufferModified();
       }
@@ -3807,19 +3871,34 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
   // stay an absolute byte offset, which is what the shader adds to the tiled
   // address.
   VkDescriptorSet descriptor_set_dest = VK_NULL_HANDLE;
+  // Without the persistent whole-buffer descriptor (maxStorageBufferRange
+  // below the shared memory size, as on Turnip), bind a transient descriptor
+  // covering only the destination instead of falling back to the EDRAM round
+  // trip (dump to the EDRAM buffer, then copy out - two dispatches and their
+  // barriers per resolve).
+  bool transient_shared_dest = false;
   if (!copy_dest_scaled) {
     descriptor_set_dest =
         texture_cache.shared_memory_persistent_descriptor_set();
     if (descriptor_set_dest == VK_NULL_HANDLE) {
-      static bool no_persistent_dest_logged = false;
-      if (!no_persistent_dest_logged) {
-        no_persistent_dest_logged = true;
-        XELOGW(
-            "VulkanRenderTargetCache: No persistent shared memory descriptor "
-            "set (maxStorageBufferRange below the shared memory size) - every "
-            "resolve will take the EDRAM round trip");
+      if (!cvars::vulkan_direct_resolve_transient_dest) {
+        static bool no_persistent_dest_logged = false;
+        if (!no_persistent_dest_logged) {
+          no_persistent_dest_logged = true;
+          XELOGW(
+              "VulkanRenderTargetCache: No persistent shared memory descriptor "
+              "set (maxStorageBufferRange below the shared memory size) - "
+              "every resolve will take the EDRAM round trip");
+        }
+        return false;
       }
-      return false;
+      // STAB-S1: the transient path hangs Turnip on depth sources (it also
+      // texelFetches the stencil aspect of an MSAA depth image there).
+      if (resolve_info.IsCopyingDepth() &&
+          !cvars::vulkan_direct_resolve_transient_depth) {
+        return false;
+      }
+      transient_shared_dest = true;
     }
   }
 
@@ -3843,6 +3922,8 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
     pipeline_key.source_scale_native = rt_key.scale_native;
     pipeline_key.native_layout = uint32_t(!copy_dest_scaled);
     pipeline_key.direct_resolve = 1;
+    pipeline_key.skip_stencil =
+        uint32_t(rt_key.is_depth && cvars::xdroid_depth_read_skip_stencil);
     if (GetDumpPipeline(pipeline_key) == VK_NULL_HANDLE) {
       return false;
     }
@@ -3909,6 +3990,50 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
     return false;
   }
 
+  // Byte offset of the transient destination binding, subtracted from the
+  // absolute destination base the shader adds to the tiled address.
+  uint32_t transient_dest_offset = 0;
+  uint64_t transient_dest_range = 0;
+  if (transient_shared_dest) {
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        command_processor_.GetVulkanDevice();
+    const uint64_t alignment = std::max<uint64_t>(
+        vulkan_device->properties().minStorageBufferOffsetAlignment, 4);
+    transient_dest_offset =
+        uint32_t(resolve_info.copy_dest_base & ~uint32_t(alignment - 1));
+    const uint64_t range = uint64_t(resolve_info.copy_dest_extent_start) +
+                           resolve_info.copy_dest_extent_length -
+                           transient_dest_offset;
+    transient_dest_range = range;
+    if (resolve_info.copy_dest_extent_start < transient_dest_offset ||
+        range > vulkan_device->properties().maxStorageBufferRange) {
+      return false;
+    }
+    descriptor_set_dest = command_processor_.AllocateSingleTransientDescriptor(
+        VulkanCommandProcessor::SingleTransientDescriptorLayout::
+            kStorageBuffer);
+    if (descriptor_set_dest == VK_NULL_HANDLE) {
+      return false;
+    }
+    VkDescriptorBufferInfo dest_buffer_info;
+    dest_buffer_info.buffer = shared_memory.buffer();
+    dest_buffer_info.offset = transient_dest_offset;
+    dest_buffer_info.range = range;
+    VkWriteDescriptorSet write_dest;
+    write_dest.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_dest.pNext = nullptr;
+    write_dest.dstSet = descriptor_set_dest;
+    write_dest.dstBinding = 0;
+    write_dest.dstArrayElement = 0;
+    write_dest.descriptorCount = 1;
+    write_dest.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_dest.pImageInfo = nullptr;
+    write_dest.pBufferInfo = &dest_buffer_info;
+    write_dest.pTexelBufferView = nullptr;
+    vulkan_device->functions().vkUpdateDescriptorSets(
+        vulkan_device->device(), 1, &write_dest, 0, nullptr);
+  }
+
   command_processor_.PushDebugMarker("DirectResolveRenderTargets: base tile %u",
                                      dump_base);
 
@@ -3969,7 +4094,9 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
           copy_shader_constants.dest_relative.dest_coordinate_info.packed;
   // The scaled destination's binding already starts at the base.
   resolve_push_constants[kEdramDumpShaderPushConstantResolveDestBase] =
-      copy_dest_scaled ? 0 : copy_shader_constants.dest_base;
+      copy_dest_scaled
+          ? 0
+          : copy_shader_constants.dest_base - transient_dest_offset;
   resolve_push_constants[kEdramDumpShaderPushConstantResolveHeightDiv8] =
       resolve_info.height_div_8;
 
@@ -4081,10 +4208,40 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
           sizeof(uint32_t) * kEdramDumpShaderPushConstantResolveDispatchTile,
           sizeof(dispatch_tile), &dispatch_tile);
 
+      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
       command_processor_.SubmitBarriers(true);
       uint32_t threads_x =
           (dispatch.width_tiles * tile_pixels_x + (pixels_per_thread - 1)) /
           pixels_per_thread;
+      command_processor_.TagDispatch(
+          VulkanGpuBreadcrumbs::WorkKind::kDirectResolve);
+      if (command_processor_.gpu_breadcrumbs_enabled()) {
+        // STAB-S1 (temp): everything that shapes this dispatch, for the hang
+        // report - word 0 is the pipeline key the variant table counts.
+        const uint32_t detail[] = {
+            invocation.pipeline_key.key,
+            rt_key.key,
+            transient_dest_offset,
+            uint32_t(transient_dest_range),
+            resolve_push_constants[kEdramDumpShaderPushConstantResolveDestBase],
+            resolve_push_constants[kEdramDumpShaderPushConstantResolveEdramInfo],
+            resolve_push_constants
+                [kEdramDumpShaderPushConstantResolveCoordinateInfo],
+            resolve_push_constants[kEdramDumpShaderPushConstantResolveDestInfo],
+            resolve_push_constants
+                [kEdramDumpShaderPushConstantResolveDestCoordinateInfo],
+            resolve_push_constants
+                [kEdramDumpShaderPushConstantResolveHeightDiv8],
+            dispatch_tile.packed,
+            last_pitches.pitches,
+            last_offsets.offsets,
+            resolve_info.copy_dest_extent_start,
+            resolve_info.copy_dest_extent_length,
+            dispatch.width_tiles | (dispatch.height_tiles << 16),
+        };
+        command_processor_.TagDispatchDetail(detail,
+                                             uint32_t(xe::countof(detail)));
+      }
       command_buffer.CmdVkDispatch(
           (threads_x + (kEdramDumpShaderResolveThreadsPerGroupX - 1)) /
               kEdramDumpShaderResolveThreadsPerGroupX,
@@ -4092,6 +4249,34 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
            (kEdramDumpShaderResolveThreadsPerGroupY - 1)) /
               kEdramDumpShaderResolveThreadsPerGroupY,
           1);
+      // STAB-S1 forensic (temp): identical repeats write identical values.
+      for (uint32_t repeat = 1;
+           rt_key.is_depth && repeat < cvars::xdroid_depth_read_repeat;
+           ++repeat) {
+        command_processor_.TagDispatch(
+            VulkanGpuBreadcrumbs::WorkKind::kDirectResolve);
+        command_buffer.CmdVkDispatch(
+            (threads_x + (kEdramDumpShaderResolveThreadsPerGroupX - 1)) /
+                kEdramDumpShaderResolveThreadsPerGroupX,
+            (dispatch.height_tiles * tile_pixels_y +
+             (kEdramDumpShaderResolveThreadsPerGroupY - 1)) /
+                kEdramDumpShaderResolveThreadsPerGroupY,
+            1);
+      }
+      if (cvars::vulkan_direct_resolve_post_barrier) {
+        // STAB-S1 arm (temp): nothing after this dispatch may start before
+        // it has finished, whatever the barriers the next work pushes.
+        VkMemoryBarrier post_barrier;
+        post_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        post_barrier.pNext = nullptr;
+        post_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        post_barrier.dstAccessMask =
+            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        command_buffer.CmdVkPipelineBarrier(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post_barrier, 0,
+            nullptr, 0, nullptr);
+      }
     }
   }
 
@@ -4359,6 +4544,8 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
     pipeline_key.is_depth = rt_key.is_depth;
     pipeline_key.source_scale_native = rt_key.scale_native;
     pipeline_key.native_layout = uint32_t(native_layout);
+    pipeline_key.skip_stencil =
+        uint32_t(rt_key.is_depth && cvars::xdroid_depth_read_skip_stencil);
     dump_invocations_.emplace_back(rectangle, pipeline_key);
   }
 
@@ -4444,18 +4631,26 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
             sizeof(last_offsets), &last_offsets);
       }
       command_processor_.SubmitBarriers(true);
-      // The native layout has a 1x1 footprint.
-      command_buffer.CmdVkDispatch(
-          ((native_layout ? 1 : draw_resolution_scale_x()) *
-               (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
-               dispatch.width_tiles +
-           (kEdramDumpShaderSamplesPerGroupX - 1)) /
-              kEdramDumpShaderSamplesPerGroupX,
-          ((native_layout ? 1 : draw_resolution_scale_y()) *
-               xenos::kEdramTileHeightSamples * dispatch.height_tiles +
-           (kEdramDumpShaderSamplesPerGroupY - 1)) /
-              kEdramDumpShaderSamplesPerGroupY,
-          1);
+      // STAB-S1 forensic (temp): identical repeats write identical values.
+      const uint32_t repeats =
+          rt_key.is_depth ? std::max(cvars::xdroid_depth_read_repeat, 1u) : 1;
+      for (uint32_t repeat = 0; repeat < repeats; ++repeat) {
+        // The native layout has a 1x1 footprint.
+        command_processor_.TagDispatch(
+            VulkanGpuBreadcrumbs::WorkKind::kDump);
+        command_buffer.CmdVkDispatch(
+            ((native_layout ? 1 : draw_resolution_scale_x()) *
+                 (xenos::kEdramTileWidthSamples >>
+                  uint32_t(rt_key.Is64bpp())) *
+                 dispatch.width_tiles +
+             (kEdramDumpShaderSamplesPerGroupX - 1)) /
+                kEdramDumpShaderSamplesPerGroupX,
+            ((native_layout ? 1 : draw_resolution_scale_y()) *
+                 xenos::kEdramTileHeightSamples * dispatch.height_tiles +
+             (kEdramDumpShaderSamplesPerGroupY - 1)) /
+                kEdramDumpShaderSamplesPerGroupY,
+            1);
+      }
     }
     MarkEdramBufferModified();
   }

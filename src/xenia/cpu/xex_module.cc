@@ -1704,12 +1704,8 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
     }
   }
   uint32_t high_8_aligned = highest_exec_addr & ~(8U - 1);
-  uint32_t n_possible_8byte_addresses = (high_8_aligned - low_8_aligned) / 8;
-  uint32_t* funcstart_candidate_stack =
-      new uint32_t[n_possible_8byte_addresses];
-  uint32_t* funcstart_candstack2 = new uint32_t[n_possible_8byte_addresses];
-
-  uint32_t stack_pos = 0;
+  std::vector<uint32_t> funcstarts;
+  funcstarts.reserve((high_8_aligned - low_8_aligned) / 8);
   {
     // all functions seem to start on 8 byte boundaries, except for obvious ones
     // like the save/rest funcs
@@ -1731,8 +1727,8 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
     uint32_t mfspr_r12_lr32 =
         *reinterpret_cast<const uint32_t*>(&mfspr_r12_lr[0]);
 
-    auto add_new_func = [funcstart_candidate_stack, &stack_pos](uint32_t addr) {
-      funcstart_candidate_stack[stack_pos++] = addr;
+    auto add_new_func = [&funcstarts](uint32_t addr) {
+      funcstarts.push_back(addr);
     };
     /*
                 First pass: detect save of the link register at an eight byte
@@ -1786,6 +1782,95 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
       }
     }
 
+    // Third pass: functions whose address is formed with lis + addi/ori, such
+    // as callbacks stored into a table. A leaf that is never the target of a bl
+    // has no .pdata entry and can follow the previous blr without padding, so
+    // none of the passes above find it and it compiles on first call.
+    auto in_code_section = [this](uint32_t address) {
+      for (auto& section : pe_sections_) {
+        if ((section.flags & kXEPESectionContainsCode) &&
+            address >= section.address &&
+            address - section.address < section.size) {
+          return true;
+        }
+      }
+      return false;
+    };
+    auto read = [this](uint32_t address) -> uint32_t {
+      return *memory()->TranslateVirtualBE<uint32_t>(address);
+    };
+    auto is_address_taken_function = [&](uint32_t address) {
+      if ((address & 3) || !in_code_section(address) ||
+          !in_code_section(address - 4)) {
+        return false;
+      }
+      uint32_t first = read(address);
+      // A table of code addresses (a jump table) rather than code.
+      if (!first || in_code_section(first)) {
+        return false;
+      }
+      uint32_t previous = read(address - 4);
+      bool previous_is_b =
+          (previous >> 26) == 18 && !ppc::PPCOpcodeBits{previous}.I.LK;
+      return !previous || previous == 0x4E800020 || previous_is_b;
+    };
+    // How far an addi/ori may follow the lis its value started from.
+    constexpr uint32_t kConstantWindowBytes = 64;
+    for (auto& section : pe_sections_) {
+      if (!(section.flags & kXEPESectionContainsCode)) {
+        continue;
+      }
+      std::array<uint32_t, 32> registers = {};
+      std::array<uint32_t, 32> lis_address = {};
+      auto clear = [&](uint32_t reg) { lis_address[reg] = 0; };
+      uint32_t section_end = section.address + (section.size & ~3u);
+      for (uint32_t address = section.address; address < section_end;
+           address += 4) {
+        uint32_t code = read(address);
+        ppc::PPCOpcodeBits bits{code};
+        uint32_t opcode = code >> 26;
+        if (opcode == 15 && !bits.D.RA) {
+          registers[bits.D.RT] = static_cast<uint32_t>(bits.D.DS) << 16;
+          lis_address[bits.D.RT] = address;
+          continue;
+        }
+        uint32_t source = 32, dest = 32, value = 0;
+        if (opcode == 14 && bits.D.RA) {
+          source = bits.D.RA;
+          dest = bits.D.RT;
+          value = registers[source] +
+                  static_cast<uint32_t>(ppc::XEEXTS16(bits.D.DS));
+        } else if (opcode == 24) {
+          source = bits.D.RT;
+          dest = bits.D.RA;
+          value = registers[source] | bits.D.DS;
+        }
+        if (source != 32 && lis_address[source] &&
+            address - lis_address[source] <= kConstantWindowBytes) {
+          registers[dest] = value;
+          lis_address[dest] = lis_address[source];
+          if (is_address_taken_function(value)) {
+            add_new_func(value);
+          }
+          continue;
+        }
+        // Anything else that may write a register ends its constant. Clearing
+        // too much only loses a candidate; a stale high half invents one.
+        bool is_branch = opcode == 16 || opcode == 18 || opcode == 19;
+        if (is_branch && (code & 1)) {
+          // A call clobbers the volatile registers.
+          clear(0);
+          for (uint32_t reg = 3; reg <= 12; ++reg) {
+            clear(reg);
+          }
+        } else if (!is_branch && opcode != 10 && opcode != 11) {
+          // Update forms and logical ops write RA, most others RT.
+          clear(bits.D.RT);
+          clear(bits.D.RA);
+        }
+      }
+    }
+
     auto pdata = this->GetPESection(".pdata");
 
     if (pdata) {
@@ -1808,34 +1893,10 @@ std::vector<uint32_t> XexModule::PreanalyzeCode() {
 
   // Sort the list of function starts and then ensure that all addresses are
   // unique
-  uint32_t n_known_funcaddrs = 0;
-  {
-    // make addresses unique
-
-    std::sort(funcstart_candidate_stack, funcstart_candidate_stack + stack_pos);
-
-    uint32_t read_pos = 0;
-    uint32_t write_pos = 0;
-    uint32_t previous_addr = ~0u;
-    while (read_pos < stack_pos) {
-      uint32_t current_addr = funcstart_candidate_stack[read_pos++];
-
-      if (current_addr != previous_addr) {
-        previous_addr = current_addr;
-        funcstart_candstack2[write_pos++] = current_addr;
-      }
-    }
-    n_known_funcaddrs = write_pos;
-  }
-
-  delete[] funcstart_candidate_stack;
-
-  std::vector<uint32_t> result;
-  result.resize(n_known_funcaddrs);
-  memcpy(&result[0], funcstart_candstack2,
-         sizeof(uint32_t) * n_known_funcaddrs);
-  delete[] funcstart_candstack2;
-  return result;
+  std::sort(funcstarts.begin(), funcstarts.end());
+  funcstarts.erase(std::unique(funcstarts.begin(), funcstarts.end()),
+                   funcstarts.end());
+  return funcstarts;
 }
 bool XexModule::FindSaveRest() {
   // Special stack save/restore functions.

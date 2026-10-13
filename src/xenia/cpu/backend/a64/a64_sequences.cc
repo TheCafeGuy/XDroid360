@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <type_traits>
 
 #include "xenia/base/byte_order.h"
@@ -3272,54 +3273,43 @@ EMITTER_OPCODE_TABLE(OPCODE_DID_SATURATE, DID_SATURATE);
 // ============================================================================
 // OPCODE_MAX / OPCODE_MIN (scalar)
 // ============================================================================
+// A float MAX/MIN operand: its register, or the constant loaded into
+// s<scratch>/d<scratch>.
+static SReg LoadFpConst(A64Emitter& e, const F32Op& op, int scratch) {
+  if (!op.is_constant) {
+    return op;
+  }
+  const float value = op.constant();
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  e.mov(e.w0, static_cast<uint64_t>(bits));
+  e.fmov(SReg(scratch), e.w0);
+  return SReg(scratch);
+}
+static DReg LoadFpConst(A64Emitter& e, const F64Op& op, int scratch) {
+  if (!op.is_constant) {
+    return op;
+  }
+  const double value = op.constant();
+  uint64_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  e.mov(e.x0, bits);
+  e.fmov(DReg(scratch), e.x0);
+  return DReg(scratch);
+}
+
 struct MAX_F32 : Sequence<MAX_F32, I<OPCODE_MAX, F32Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    if (i.src1.is_constant) {
-      union {
-        float f;
-        uint32_t u;
-      } c;
-      c.f = i.src1.constant();
-      e.mov(e.w0, static_cast<uint64_t>(c.u));
-      e.fmov(e.s0, e.w0);
-      e.fmax(i.dest, e.s0, i.src2.is_constant ? e.s1 : i.src2);
-    } else if (i.src2.is_constant) {
-      union {
-        float f;
-        uint32_t u;
-      } c;
-      c.f = i.src2.constant();
-      e.mov(e.w0, static_cast<uint64_t>(c.u));
-      e.fmov(e.s0, e.w0);
-      e.fmax(i.dest, i.src1, e.s0);
-    } else {
-      e.fmax(i.dest, i.src1, i.src2);
-    }
+    const auto src1 = LoadFpConst(e, i.src1, 0);
+    const auto src2 = LoadFpConst(e, i.src2, 1);
+    e.fmax(i.dest, src1, src2);
   }
 };
 struct MAX_F64 : Sequence<MAX_F64, I<OPCODE_MAX, F64Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    if (i.src1.is_constant) {
-      union {
-        double d;
-        uint64_t u;
-      } c;
-      c.d = i.src1.constant();
-      e.mov(e.x0, c.u);
-      e.fmov(e.d0, e.x0);
-      e.fmax(i.dest, e.d0, i.src2.is_constant ? e.d1 : i.src2);
-    } else if (i.src2.is_constant) {
-      union {
-        double d;
-        uint64_t u;
-      } c;
-      c.d = i.src2.constant();
-      e.mov(e.x0, c.u);
-      e.fmov(e.d0, e.x0);
-      e.fmax(i.dest, i.src1, e.d0);
-    } else {
-      e.fmax(i.dest, i.src1, i.src2);
-    }
+    const auto src1 = LoadFpConst(e, i.src1, 0);
+    const auto src2 = LoadFpConst(e, i.src2, 1);
+    e.fmax(i.dest, src1, src2);
   }
 };
 struct MAX_V128 : Sequence<MAX_V128, I<OPCODE_MAX, V128Op, V128Op, V128Op>> {
@@ -3419,52 +3409,16 @@ struct MIN_I64 : Sequence<MIN_I64, I<OPCODE_MIN, I64Op, I64Op, I64Op>> {
 };
 struct MIN_F32 : Sequence<MIN_F32, I<OPCODE_MIN, F32Op, F32Op, F32Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    if (i.src1.is_constant) {
-      union {
-        float f;
-        uint32_t u;
-      } c;
-      c.f = i.src1.constant();
-      e.mov(e.w0, static_cast<uint64_t>(c.u));
-      e.fmov(e.s0, e.w0);
-      e.fmin(i.dest, e.s0, i.src2.is_constant ? e.s1 : i.src2);
-    } else if (i.src2.is_constant) {
-      union {
-        float f;
-        uint32_t u;
-      } c;
-      c.f = i.src2.constant();
-      e.mov(e.w0, static_cast<uint64_t>(c.u));
-      e.fmov(e.s0, e.w0);
-      e.fmin(i.dest, i.src1, e.s0);
-    } else {
-      e.fmin(i.dest, i.src1, i.src2);
-    }
+    const auto src1 = LoadFpConst(e, i.src1, 0);
+    const auto src2 = LoadFpConst(e, i.src2, 1);
+    e.fmin(i.dest, src1, src2);
   }
 };
 struct MIN_F64 : Sequence<MIN_F64, I<OPCODE_MIN, F64Op, F64Op, F64Op>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
-    if (i.src1.is_constant) {
-      union {
-        double d;
-        uint64_t u;
-      } c;
-      c.d = i.src1.constant();
-      e.mov(e.x0, c.u);
-      e.fmov(e.d0, e.x0);
-      e.fmin(i.dest, e.d0, i.src2.is_constant ? e.d1 : i.src2);
-    } else if (i.src2.is_constant) {
-      union {
-        double d;
-        uint64_t u;
-      } c;
-      c.d = i.src2.constant();
-      e.mov(e.x0, c.u);
-      e.fmov(e.d0, e.x0);
-      e.fmin(i.dest, i.src1, e.d0);
-    } else {
-      e.fmin(i.dest, i.src1, i.src2);
-    }
+    const auto src1 = LoadFpConst(e, i.src1, 0);
+    const auto src2 = LoadFpConst(e, i.src2, 1);
+    e.fmin(i.dest, src1, src2);
   }
 };
 struct MIN_V128 : Sequence<MIN_V128, I<OPCODE_MIN, V128Op, V128Op, V128Op>> {

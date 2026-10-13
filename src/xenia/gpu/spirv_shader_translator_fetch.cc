@@ -11,20 +11,83 @@
 
 #include <climits>
 #include <cmath>
+#include <cstdlib>
+#include <string>
+#include <utility>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_bool(spirv_fine_derivatives);
 
+DEFINE_string(
+    deswizzle_identity_ps_hashes, "",
+    "Pixel shader ucode hashes (hex) whose 2D param_gen texture samples "
+    "manually de-swizzle the raw EDRAM sub-tile order of their source, as "
+    "tokens \"<hash>[:<slot>[+<slot>...]]\" separated by commas or spaces. "
+    "The texture cache detiles to linear, so that de-swizzle is a wrong texel "
+    "permutation here: a matching fetch samples the texel under the pixel "
+    "instead (1:1 copy). A bare hash covers all fetch constant slots. Empty "
+    "uses the title's built-in list, if any.",
+    "GPU");
+
 namespace xe {
 namespace gpu {
 
 namespace {
+// Set before the title's shaders are translated, read-only afterwards.
+std::string title_deswizzle_identity_ps_hashes;
+
+// "<hash>[:<slot>[+<slot>...]]" tokens. Port of UcodeHashSlotInList from
+// sal063/AC6_recomp 313fd236, Copyright (c) 2026, rexglue, BSD 3-Clause
+// (docs/licenses/AC6_recomp-LICENSE.txt).
+bool UcodeHashSlotInList(uint64_t hash, uint32_t slot,
+                         const std::string& list) {
+  auto is_separator = [](char c) {
+    return c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n' ||
+           c == '\r';
+  };
+  size_t i = 0, n = list.size();
+  while (i < n) {
+    while (i < n && is_separator(list[i])) {
+      ++i;
+    }
+    size_t start = i;
+    while (i < n && !is_separator(list[i])) {
+      ++i;
+    }
+    if (i == start) {
+      continue;
+    }
+    std::string token = list.substr(start, i - start);
+    size_t colon = token.find(':');
+    if (std::strtoull(token.substr(0, colon).c_str(), nullptr, 16) != hash) {
+      continue;
+    }
+    if (colon == std::string::npos) {
+      return true;
+    }
+    size_t p = colon + 1;
+    while (p < token.size()) {
+      size_t q = token.find('+', p);
+      if (q == std::string::npos) {
+        q = token.size();
+      }
+      if (q > p &&
+          std::strtoul(token.substr(p, q - p).c_str(), nullptr, 10) == slot) {
+        return true;
+      }
+      p = q + 1;
+    }
+  }
+  return false;
+}
+
 // The implementation picks which pixels of the quad a coarse derivative uses.
 spv::Op DerivativeXOp() {
   return cvars::spirv_fine_derivatives ? spv::OpDPdxFine : spv::OpDPdxCoarse;
@@ -33,6 +96,11 @@ spv::Op DerivativeYOp() {
   return cvars::spirv_fine_derivatives ? spv::OpDPdyFine : spv::OpDPdyCoarse;
 }
 }  // namespace
+
+void SpirvShaderTranslator::SetTitleDeswizzleIdentityPsHashes(
+    std::string hashes) {
+  title_deswizzle_identity_ps_hashes = std::move(hashes);
+}
 
 void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     const ParsedVertexFetchInstruction& instr) {
@@ -704,6 +772,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             ? xenos::FetchOpDimension::k2D
             : instr.dimension;
 
+    // A guest de-swizzle of a texture the cache already detiled: sample the
+    // texel under the pixel (deswizzle_identity_ps_hashes).
+    bool deswizzle_identity = false;
+    if (instr.opcode == ucode::FetchOpcode::kTextureFetch &&
+        !instr.attributes.unnormalized_coordinates &&
+        instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
+        GetSpirvShaderModification().pixel.param_gen_enable &&
+        input_fragment_coordinates_ != spv::NoResult) {
+      const std::string& hashes =
+          cvars::deswizzle_identity_ps_hashes.empty()
+              ? title_deswizzle_identity_ps_hashes
+              : cvars::deswizzle_identity_ps_hashes;
+      deswizzle_identity =
+          !hashes.empty() &&
+          UcodeHashSlotInList(current_shader().ucode_data_hash(),
+                              fetch_constant_index, hashes);
+    }
+
     spv::Id sampler = spv::NoResult;
     spv::Id image_2d_array_or_cube_unsigned = spv::NoResult;
     spv::Id image_2d_array_or_cube_signed = spv::NoResult;
@@ -920,7 +1006,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           // A promoted tfetch1D always needs the size - the interpretation is
           // selected at runtime, and the width feeds the wide 1D remap.
           if (instr.dimension == xenos::FetchOpDimension::k1D ||
-              instr.attributes.unnormalized_coordinates) {
+              instr.attributes.unnormalized_coordinates || deswizzle_identity) {
             size_needed_components |= 0b0011;
           }
           break;
@@ -1350,6 +1436,22 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           }
         }
       }
+      if (deswizzle_identity) {
+        // Size is in host texels for resolution-scaled textures, like
+        // gl_FragCoord, so this is a 1:1 copy at any scale.
+        for (uint32_t i = 0; i < 2; ++i) {
+          assert_true(size[i] != spv::NoResult);
+          id_vector_temp_.clear();
+          id_vector_temp_.push_back(builder_->makeIntConstant(int(i)));
+          spv::Id position = builder_->createLoad(
+              builder_->createAccessChain(spv::StorageClassInput,
+                                          input_fragment_coordinates_,
+                                          id_vector_temp_),
+              spv::NoPrecision);
+          coordinates[i] = builder_->createNoContractionBinOp(
+              spv::OpFDiv, type_float_, position, size[i]);
+        }
+      }
       // Handle wide 1D textures (> 8192 wide) mapped to 2D grids.
       if (instr.dimension == xenos::FetchOpDimension::k1D &&
           size_1d_width_minus_1_uint != spv::NoResult) {
@@ -1462,17 +1564,29 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                 spv::OpFAdd, type_float_, z_coordinate_ref, z_offset);
           }
           assert_true(data_is_3d != spv::NoResult);
+          assert_true(z_size != spv::NoResult);
           SpirvBuilder::IfBuilder if_data_is_3d(
               data_is_3d, spv::SelectionControlDontFlattenMask, *builder_);
           spv::Id z_3d;
           {
-            assert_true(z_size != spv::NoResult);
             z_3d = builder_->createNoContractionBinOp(spv::OpFDiv, type_float_,
                                                       z_coordinate_ref, z_size);
           }
+          if_data_is_3d.makeBeginElse();
+          spv::Id z_stacked;
+          {
+            // Clamp the layer index as on the normalized path below, so an Inf
+            // or NaN coordinate does not select an undefined array layer (the
+            // DXBC translator clamps here too).
+            z_stacked = builder_->createTriBuiltinCall(
+                type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
+                z_coordinate_ref, const_float_0_,
+                builder_->createNoContractionBinOp(
+                    spv::OpFSub, type_float_, z_size,
+                    builder_->makeFloatConstant(1.0f)));
+          }
           if_data_is_3d.makeEndIf();
-          z_coordinate_ref =
-              if_data_is_3d.createMergePhi(z_3d, z_coordinate_ref);
+          z_coordinate_ref = if_data_is_3d.createMergePhi(z_3d, z_stacked);
         } else {
           // Denormalize the Z coordinate for a stacked texture, and apply the
           // offset.
@@ -1968,10 +2082,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
             } break;
             case xenos::FetchOpDimension::k2D: {
               if (instr.attributes.use_register_gradients) {
+                // i = 0 is the horizontal gradient (ddx), 1 the vertical
+                // (ddy), as in the 3D and cube paths and the DXBC translator.
                 for (uint32_t i = 0; i < 2; ++i) {
                   spv::Id register_gradient_3d =
-                      builder_->createLoad(i ? var_main_tfetch_gradients_h_
-                                             : var_main_tfetch_gradients_v_,
+                      builder_->createLoad(i ? var_main_tfetch_gradients_v_
+                                             : var_main_tfetch_gradients_h_,
                                            spv::NoPrecision);
                   spv::Id register_gradient_x =
                       builder_->createCompositeExtract(register_gradient_3d,

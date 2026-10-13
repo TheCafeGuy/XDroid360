@@ -79,6 +79,8 @@ class AudioSystem {
   virtual void Initialize();
 
   void WorkerThreadMain();
+  void ConsumerPacedWorkerLoop();
+  void RunClientCallback(size_t client_index);
 
   virtual X_STATUS CreateDriver(size_t index,
                                 xe::threading::Semaphore* semaphore,
@@ -93,7 +95,9 @@ class AudioSystem {
   std::atomic<bool> worker_running_ = {false};
   kernel::object_ref<kernel::XHostThread> worker_thread_;
 
-  xe::global_critical_region global_critical_region_;
+  // Guards clients_. The global lock is never taken while holding it, so its
+  // holders can't delay the pump.
+  std::mutex clients_mutex_;
   static constexpr size_t kMaximumClientCount = 8;
   struct ClientSlot {
     AudioDriver* driver = nullptr;

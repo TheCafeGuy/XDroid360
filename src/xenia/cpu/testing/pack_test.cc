@@ -33,6 +33,15 @@ TEST_CASE("PACK_D3DCOLOR", "[instr]") {
         auto result = ctx->v[3];
         REQUIRE(result == vec128i(0, 0, 0, 0x80506070));
       });
+  // A signalling NaN clamps like a quiet one, to the minimum.
+  test.Run(
+      [](PPCContext* ctx) {
+        ctx->v[4] = vec128i(0x7F800001, 0x40400060, 0x7FC00000, 0x40400080);
+      },
+      [](PPCContext* ctx) {
+        auto result = ctx->v[3];
+        REQUIRE(result == vec128i(0, 0, 0, 0x80006000));
+      });
 }
 
 TEST_CASE("PACK_FLOAT16_2", "[instr]") {

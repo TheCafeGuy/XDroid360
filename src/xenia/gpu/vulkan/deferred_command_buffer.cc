@@ -181,6 +181,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                             args.size, args.data);
       } break;
 
+      case Command::kVkWriteBufferMarkerAMD: {
+        PFN_vkCmdWriteBufferMarkerAMD write_buffer_marker =
+            command_processor_.GetVulkanDevice()->cmd_write_buffer_marker_amd();
+        if (write_buffer_marker) {
+          auto& args =
+              *reinterpret_cast<const ArgsVkWriteBufferMarkerAMD*>(stream);
+          write_buffer_marker(command_buffer, args.pipeline_stage,
+                              args.dst_buffer, args.dst_offset, args.marker);
+        }
+      } break;
+
       case Command::kVkCopyBufferToImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
         dfn.vkCmdCopyBufferToImage(
@@ -189,6 +200,17 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const VkBufferImageCopy*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 xe::align(sizeof(ArgsVkCopyBufferToImage),
+                          alignof(VkBufferImageCopy))));
+      } break;
+
+      case Command::kVkCopyImageToBuffer: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
+        dfn.vkCmdCopyImageToBuffer(
+            command_buffer, args.src_image, args.src_image_layout,
+            args.dst_buffer, args.region_count,
+            reinterpret_cast<const VkBufferImageCopy*>(
+                reinterpret_cast<const uint8_t*>(stream) +
+                xe::align(sizeof(ArgsVkCopyImageToBuffer),
                           alignof(VkBufferImageCopy))));
       } break;
 
@@ -539,7 +561,37 @@ void* DeferredCommandBuffer::WriteCommand(Command command,
       *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
+  last_arguments_offset_ = offset + kCommandHeaderSizeElements;
   return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+}
+
+void DeferredCommandBuffer::PatchRenderArea(size_t arguments_offset,
+                                            bool dynamic_rendering,
+                                            const VkRect2D& render_area) {
+  assert_true(arguments_offset < command_stream_.size());
+  void* args = command_stream_.data() + arguments_offset;
+  if (dynamic_rendering) {
+    reinterpret_cast<ArgsVkBeginRendering*>(args)->render_area = render_area;
+  } else {
+    reinterpret_cast<ArgsVkBeginRenderPass*>(args)->render_area = render_area;
+  }
+}
+
+void DeferredCommandBuffer::CmdVkDispatch(uint32_t group_count_x,
+                                          uint32_t group_count_y,
+                                          uint32_t group_count_z) {
+  // The command processor owns this buffer and is not const; only the
+  // reference stored here is.
+  auto& command_processor =
+      const_cast<VulkanCommandProcessor&>(command_processor_);
+  command_processor.OnDispatchBegin(*this, group_count_x, group_count_y,
+                                    group_count_z);
+  auto& args = *reinterpret_cast<ArgsVkDispatch*>(
+      WriteCommand(Command::kVkDispatch, sizeof(ArgsVkDispatch)));
+  args.group_count_x = group_count_x;
+  args.group_count_y = group_count_y;
+  args.group_count_z = group_count_z;
+  command_processor.OnDispatchEnd(*this);
 }
 
 }  // namespace vulkan

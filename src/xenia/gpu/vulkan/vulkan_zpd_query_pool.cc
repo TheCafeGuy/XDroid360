@@ -11,10 +11,17 @@
 
 #include <algorithm>
 
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+
+DEFINE_bool(vulkan_zpd_copy_wait, false,
+            "Copy occlusion query results with VK_QUERY_RESULT_WAIT_BIT. Off: "
+            "a barrier orders the copy after prior work and the copy itself "
+            "never blocks, so a query that never ended can't hang the GPU.",
+            "Vulkan");
 
 namespace xe {
 namespace gpu {
@@ -664,18 +671,33 @@ void VulkanZPDQueryPool::RecordResolveBatch(VkCommandBuffer command_buffer) {
 
     VkDeviceSize barrier_offset = VK_WHOLE_SIZE;
     VkDeviceSize barrier_end = 0;
+    // XDroid360: with WAIT_BIT, Turnip makes the CP poll each
+    // query's availability; a query in the batch that never ended leaves the
+    // CP waiting forever (kgsl "gpu timeout" at the same command offset).
+    // Instead wait for all prior work with a barrier, then copy without
+    // WAIT_BIT, which can never block - an unfinished query reads a stale
+    // value for a frame rather than hanging the GPU.
+    const bool copy_wait = cvars::vulkan_zpd_copy_wait;
+    if (!copy_wait) {
+      VkMemoryBarrier query_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      query_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+      query_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      dfn.vkCmdPipelineBarrier(command_buffer,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                               &query_barrier, 0, nullptr, 0, nullptr);
+    }
     for (const ResolveRange& range : resolve_batch_ranges_) {
       VkDeviceSize offset =
           static_cast<VkDeviceSize>(range.start) * sizeof(uint64_t);
       VkDeviceSize size =
           static_cast<VkDeviceSize>(range.count) * sizeof(uint64_t);
 
-      // WAIT_BIT blocks until available. No separate availability check
-      // needed.
       dfn.vkCmdCopyQueryPoolResults(
           command_buffer, query_pool_, range.start, range.count,
           readback_buffer_, offset, sizeof(uint64_t),
-          VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+          copy_wait ? (VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
+                    : VK_QUERY_RESULT_64_BIT);
 
       barrier_offset = std::min(barrier_offset, offset);
       barrier_end = std::max(barrier_end, offset + size);

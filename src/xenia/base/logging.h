@@ -232,8 +232,15 @@ void XELOGKERNEL(std::string_view format, const Args&... args) {
 
 template <typename... Args>
 void XELOGFS(std::string_view format, const Args&... args) {
-  xe::logging::AppendLogLineFormat(xe::LogSrc::Uncategorized,
-                                   xe::LogLevel::Info, 'F', format, args...);
+#if XE_PLATFORM_ANDROID
+  // Debug on Android: one line per guest file access would evict everything
+  // else from logcat's per-process buffer.
+  constexpr xe::LogLevel kFsLevel = xe::LogLevel::Debug;
+#else
+  constexpr xe::LogLevel kFsLevel = xe::LogLevel::Info;
+#endif
+  xe::logging::AppendLogLineFormat(xe::LogSrc::Uncategorized, kFsLevel, 'F',
+                                   format, args...);
 }
 
 #else

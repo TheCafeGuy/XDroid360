@@ -659,6 +659,13 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
         result = true;
         break;
       }
+      case PM4_WAIT_IB_PFD_COMPLETE: {
+        // Waits for earlier INDIRECT_BUFFER_PFD base and size writes.
+        // No wait is needed since we process indirect buffers synchronously.
+        reader_.AdvanceRead(count * sizeof(uint32_t));
+        result = true;
+        break;
+      }
       case PM4_WAIT_FOR_IDLE: {
         // This opcode is used by 5454084E while going / being ingame.
         assert_true(count == 1);
@@ -910,7 +917,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
               static_cast<uint64_t>(wait_ms * 1000000 * 0.90);
           xe::threading::NanoSleep(sleep_ns);
 #else
-          xe::threading::Sleep(std::chrono::milliseconds(wait / 0x100));
+          if (cvars::gpu_wait_reg_mem_vblank_event && vblank_event_) {
+            xe::threading::Wait(vblank_event_.get(), false,
+                                std::chrono::milliseconds(wait / 0x100));
+          } else {
+            xe::threading::Sleep(std::chrono::milliseconds(wait / 0x100));
+          }
 #endif
         }
         // Unlimited vblank mode (guest_display_refresh_cap=false) - spin since
@@ -984,6 +996,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
   reg_val = GpuSwap(reg_val, endianness);
   xe::store(memory_->TranslatePhysical(mem_addr), reg_val);
   trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
+  xe::threading::GuestGpuWritebackGeneration().Bump();
 
   return true;
 }
@@ -1006,6 +1019,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     write_data = GpuSwap(write_data, endianness);
     xe::store(memory_->TranslatePhysical(addr), write_data);
     trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
+    xe::threading::GuestGpuWritebackGeneration().Bump();
     write_addr += 4;
   }
 
@@ -1056,6 +1070,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
       write_data = GpuSwap(write_data, endianness);
       xe::store(memory_->TranslatePhysical(write_reg_addr), write_data);
       trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
+      xe::threading::GuestGpuWritebackGeneration().Bump();
     } else {
       // Register.
       COMMAND_PROCESSOR::WriteRegister(write_reg_addr, write_data);
@@ -1139,6 +1154,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   }
   xe::store(write_destination, data_value);
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
+  xe::threading::GuestGpuWritebackGeneration().Bump();
   return true;
 }
 
@@ -1182,6 +1198,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_EXT(
   }
 
   trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
+  xe::threading::GuestGpuWritebackGeneration().Bump();
   return true;
 }
 
@@ -1755,6 +1772,7 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
         xe::store_and_swap<uint32_t>(
             memory_->TranslatePhysical(writeback_ptr),
             uint32_t(reader_.read_offset() / sizeof(uint32_t)));
+        xe::threading::GuestGpuWritebackGeneration().Bump();
       }
       remaining_at_writeback = remaining;
     }

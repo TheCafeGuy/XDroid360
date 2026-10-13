@@ -9,6 +9,9 @@
 
 #include "xenia/gpu/gpu_flags.h"
 
+#include <algorithm>
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/ui/renderdoc_api.h"
@@ -127,6 +130,45 @@ DEFINE_bool(occlusion_query_log, false,
             "Log occlusion query lifetime and summary stats.", "GPU");
 
 uint32_t GetGuestVblankRateHz() { return cvars::use_50Hz_mode ? 50 : 60; }
+
+// XDroid360 fast forward: multiplies the fixed vblank rate instead of
+// switching to the uncapped 1 ms vblank mode, which hung the Adreno GPU within
+// seconds in menus and loading screens (3 of 3 runs, 2026-10-07).
+DEFINE_uint32(guest_vblank_ff_multiplier, 4,
+              "Fast forward speed: the guest vblank rate is multiplied by this "
+              "while fast forward is on (2-8).",
+              "GPU");
+static std::atomic<bool> fast_forward_enabled{false};
+void SetFastForward(bool enabled) {
+  fast_forward_enabled.store(enabled, std::memory_order_relaxed);
+}
+uint32_t GetFastForwardMultiplier() {
+  if (!fast_forward_enabled.load(std::memory_order_relaxed)) {
+    return 1;
+  }
+  return std::clamp<uint32_t>(cvars::guest_vblank_ff_multiplier, 2, 8);
+}
+
+// XDroid360 display tone mapping for AMOLED panels: games mastered for CRT
+// and LCD TVs clip bright highlights (snowy mountains) on a high-contrast
+// OLED. 0 = off; up to 1 = strongest highlight compression. Applied to the
+// guest gamma ramp, so it costs no GPU work.
+DEFINE_double(display_tone_strength, 0.0,
+              "AMOLED highlight compression strength (0 = off, 1 = strongest), "
+              "applied through the gamma ramp.",
+              "GPU");
+static std::atomic<float> display_tone_strength_live{-1.0f};
+void SetDisplayToneStrength(float strength) {
+  display_tone_strength_live.store(std::clamp(strength, 0.0f, 1.0f),
+                                   std::memory_order_relaxed);
+}
+float GetDisplayToneStrength() {
+  float live = display_tone_strength_live.load(std::memory_order_relaxed);
+  if (live >= 0.0f) {
+    return live;
+  }
+  return std::clamp(float(cvars::display_tone_strength), 0.0f, 1.0f);
+}
 
 DEFINE_bool(
     gpu_debug_markers, false,

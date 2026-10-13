@@ -10,6 +10,7 @@
 #ifndef XENIA_UI_WINDOWED_APP_CONTEXT_ANDROID_H_
 #define XENIA_UI_WINDOWED_APP_CONTEXT_ANDROID_H_
 
+#include <atomic>
 #include <android/asset_manager.h>
 #include <android/configuration.h>
 #include <android/looper.h>
@@ -149,6 +150,8 @@ class AndroidWindowedAppContext final : public WindowedAppContext {
   // threads in NotifyUILoopOfPendingFunctions.
   std::array<int, 2> ui_thread_looper_callback_pipe_{-1, -1};
   bool ui_thread_looper_callback_registered_ = false;
+  // A window paint is queued on the UI thread looper and not run yet.
+  std::atomic<bool> window_paint_posted_{false};
 
   int32_t window_surface_layout_left_ = 0;
   int32_t window_surface_layout_top_ = 0;

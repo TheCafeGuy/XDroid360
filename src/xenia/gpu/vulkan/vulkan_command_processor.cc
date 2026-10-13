@@ -9,12 +9,21 @@
 
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <string>
+#include <thread>
 
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
@@ -31,6 +40,7 @@
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
 #include "xenia/gpu/xenos.h"
+#include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
@@ -41,6 +51,10 @@ DECLARE_bool(gpu_debug_markers);
 DECLARE_bool(memexport_enable);
 DECLARE_bool(submit_on_primary_buffer_end);
 
+DEFINE_uint32(vulkan_max_submissions_in_flight, 0,
+              "Wait before opening a submission while this many are still "
+              "executing on the GPU. 0 = no limit beyond frames in flight.",
+              "Vulkan");
 DEFINE_bool(
     vulkan_dynamic_rendering, true,
     "Use VK_KHR_dynamic_rendering instead of traditional render passes. "
@@ -48,9 +62,110 @@ DEFINE_bool(
     "1.3 or VK_KHR_dynamic_rendering extension support.",
     "Vulkan");
 
+DEFINE_bool(vulkan_tight_render_area, false,
+            "Shrink each guest render pass's render area to the union of its "
+            "draw scissors (origin kept, 64 px) instead of the whole EDRAM-height "
+            "surface. On tile-based GPUs this cuts the tiles each pass loads, "
+            "stores and replays its draws over.",
+            "Vulkan");
+
+DEFINE_uint32(vulkan_gpu_stall_report_ms, 100,
+              "XDroid360: when the oldest pending submission is still running "
+              "this long after the command processor starts waiting for it, "
+              "log the recent submissions (and the breadcrumb hang report "
+              "with vulkan_gpu_breadcrumbs) while the GPU is still stuck. "
+              "kgsl recovers a hang in ~250 ms. 0 = off.",
+              "Vulkan");
+
+// XDroid360 forensic tool (temp, revert-planned): STAB-S1 S-TOOL.
+DEFINE_uint32(xdroid_stall_inject_every_s, 0,
+              "Temp forensic: every this many seconds, block the GPU command "
+              "processor for xdroid_stall_inject_ms, which the guest sees as "
+              "a GPU hang (time jump and audio tests). 0 = off.",
+              "Vulkan");
+DEFINE_uint32(xdroid_stall_inject_ms, 8000,
+              "Temp forensic: length of each injected GPU stall.", "Vulkan");
+
+DEFINE_bool(xdroid_draw_blackbox, false,
+            "XDroid360 HUD-1 forensic (temp): record per draw the vertex and "
+            "index ranges the command processor read, their guest bytes at "
+            "parse and at the frame's swap, and the texture fetches; on a "
+            "HUD-1 detection write frames n-3..n+1 to "
+            "<storage>/glitch/draws-fNNNNNNN.txt. Live.",
+            "XDroid360");
+DEFINE_int32(xdroid_vfetch_reupload_max_kb, 0,
+             "HUD-1 arm H3 (temp): before each draw, vertex fetch and index "
+             "ranges up to this many KB are copied again from guest memory "
+             "even when shared memory marks them valid (0 = off). Live.",
+             "XDroid360");
+DEFINE_bool(xdroid_glitch_recorder, false,
+            "XDroid360 forensic tool: find one-frame glitches in the guest "
+            "output (a frame unlike both neighbours that agree) and save "
+            "them as PPM strips (frames n-1, n, n+1) in <storage>/glitch/. "
+            "Live-switchable.",
+            "Vulkan");
+DEFINE_uint32(vulkan_gpu_stall_watchdog_ms, 120,
+              "A separate thread reports (time, recent submissions, GPU "
+              "breadcrumbs) when the GPU thread has not swapped or submitted "
+              "for this long while guest commands are pending: in the hangs "
+              "that end in an ANR it is blocked outside the awaited-submission "
+              "path the stall report watches. 0 = off.",
+              "Vulkan");
+
+DEFINE_uint32(vulkan_log_dispatch_groups, 262144,
+              "Log compute dispatches outside guest draws (resolves, texture "
+              "loads, transfers) with at least this many workgroups, at most "
+              "64 per session: a runaway dispatch is one suspect for the GPU "
+              "hangs between render passes (STAB-S1). 0 = off.",
+              "Vulkan");
+
+DEFINE_bool(vulkan_gpu_breadcrumbs, false,
+            "Forensic: write a GPU marker before and after every guest draw "
+            "and around every render pass (VK_AMD_buffer_marker), and on "
+            "device loss log the pass and draw the GPU stopped in. Runs with "
+            "it on are not comparable with performance runs.",
+            "Vulkan");
+
+DEFINE_bool(vulkan_gpu_completion_hint, true,
+            "Have the GPU write each submission's index into host-coherent "
+            "memory at its end, and query a submission's fence only once that "
+            "value reports it done. Avoids fence status queries that sleep in "
+            "the kernel (Turnip on kgsl) without a waiter thread.",
+            "Vulkan");
+
+namespace {
+// AMOLED highlight compression on a normalized [0, 1] display value. Values
+// below the knee are untouched (slope 1, so colors and mid-tones keep their
+// saturation); only near-white values roll off with a quadratic shoulder of
+// matching slope to a reduced peak. strength 0.1: knee 0.92, white 0.99;
+// strength 1: knee 0.70, white 0.85. (v1 darkened everything and started at
+// 45% brightness: colors went grey and HUD text lost contrast.)
+float XdToneCurve(float x, float strength) {
+  const float knee = 0.94f - 0.24f * strength;
+  if (x <= knee) {
+    return x;
+  }
+  const float white = 1.0f - 0.15f * strength;
+  // Shoulder y = knee + a*t - b*t^2 over t = x - knee in [0, 1 - knee]:
+  // slope 1 at the knee, ends at `white`.
+  const float span = 1.0f - knee;
+  const float t = std::min(x - knee, span);
+  const float b = (span - (white - knee)) / (span * span);
+  return knee + t - b * t * t;
+}
+}  // namespace
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+namespace {
+uint64_t SteadyMs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -533,6 +648,34 @@ bool VulkanCommandProcessor::SetupContext() {
   if (!texture_cache_) {
     XELOGE("Failed to initialize the texture cache");
     return false;
+  }
+
+  if (cvars::vulkan_gpu_completion_hint) {
+    uint32_t completion_hint_memory_type;
+    if (ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, sizeof(uint32_t), VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kUpload, completion_hint_buffer_,
+            completion_hint_memory_, &completion_hint_memory_type)) {
+      void* mapping;
+      if ((vulkan_device->memory_types().host_coherent &
+           (uint32_t(1) << completion_hint_memory_type)) &&
+          dfn.vkMapMemory(device, completion_hint_memory_, 0, VK_WHOLE_SIZE, 0,
+                          &mapping) == VK_SUCCESS) {
+        completion_hint_mapping_ = static_cast<volatile uint32_t*>(mapping);
+        // Index 0 is never a submission, so nothing reads as done yet.
+        *completion_hint_mapping_ = 0;
+        completion_timeline_.SetCompletionHint(completion_hint_mapping_);
+        XELOGI("VulkanCommandProcessor: GPU completion hint enabled");
+      } else {
+        XELOGW(
+            "VulkanCommandProcessor: no host-coherent mapping for the GPU "
+            "completion hint, polling fences instead");
+        ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                               completion_hint_buffer_);
+        ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                               completion_hint_memory_);
+      }
+    }
   }
 
   // Fallback for query segment normalization when no draw pinned a scale.
@@ -1421,11 +1564,26 @@ bool VulkanCommandProcessor::SetupContext() {
   system_constants_.zpd_fsi_counter_index = UINT32_MAX;
   zpd_counter_index_force_update_ = true;
 
+  if (cvars::vulkan_gpu_breadcrumbs) {
+    gpu_breadcrumbs_.Initialize(vulkan_device);
+  }
+
+  if (cvars::vulkan_gpu_stall_watchdog_ms) {
+    stall_watchdog_quit_.store(false, std::memory_order_relaxed);
+    stall_watchdog_thread_ = std::thread([this] { StallWatchdogLoop(); });
+  }
+
   return true;
 }
 
 void VulkanCommandProcessor::ShutdownContext() {
+  if (stall_watchdog_thread_.joinable()) {
+    stall_watchdog_quit_.store(true, std::memory_order_relaxed);
+    stall_watchdog_thread_.join();
+  }
   AwaitAllQueueOperationsCompletion();
+
+  gpu_breadcrumbs_.Shutdown();
 
   ResetResolveReadWatch();
   DestroyResolveFaultCopy();
@@ -1478,6 +1636,13 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout,
                                          device,
                                          fxaa_source_descriptor_set_layout_);
+
+  completion_timeline_.SetCompletionHint(nullptr);
+  completion_hint_mapping_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                         completion_hint_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                         completion_hint_memory_);
 
   // Resolve downscale cleanup.
   ClearReadbackStagingBuffers();
@@ -1964,6 +2129,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  gpu_thread_heartbeat_ms_.store(SteadyMs(), std::memory_order_relaxed);
   EndZPDFrame();
 
   // Before the presenter check, so the paths that return early end the frame
@@ -1971,24 +2137,112 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   NoteResolveFrame();
 
   CollectCompletedGpuTimeQueries();
-  static constexpr uint32_t kRenderPassWindowFrames = 60;
+  // Host time between swaps, for the stats line below.
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (stats_last_swap_.time_since_epoch().count() &&
+        stats_frame_count_ < stats_frame_us_.size()) {
+      stats_frame_us_[stats_frame_count_++] = uint32_t(std::min<int64_t>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              now - stats_last_swap_)
+              .count(),
+          INT32_MAX));
+    }
+    stats_last_swap_ = now;
+  }
+  // XDroid360 forensic tool (temp, revert-planned): STAB-S1 S-TOOL.
+  if (cvars::xdroid_stall_inject_every_s) {
+    static std::chrono::steady_clock::time_point last_injection;
+    const auto now = std::chrono::steady_clock::now();
+    if (!last_injection.time_since_epoch().count()) {
+      last_injection = now;
+    } else if (now - last_injection >=
+               std::chrono::seconds(cvars::xdroid_stall_inject_every_s)) {
+      XELOGW("XDroid360: injected GPU stall of {} ms at frame {}",
+             cvars::xdroid_stall_inject_ms, frame_current_);
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(cvars::xdroid_stall_inject_ms));
+      last_injection = std::chrono::steady_clock::now();
+    }
+  }
+  static constexpr uint32_t kRenderPassWindowFrames = kStatsWindowFrames;
   if (++render_pass_window_frames_ >= kRenderPassWindowFrames) {
-    uint64_t submissions_now = GetCurrentSubmission();
-    COUNT_profile_set(
-        "gpu/command_buffers_per_frame",
-        int64_t((submissions_now - gpu_time_submissions_window_start_) /
-                render_pass_window_frames_));
+    const uint32_t frames = render_pass_window_frames_;
+    const uint64_t submissions_now = GetCurrentSubmission();
+    const uint64_t command_buffers =
+        submissions_now - gpu_time_submissions_window_start_;
+    const uint64_t render_passes =
+        render_passes_total_ - render_passes_window_start_;
+    const uint64_t gpu_busy_us =
+        (gpu_time_total_ns_ - gpu_time_window_start_ns_) / 1000;
     gpu_time_submissions_window_start_ = submissions_now;
-    COUNT_profile_set(
-        "gpu/render_passes_per_frame",
-        int64_t((render_passes_total_ - render_passes_window_start_) /
-                render_pass_window_frames_));
     render_passes_window_start_ = render_passes_total_;
-
-    COUNT_profile_set("gpu/gpu_busy_us_per_frame",
-                      int64_t((gpu_time_total_ns_ - gpu_time_window_start_ns_) /
-                              (uint64_t(1000) * render_pass_window_frames_)));
     gpu_time_window_start_ns_ = gpu_time_total_ns_;
+    COUNT_profile_set("gpu/command_buffers_per_frame",
+                      int64_t(command_buffers / frames));
+    COUNT_profile_set("gpu/render_passes_per_frame",
+                      int64_t(render_passes / frames));
+    COUNT_profile_set("gpu/gpu_busy_us_per_frame",
+                      int64_t(gpu_busy_us / frames));
+
+    // One line per window for on-device measurement (tools/device): host
+    // frame pacing and GPU load.
+    const size_t n = stats_frame_count_;
+    std::array<uint32_t, kStatsWindowFrames> sorted = stats_frame_us_;
+    std::sort(sorted.begin(), sorted.begin() + n);
+    uint64_t wall_us = 0;
+    for (size_t i = 0; i < n; ++i) {
+      wall_us += sorted[i];
+    }
+    // FP-1: the guest vblank rate over the same wall time (60 expected); a
+    // 30 FPS cap that loses vblanks shows here, not in the GPU numbers.
+    const uint64_t vblanks_now = graphics_system_->vblank_count();
+    const uint64_t vblanks = vblanks_now - vblank_window_start_;
+    vblank_window_start_ = vblanks_now;
+    // Wall clock of this line, to place screen recordings and glitch marks
+    // on the frame numbers (IS-2).
+    const auto wall_now = std::chrono::system_clock::now();
+    const std::time_t wall_seconds =
+        std::chrono::system_clock::to_time_t(wall_now);
+    std::tm wall_local{};
+#ifdef _WIN32
+    localtime_s(&wall_local, &wall_seconds);
+#else
+    localtime_r(&wall_seconds, &wall_local);
+#endif
+    const uint32_t wall_ms = uint32_t(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            wall_now.time_since_epoch())
+            .count() %
+        1000);
+    XELOGI(
+        "Frame stats: fps={:.1f} frame_us p50={} p95={} max={} "
+        "gpu_busy_us/frame={} passes/frame={} cmdbufs/frame={} vblank_hz={:.1f} "
+        "wall={:02}:{:02}:{:02}.{:03}",
+        wall_us ? n * 1e6 / double(wall_us) : 0.0, n ? sorted[n / 2] : 0,
+        n ? sorted[n * 95 / 100] : 0, n ? sorted[n - 1] : 0,
+        gpu_busy_us / frames, render_passes / frames,
+        command_buffers / frames,
+        wall_us ? vblanks * 1e6 / double(wall_us) : 0.0, wall_local.tm_hour,
+        wall_local.tm_min, wall_local.tm_sec, wall_ms);
+    // GE-0: why passes ended, per frame, to choose between the pass-merging
+    // items (texture-load/upload splice, barrier hoist, resolve folding).
+    static constexpr const char* kPassEndReasonNames[] = {
+        "other", "rt", "barrier", "texload", "upload", "resolve",
+        "transfer", "readback", "query", "swap", "submit"};
+    static_assert(std::size(kPassEndReasonNames) ==
+                  size_t(PassEndReason::kCount));
+    std::string pass_ends_line;
+    for (size_t i = 0; i < size_t(PassEndReason::kCount); ++i) {
+      const uint64_t ends = pass_ends_total_[i] - pass_ends_window_start_[i];
+      pass_ends_window_start_[i] = pass_ends_total_[i];
+      if (ends) {
+        pass_ends_line += fmt::format(" {}={:.1f}", kPassEndReasonNames[i],
+                                      double(ends) / frames);
+      }
+    }
+    XELOGI("Pass ends/frame:{}", pass_ends_line);
+    stats_frame_count_ = 0;
 
     render_pass_window_frames_ = 0;
   }
@@ -2196,6 +2450,13 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         uint32_t& gamma_ramp_frame_index_ref =
             use_pwl_gamma_ramp ? gamma_ramp_pwl_current_frame_
                                : gamma_ramp_256_entry_table_current_frame_;
+        const float tone_strength = GetDisplayToneStrength();
+        if (tone_strength != gamma_ramp_tone_strength_) {
+          // Re-upload both ramp kinds with the new curve.
+          gamma_ramp_tone_strength_ = tone_strength;
+          gamma_ramp_256_entry_table_current_frame_ = UINT32_MAX;
+          gamma_ramp_pwl_current_frame_ = UINT32_MAX;
+        }
         if (gamma_ramp_frame_index_ref == UINT32_MAX) {
           constexpr uint32_t kGammaRampSize256EntryTable =
               sizeof(uint32_t) * 256;
@@ -2237,6 +2498,33 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                     : static_cast<const void*>(gamma_ramp_256_entry_table()),
                 gamma_ramp_size);
           }
+          if (tone_strength > 0.0f) {
+            auto tone10 = [tone_strength](uint32_t v) {
+              return uint32_t(std::lround(
+                  XdToneCurve(float(v) / 1023.0f, tone_strength) * 1023.0f));
+            };
+            if (use_pwl_gamma_ramp) {
+              // output = base + fraction * delta per segment; remap both ends.
+              auto pwl =
+                  reinterpret_cast<reg::DC_LUT_PWL_DATA*>(gamma_ramp_frame_upload);
+              for (size_t i = 0; i < 128 * 3; ++i) {
+                uint32_t base = pwl[i].base >> 6;
+                uint32_t end = std::min(base + (pwl[i].delta >> 6), 1023u);
+                uint32_t new_base = tone10(base);
+                uint32_t new_end = std::max(tone10(end), new_base);
+                pwl[i].base = new_base << 6;
+                pwl[i].delta = (new_end - new_base) << 6;
+              }
+            } else {
+              auto table =
+                  reinterpret_cast<reg::DC_LUT_30_COLOR*>(gamma_ramp_frame_upload);
+              for (size_t i = 0; i < 256; ++i) {
+                table[i].color_10_red = tone10(table[i].color_10_red);
+                table[i].color_10_green = tone10(table[i].color_10_green);
+                table[i].color_10_blue = tone10(table[i].color_10_blue);
+              }
+            }
+          }
           bool gamma_ramp_has_upload_buffer =
               gamma_ramp_upload_buffer_memory_ != VK_NULL_HANDLE;
           ui::vulkan::util::FlushMappedMemoryRange(
@@ -2253,6 +2541,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_QUEUE_FAMILY_IGNORED,
                 VK_QUEUE_FAMILY_IGNORED, false);
+            TagPassEnd(PassEndReason::kSwap);
             SubmitBarriers(true);
             InsertDebugMarker("Gamma Ramp Upload: %u bytes",
                               static_cast<uint32_t>(gamma_ramp_size));
@@ -2323,6 +2612,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         }
 
         // End the current render pass before inserting barriers.
+        TagPassEnd(PassEndReason::kSwap);
         SubmitBarriers(true);
 
         PushDebugMarker("Apply Gamma Ramp: %s%s",
@@ -2463,6 +2753,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                 VK_IMAGE_LAYOUT_GENERAL);
           }
+          TagPassEnd(PassEndReason::kSwap);
           SubmitBarriers(true);
 
           // Bind FXAA pipeline.
@@ -2552,12 +2843,49 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
           PopDebugMarker();
         }
 
+        // XDroid360 forensic tool (IS-2): automatic one-frame glitch
+        // capture from the final guest output.
+        bool glitch_captured = false;
+        if (cvars::xdroid_glitch_recorder && kernel_state_ &&
+            glitch_recorder_.EnsureInitialized(
+                vulkan_device,
+                kernel_state_->emulator()->storage_root() / "glitch")) {
+          PushImageMemoryBarrier(
+              vulkan_context.image(),
+              ui::vulkan::util::InitializeSubresourceRange(),
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+              VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+              VK_IMAGE_LAYOUT_GENERAL, VK_QUEUE_FAMILY_IGNORED,
+              VK_QUEUE_FAMILY_IGNORED, false);
+          SubmitBarriers(true);
+          glitch_recorder_.Poll(deferred_command_buffer_,
+                                GetCompletedSubmission(),
+                                GetCurrentSubmission(), frame_current_);
+          const uint64_t hud1_frame = glitch_recorder_.TakeHud1Frame();
+          if (hud1_frame != UINT64_MAX && cvars::xdroid_draw_blackbox) {
+            draw_blackbox_.Dump(
+                kernel_state_->emulator()->storage_root() / "glitch",
+                hud1_frame);
+          }
+          glitch_recorder_.Capture(
+              deferred_command_buffer_, vulkan_context.image(),
+              frontbuffer_width_scaled, frontbuffer_height_scaled,
+              GetCurrentSubmission(), frame_current_);
+          glitch_captured = true;
+        }
+
         // Insert the release barrier - transition from GENERAL to the
-        // presenter's expected layout.
+        // presenter's expected layout. After a glitch capture the layout
+        // change also waits for its transfer reads.
         PushImageMemoryBarrier(
             vulkan_context.image(),
             ui::vulkan::util::InitializeSubresourceRange(),
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            glitch_captured ? VkPipelineStageFlags(
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT)
+                            : VkPipelineStageFlags(
+                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT),
             ui::vulkan::VulkanPresenter::kGuestOutputInternalStageMask,
             VK_ACCESS_SHADER_WRITE_BIT,
             ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
@@ -2734,7 +3062,12 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
     if (force_end_render_pass) {
       EndRenderPass();
     }
+    pass_end_reason_ = PassEndReason::kOther;
     return false;
+  }
+  // An untagged end here is a barrier queued earlier by another site.
+  if (pass_end_reason_ == PassEndReason::kOther) {
+    pass_end_reason_ = PassEndReason::kBarrier;
   }
   EndRenderPass();
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend();
@@ -2796,6 +3129,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   // End current render pass/rendering if active, via EndRenderPass so any open
   // occlusion query segment is closed first. A query begun inside the pass must
   // be ended before the pass is.
+  TagPassEnd(PassEndReason::kRtChange);
   EndRenderPass();
 
   // Clear released ZPD counter slots while no pass is open, so a hybrid query
@@ -2843,6 +3177,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         has_stencil ? &stencil_attachment : nullptr;
 
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    tight_area_dynamic_ = true;
   } else {
     // Use traditional render pass.
     VkRenderPassBeginInfo render_pass_begin_info;
@@ -2852,16 +3187,27 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     render_pass_begin_info.framebuffer = framebuffer->framebuffer;
     render_pass_begin_info.renderArea.offset.x = 0;
     render_pass_begin_info.renderArea.offset.y = 0;
-    // TODO(Triang3l): Actual dirty width / height in the deferred command
-    // buffer.
+    // The actual area is patched in EndRenderPass (vulkan_tight_render_area).
     render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
                                                   VK_SUBPASS_CONTENTS_INLINE);
+    tight_area_dynamic_ = false;
   }
+  // Remember where the begin command lives; EndRenderPass shrinks
+  // its render area to the union of the pass's draw scissors.
+  tight_area_pending_ = cvars::vulkan_tight_render_area;
+  tight_area_args_offset_ =
+      deferred_command_buffer_.last_command_arguments_offset();
+  tight_area_extent_ = framebuffer->host_extent;
+  tight_area_valid_ = false;
   in_render_pass_ = true;
   ++render_passes_total_;
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnRenderPassBegin(deferred_command_buffer_,
+                                       GetCurrentSubmission(), frame_current_);
+  }
 
   // Resume any pending ZPD segment now that the pass is open.
   OpenQuerySegment(false);
@@ -2895,6 +3241,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   // End current render pass/rendering if active, via EndRenderPass so any open
   // occlusion query segment is closed first. A query begun inside the pass must
   // be ended before the pass is.
+  TagPassEnd(PassEndReason::kRtChange);
   EndRenderPass();
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
@@ -2966,6 +3313,10 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
   in_render_pass_ = true;
   ++render_passes_total_;
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnRenderPassBegin(deferred_command_buffer_,
+                                       GetCurrentSubmission(), frame_current_);
+  }
 
   OpenQuerySegment(false);
 }
@@ -2973,14 +3324,42 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 void VulkanCommandProcessor::EndRenderPass() {
   SCOPE_profile_cpu_f("gpu");
   assert_true(submission_open_);
+  const PassEndReason pass_end_reason = pass_end_reason_;
+  pass_end_reason_ = PassEndReason::kOther;
   if (!in_render_pass_) {
     return;
   }
+  ++pass_ends_total_[size_t(pass_end_reason)];
   // Close native Vulkan occlusion queries before ending the pass. FSI counter
   // segments don't use vkCmdBeginQuery / vkCmdEndQuery and can stay logically
   // open across render passes.
   if (zpd_active_segment_.segment_active && !zpd_active_query_is_fsi_) {
     CloseQuerySegment();
+  }
+  if (tight_area_pending_) {
+    tight_area_pending_ = false;
+    if (tight_area_valid_) {
+      // Keep the origin at (0, 0) and only shrink the far edges, rounded up
+      // to 64 px: an offset area that doesn't start on a GMEM bin boundary
+      // made Turnip store stripes ("barcode" flicker in the AC6 hangar stat
+      // hexagon). Nearly all the waste is height (2048 rows vs ~720 used).
+      constexpr int32_t kAlign = 64;
+      int32_t x0 = 0;
+      int32_t y0 = 0;
+      int32_t x1 = std::min<int32_t>(int32_t(tight_area_extent_.width),
+                                     (tight_area_x1_ + kAlign - 1) & ~(kAlign - 1));
+      int32_t y1 = std::min<int32_t>(int32_t(tight_area_extent_.height),
+                                     (tight_area_y1_ + kAlign - 1) & ~(kAlign - 1));
+      if (x1 > x0 && y1 > y0) {
+        VkRect2D area;
+        area.offset.x = x0;
+        area.offset.y = y0;
+        area.extent.width = uint32_t(x1 - x0);
+        area.extent.height = uint32_t(y1 - y0);
+        deferred_command_buffer_.PatchRenderArea(tight_area_args_offset_,
+                                                 tight_area_dynamic_, area);
+      }
+    }
   }
   // Use current_render_pass_ to determine which end command to use.
   // VK_NULL_HANDLE means we used dynamic rendering, otherwise traditional.
@@ -2988,6 +3367,9 @@ void VulkanCommandProcessor::EndRenderPass() {
     deferred_command_buffer_.CmdVkEndRendering();
   } else {
     deferred_command_buffer_.CmdVkEndRenderPass();
+  }
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnRenderPassEnd(deferred_command_buffer_);
   }
   current_render_pass_ = VK_NULL_HANDLE;
   current_framebuffer_ = nullptr;
@@ -3449,6 +3831,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (memexport_used_pixel) {
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
+  // Exports land in guest RAM through the host buffer.
+  if (cvars::memexport_enable &&
+      shared_memory_host_and_edram_descriptor_set_ != VK_NULL_HANDLE) {
+    for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+      ProvideResolveOutputForGpuWrite(memexport_range.base_address_dwords << 2,
+                                      memexport_range.size_bytes);
+    }
+  }
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -3469,6 +3859,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   draw_util::HostDepthPolygonOffset host_depth_polygon_offset;
   bool apply_host_depth_polygon_offset = false;
   bool zpd_hybrid = false;
+  // Per shader (vertex, pixel), whether its samplers were gathered.
+  bool samplers_gathered[2] = {};
 
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
@@ -3628,8 +4020,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         continue;
       }
       // Don't read a shader's sampler bindings while a creation thread is still
-      // populating them (async draws don't translate here). A placeholder draw
-      // that ends up using this shader binds no samplers for it anyway.
+      // populating them (async draws don't translate here). If the bound
+      // pipeline ends up running this shader the draw is redone below.
       if (!shader->bindings_ready()) {
         if (!i) {
           shader_samplers.clear();
@@ -3639,6 +4031,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
           shader->GetSamplerBindingsAfterTranslation();
       if (!i) {
+        samplers_gathered[j] = true;
         shader_samplers.reserve(shader_sampler_bindings.size());
         for (const VulkanShader::SamplerBinding& shader_sampler_binding :
              shader_sampler_bindings) {
@@ -3694,6 +4087,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  // An async pipeline stand-in (a placeholder, or skipping the draw) is only
+  // fine for a pass redrawn every frame. Wait for the real pipeline instead for
+  // a render target not drawn recently (maybe a one-off render to a texture), a
+  // small one (generated data) or memexport, whose output isn't redone.
+  bool draw_target_recurring =
+      render_target_cache_->TrackLastUpdateDrawTarget(frame_current_);
+  bool draw_target_small = render_target_cache_->IsLastUpdateDrawTargetSmall();
+  bool stand_in_allowed = draw_target_recurring && !draw_target_small &&
+                          !memexport_used_vertex && !memexport_used_pixel;
 
   // Create the pipeline (for this, need the render pass from the render target
   // cache), translating the shaders - doing this now to obtain the used
@@ -3715,6 +4117,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // pipeline will be swapped in by the creation thread when ready.
   VkPipeline current_pipeline =
       pipeline->pipeline.load(std::memory_order_acquire);
+  if (!stand_in_allowed &&
+      pipeline->creation_pending.load(std::memory_order_acquire)) {
+    uint64_t await_start = xe::Clock::QueryHostTickCount();
+    pipeline_cache_->AwaitPipelineCompletion();
+    XELOGI(
+        "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
+        "{:016X}, {:.2f} ms",
+        render_target_cache_->GetLastUpdateDrawTargetName(),
+        draw_target_small        ? "small render target"
+        : !draw_target_recurring ? "not drawn recently"
+                                 : "memexport",
+        vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+        double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
+            double(xe::Clock::QueryHostTickFrequency()));
+    current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
+    if (current_pipeline != VK_NULL_HANDLE &&
+        current_pipeline !=
+            pipeline->placeholder_pipeline.load(std::memory_order_acquire)) {
+      // The samplers were gathered while the bindings weren't ready - redo the
+      // draw with the real pipeline, which won't wait again.
+      return IssueDraw(prim_type, index_count, index_buffer_info,
+                       major_mode_explicit);
+    }
+  }
   if (current_pipeline == VK_NULL_HANDLE) {
     // Nothing to draw with yet - no placeholder, real pipeline still building.
     // Skip rather than stall, a later frame renders it.
@@ -3723,15 +4150,34 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
     return true;
   }
+  // Whether the placeholder pipeline is bound rather than the real one. Derived
+  // from the handle actually bound so it stays consistent with current_pipeline
+  // when a creation thread swaps in the real pipeline mid-draw.
+  bool bound_is_placeholder =
+      current_pipeline ==
+      pipeline->placeholder_pipeline.load(std::memory_order_acquire);
+  // The interpreter placeholder (interpreter VS + no-op PS) also needs its
+  // ucode location + full float constants fed to it.
+  bool interpreter_placeholder =
+      bound_is_placeholder &&
+      pipeline->uses_interpreter.load(std::memory_order_acquire);
+  // Any placeholder draw binds the placeholder pixel shader, which never
+  // samples. Its pixel textures and samplers must not be bound as the
+  // placeholder pipeline's layout has none.
+  bool placeholder_pixel_shader = bound_is_placeholder;
   // The interpreter reads the guest ucode from shared memory by its program
   // address. A cached interpreter placeholder reused for an inline
   // (IM_LOAD_IMMEDIATE, address 0) shader can't be fed, so skip until the real
   // pipeline is ready rather than interpret from address 0.
-  if (active_vertex_shader_ucode_address_ == 0 &&
-      current_pipeline ==
-          pipeline->placeholder_pipeline.load(std::memory_order_acquire) &&
-      pipeline->uses_interpreter.load(std::memory_order_acquire)) {
+  if (active_vertex_shader_ucode_address_ == 0 && interpreter_placeholder) {
     return true;
+  }
+  // A creation thread may have finished a shader the bound pipeline runs after
+  // its samplers were gathered. Redo the draw to gather them.
+  if ((!samplers_gathered[0] && !interpreter_placeholder) ||
+      (pixel_shader && !samplers_gathered[1] && !placeholder_pixel_shader)) {
+    return IssueDraw(prim_type, index_count, index_buffer_info,
+                     major_mode_explicit);
   }
 
   // Push debug marker with Xbox 360 draw context for RenderDoc annotation.
@@ -3886,23 +4332,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       normalized_color_mask,
       apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
 
-  // Whether we bound the placeholder pipeline (vs the real one). Derived from
-  // the handle actually bound, so it's consistent with current_pipeline even if
-  // the creation thread swaps in the real pipeline mid-draw (the is_placeholder
-  // flag is cleared a few instructions later, so reading it separately can
-  // disagree).
-  bool bound_is_placeholder =
-      current_pipeline ==
-      pipeline->placeholder_pipeline.load(std::memory_order_acquire);
-  // The interpreter placeholder (interpreter VS + no-op PS) also needs its
-  // ucode location + full float constants fed to it.
-  bool interpreter_placeholder =
-      bound_is_placeholder &&
-      pipeline->uses_interpreter.load(std::memory_order_acquire);
-  // Any placeholder draw binds the no-op placeholder pixel shader (which never
-  // samples), so its pixel textures/samplers must not be bound - the
-  // placeholder pipeline's layout has none.
-  bool placeholder_pixel_shader = bound_is_placeholder;
   {
     uint32_t ucode_base_dwords = 0, cf_instr_count = 0;
     if (interpreter_placeholder) {
@@ -4038,6 +4467,72 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       }
     }
 
+    // XDroid360 HUD-1 forensics (temp, revert-planned): the draw black box
+    // and arm H3 (re-copy small vertex ranges every draw).
+    VulkanDrawBlackbox::Record* blackbox_record = nullptr;
+    if (cvars::xdroid_draw_blackbox) {
+      uint32_t vertex_bytes = 0;
+      for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+        vertex_bytes += vfetch_sizes[i] << 2;
+      }
+      const uint32_t index_bytes =
+          index_buffer_info ? uint32_t(index_buffer_info->length) : 0;
+      if (VulkanDrawBlackbox::Wanted(vertex_bytes, index_bytes)) {
+        blackbox_record = draw_blackbox_.Begin(frame_current_);
+      }
+    }
+    if (blackbox_record) {
+      VulkanDrawBlackbox::Record& record = *blackbox_record;
+      record.vs_hash = vertex_shader->ucode_data_hash();
+      record.ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+      record.primitive = uint32_t(prim_type);
+      record.index_count = index_count;
+      if (index_buffer_info && index_buffer_info->guest_base) {
+        record.indexed = true;
+        record.index_format = uint32_t(index_buffer_info->format);
+        record.index.address = index_buffer_info->guest_base;
+        record.index.length = uint32_t(index_buffer_info->length);
+        record.index.fast_path = shared_memory_->XdroidRangeValid(
+            record.index.address, record.index.length);
+        record.index.hash_parse = VulkanDrawBlackbox::HashGuest(
+            *memory_, record.index.address, record.index.length, nullptr);
+      }
+      record.vertex_range_count = std::min(vfetch_current_queued,
+                                           VulkanDrawBlackbox::kMaxRanges);
+      for (uint32_t i = 0; i < record.vertex_range_count; ++i) {
+        VulkanDrawBlackbox::Range& range = record.vertex[i];
+        range.address = vfetch_addresses[i] << 2;
+        range.length = vfetch_sizes[i] << 2;
+        range.fast_path =
+            shared_memory_->XdroidRangeValid(range.address, range.length);
+        range.hash_parse = VulkanDrawBlackbox::HashGuest(
+            *memory_, range.address, range.length, range.head);
+      }
+      uint32_t textures_remaining = used_texture_mask;
+      uint32_t texture_slot;
+      while (record.texture_count < VulkanDrawBlackbox::kMaxTextures &&
+             xe::bit_scan_forward(textures_remaining, &texture_slot)) {
+        textures_remaining = xe::clear_lowest_bit(textures_remaining);
+        const xenos::xe_gpu_texture_fetch_t fetch =
+            regs.GetTextureFetch(texture_slot);
+        record.texture_slot[record.texture_count] = texture_slot;
+        record.texture_fetch[record.texture_count] = {
+            fetch.dword_0, fetch.dword_1, fetch.dword_2,
+            fetch.dword_3, fetch.dword_4, fetch.dword_5};
+        ++record.texture_count;
+      }
+    }
+    if (cvars::xdroid_vfetch_reupload_max_kb > 0) {
+      const uint32_t max_bytes =
+          uint32_t(cvars::xdroid_vfetch_reupload_max_kb) * 1024;
+      for (uint32_t i = 0; i < vfetch_current_queued; ++i) {
+        if ((vfetch_sizes[i] << 2) <= max_bytes) {
+          shared_memory_->XdroidForceReupload(vfetch_addresses[i] << 2,
+                                              vfetch_sizes[i] << 2);
+        }
+      }
+    }
+
     if (vfetch_current_queued) {
       // Pre-acquire the critical region so we're not repeatedly re-acquiring
       // it in RequestRange - SharedMemory tracks dirty pages and only uploads
@@ -4114,7 +4609,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         shader_32bit_index_dma, viewport_info, used_texture_mask,
         normalized_depth_control, normalized_color_mask,
         apply_host_depth_polygon_offset ? &host_depth_polygon_offset : nullptr);
-    if (!UpdateBindings(vertex_shader, pixel_shader)) {
+    // Same placeholder flags as the first call: without them a placeholder
+    // pipeline's minimal (empty) texture layout was paired with the real
+    // shaders' binding counts, writing descriptors out of bounds (SP
+    // page faults at garbage addresses, kgsl hangs).
+    if (!UpdateBindings(vertex_shader, pixel_shader, interpreter_placeholder,
+                        placeholder_pixel_shader)) {
       return false;
     }
   }
@@ -4126,6 +4626,35 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       pixel_shader ? pixel_shader->ucode_data_hash() : 0;
   submission_in_progress_.last_render_pass_key =
       render_target_cache_->last_update_render_pass_key().key;
+  if (tight_area_pending_) {
+    // Only the far edges: the area keeps its origin at (0, 0).
+    const int32_t x1 =
+        dynamic_scissor_.offset.x + int32_t(dynamic_scissor_.extent.width);
+    const int32_t y1 =
+        dynamic_scissor_.offset.y + int32_t(dynamic_scissor_.extent.height);
+    if (!tight_area_valid_) {
+      tight_area_x1_ = x1;
+      tight_area_y1_ = y1;
+      tight_area_valid_ = true;
+    } else {
+      tight_area_x1_ = std::max(tight_area_x1_, x1);
+      tight_area_y1_ = std::max(tight_area_y1_, y1);
+    }
+  }
+
+  if (gpu_breadcrumbs_.enabled()) {
+    VulkanGpuBreadcrumbs::DrawInfo breadcrumb_draw;
+    breadcrumb_draw.vs_hash = submission_in_progress_.last_vs_hash;
+    breadcrumb_draw.ps_hash = submission_in_progress_.last_ps_hash;
+    breadcrumb_draw.render_pass_key =
+        submission_in_progress_.last_render_pass_key;
+    breadcrumb_draw.host_vertex_count =
+        primitive_processing_result.host_draw_vertex_count;
+    breadcrumb_draw.guest_primitive_type = uint8_t(prim_type);
+    breadcrumb_draw.index_buffer_type =
+        uint8_t(primitive_processing_result.index_buffer_type);
+    gpu_breadcrumbs_.OnDrawBegin(deferred_command_buffer_, breadcrumb_draw);
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -4163,6 +4692,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     deferred_command_buffer_.CmdVkDrawIndexed(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
   }
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnDrawEnd(deferred_command_buffer_);
+  }
 
   // Pop debug marker for draw call.
   PopDebugMarker();
@@ -4192,7 +4724,6 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       StageMemexportReadback();
     }
   }
-
   return true;
 }
 
@@ -4204,6 +4735,7 @@ void VulkanCommandProcessor::StageMemexportReadback() {
     return;
   }
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+  TagPassEnd(PassEndReason::kReadback);
   SubmitBarriers(true);
   VkBuffer device_buffer = shared_memory_->buffer();
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -4226,6 +4758,7 @@ void VulkanCommandProcessor::StageMemexportReadback() {
     }
     VkBuffer staging_buffer = slot->buffer.buffer;
     OrderReadbackStagingWrite(staging_buffer);
+    TagPassEnd(PassEndReason::kReadback);
     SubmitBarriers(true);
     InsertDebugMarker("Memexport Readback (staging): 0x%08X, %u bytes",
                       base_bytes, size_bytes);
@@ -4240,7 +4773,7 @@ void VulkanCommandProcessor::StageMemexportReadback() {
     std::erase_if(memexport_staged_, [key](const MemexportStagedRange& staged) {
       return staged.key == key;
     });
-    memexport_staged_.push_back({key, base_bytes, size_bytes});
+    memexport_staged_.push_back({key, base_bytes, size_bytes, 0});
     // The fence and coherency waits are driven by the page marks.
     MarkMemexportPagesWritten(base_bytes, size_bytes);
   }
@@ -4271,26 +4804,26 @@ void VulkanCommandProcessor::FlushMemexportStagingReadback() {
     }
     const ReadbackStagingBuffer& staging = slot->buffer;
     InvalidateReadbackStaging(staging);
-    ReadbackStagingToGuestRam(staging, staged.address, length);
+    ReadbackStagingToGuestRam(staging, staged.offset, staged.address, length);
   }
   memexport_staged_.clear();
 }
 
 bool VulkanCommandProcessor::EnsureMemexportRangeInDeviceBuffer(
-    uint32_t base_bytes, uint32_t size_bytes) {
+    uint32_t base_bytes, uint32_t size_bytes, bool whole_range) {
   // Readers of the device buffer need memexport output copied across from
   // host_buffer_ (guest RAM), where it actually lives. Doing it on the GPU
   // keeps it ordered against the writes that produced it, which a CPU read
   // cannot be.
   if (!cvars::memexport_enable ||
       shared_memory_host_and_edram_descriptor_set_ == VK_NULL_HANDLE ||
-      !size_bytes || base_bytes >= SharedMemory::kBufferSize) {
+      !GatherMemexportCopyRuns(base_bytes, size_bytes, whole_range)) {
     return false;
   }
-  size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
-  if (!IsMemexportRange(base_bytes, size_bytes)) {
-    return false;
-  }
+  // The barriers span the runs.
+  base_bytes = memexport_copy_runs_.front().first;
+  size_bytes = memexport_copy_runs_.back().first +
+               memexport_copy_runs_.back().second - base_bytes;
   VkBuffer host_buffer = shared_memory_->host_buffer();
   VkBuffer device_buffer = shared_memory_->buffer();
   if (host_buffer == VK_NULL_HANDLE) {
@@ -4320,14 +4853,19 @@ bool VulkanCommandProcessor::EnsureMemexportRangeInDeviceBuffer(
                           VkDeviceSize(size_bytes), read_stages,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, read_access,
                           VK_ACCESS_TRANSFER_WRITE_BIT);
+  TagPassEnd(PassEndReason::kUpload);
   SubmitBarriers(true);
 
-  VkBufferCopy copy_region;
-  copy_region.srcOffset = base_bytes;
-  copy_region.dstOffset = base_bytes;
-  copy_region.size = size_bytes;
-  deferred_command_buffer_.CmdVkCopyBuffer(host_buffer, device_buffer, 1,
-                                           &copy_region);
+  memexport_copy_regions_.clear();
+  for (const auto& run : memexport_copy_runs_) {
+    VkBufferCopy& copy_region = memexport_copy_regions_.emplace_back();
+    copy_region.srcOffset = run.first;
+    copy_region.dstOffset = run.first;
+    copy_region.size = run.second;
+  }
+  deferred_command_buffer_.CmdVkCopyBuffer(
+      host_buffer, device_buffer, uint32_t(memexport_copy_regions_.size()),
+      memexport_copy_regions_.data());
 
   // Make the copied data visible to the following read.
   PushBufferMemoryBarrier(device_buffer, VkDeviceSize(base_bytes),
@@ -4528,6 +5066,7 @@ bool VulkanCommandProcessor::DownscaleScaledResolve(
                              descriptor_writes.data(), 0, nullptr);
 
   // End any active render pass and submit barriers
+  TagPassEnd(PassEndReason::kResolve);
   SubmitBarriers(true);
 
   // Barrier for source buffer - ensure resolve copy compute shader writes
@@ -4628,6 +5167,7 @@ bool VulkanCommandProcessor::MirrorScaledResolveToSharedMemory(
   shared_memory_->Use(
       VulkanSharedMemory::Usage::kTransferDestination,
       std::make_pair(written_address, scaled_info.readback_length));
+  TagPassEnd(PassEndReason::kResolve);
   SubmitBarriers(true);
   VkBufferCopy copy_region = {};
   copy_region.srcOffset = 0;
@@ -4847,6 +5387,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
       if (in_render_pass_) {
         saved_render_pass = current_render_pass_;
         saved_framebuffer = current_framebuffer_;
+        TagPassEnd(PassEndReason::kQuery);
         EndRenderPass();
       }
       if (!EndSubmission(false)) {
@@ -4911,6 +5452,7 @@ CommandProcessor::QueryOpenResult VulkanCommandProcessor::OpenZPDQuery(
         VkRenderPass saved_render_pass = current_render_pass_;
         const VulkanRenderTargetCache::Framebuffer* saved_framebuffer =
             current_framebuffer_;
+        TagPassEnd(PassEndReason::kQuery);
         EndRenderPass();
         zpd_host_query_pool_->ClearCounter(deferred_command_buffer_,
                                            zpd_active_query_index_);
@@ -5038,6 +5580,7 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
       }
       pipeline_cache_->AwaitPipelineCompletion();
     }
+    TagPassEnd(PassEndReason::kQuery);
     EndRenderPass();
     if (!EndSubmission(false)) {
       return false;
@@ -5088,6 +5631,86 @@ bool VulkanCommandProcessor::DumpEdramSnapshotToFile(
   return render_target_cache_->WriteEdramSnapshotToFile(path);
 }
 
+void VulkanCommandProcessor::OnDispatchBegin(
+    DeferredCommandBuffer& command_buffer, uint32_t group_count_x,
+    uint32_t group_count_y, uint32_t group_count_z) {
+  const VulkanGpuBreadcrumbs::WorkKind kind = dispatch_kind_;
+  dispatch_kind_ = VulkanGpuBreadcrumbs::WorkKind::kCount;
+  const uint32_t detail_count = dispatch_detail_count_;
+  dispatch_detail_count_ = 0;
+  const uint64_t groups =
+      uint64_t(group_count_x) * group_count_y * group_count_z;
+  if (cvars::vulkan_log_dispatch_groups &&
+      groups >= cvars::vulkan_log_dispatch_groups &&
+      large_dispatch_logs_ < 64) {
+    ++large_dispatch_logs_;
+    XELOGW("XDroid360: large {} dispatch {}x{}x{} ({} groups), frame {}",
+           VulkanGpuBreadcrumbs::WorkKindName(kind), group_count_x,
+           group_count_y, group_count_z, groups, frame_current_);
+  }
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnWorkBegin(command_buffer, kind, group_count_x,
+                                 group_count_y, group_count_z,
+                                 GetCurrentSubmission(), frame_current_,
+                                 dispatch_detail_, detail_count);
+  }
+}
+
+void VulkanCommandProcessor::OnDispatchEnd(
+    DeferredCommandBuffer& command_buffer) {
+  if (gpu_breadcrumbs_.enabled()) {
+    gpu_breadcrumbs_.OnWorkEnd(command_buffer);
+  }
+}
+
+void VulkanCommandProcessor::StallWatchdogLoop() {
+  xe::threading::set_name("GPU Stall Watchdog");
+  uint64_t reported_heartbeat = 0;
+  uint32_t reports = 0;
+  while (!stall_watchdog_quit_.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const uint64_t heartbeat =
+        gpu_thread_heartbeat_ms_.load(std::memory_order_relaxed);
+    if (!heartbeat || heartbeat == reported_heartbeat ||
+        reports >= kMaxStallReports) {
+      continue;
+    }
+    // Pause suspends the GPU thread with commands pending (a 28.7 s false
+    // report at boot, stab3); that heartbeat is not a stall. A benign racy
+    // read of a plain bool, as for the ring pointers below.
+    if (is_paused()) {
+      reported_heartbeat = heartbeat;
+      continue;
+    }
+    const uint64_t stalled_ms = SteadyMs() - heartbeat;
+    // Only with guest commands waiting in the ring: an idle GPU thread (no
+    // guest work, loading, pause) has nothing to report. Both reads race the
+    // GPU thread benignly; it is the one that is stuck when this fires.
+    if (stalled_ms < cvars::vulkan_gpu_stall_watchdog_ms ||
+        write_ptr_index_.load(std::memory_order_relaxed) == read_ptr_index_) {
+      continue;
+    }
+    reported_heartbeat = heartbeat;
+    ++reports;
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    // The GPU thread is blocked, so the history ring and the breadcrumb
+    // records it owns hold still while they are read here.
+    XELOGE(
+        "XDroid360: GPU thread stalled {} ms at {:02}:{:02}:{:02} with guest "
+        "commands pending (frame {}, submission {} completed {}, report {}/{})",
+        stalled_ms, local.tm_hour, local.tm_min, local.tm_sec, frame_current_,
+        GetCurrentSubmission(), GetCompletedSubmission(), reports,
+        kMaxStallReports);
+    LogRecentSubmissions("watchdog");
+  }
+}
+
 void VulkanCommandProcessor::LogRecentSubmissions(const char* context) {
   XELOGE(
       "VulkanCommandProcessor: recent submission history ({}) - oldest first, "
@@ -5117,6 +5740,7 @@ void VulkanCommandProcessor::LogRecentSubmissions(const char* context) {
         s.resolve_count, s.last_vs_hash, s.last_ps_hash,
         uint32_t(s.last_render_pass_key));
   }
+  gpu_breadcrumbs_.LogHang();
 }
 
 void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
@@ -5133,6 +5757,37 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
     // A submission won't be ended if it hasn't been started, or if ending
     // has failed - clamp the index.
     await_submission = GetCurrentSubmission() - 1;
+  }
+
+  // XDroid360: kgsl detects and recovers a GPU hang in ~250 ms, then the GPU
+  // moves on and overwrites the breadcrumbs, so a report written after the
+  // await would show nothing. Report while the oldest submission is stuck.
+  if (cvars::vulkan_gpu_stall_report_ms &&
+      await_submission > GetCompletedSubmission() &&
+      stall_reports_ < kMaxStallReports) {
+    const uint64_t stuck_submission = GetCompletedSubmission() + 1;
+    if (stuck_submission != stall_reported_submission_ &&
+        !completion_timeline_.WaitSubmissionFor(
+            stuck_submission, cvars::vulkan_gpu_stall_report_ms)) {
+      stall_reported_submission_ = stuck_submission;
+      ++stall_reports_;
+      const std::time_t now = std::time(nullptr);
+      std::tm local{};
+#ifdef _WIN32
+      localtime_s(&local, &now);
+#else
+      localtime_r(&now, &local);
+#endif
+      XELOGE(
+          "XDroid360: GPU stall at {:02}:{:02}:{:02}: submission {} still "
+          "running after {} ms (awaiting {}, current {}, frame {}, report "
+          "{}/{})",
+          local.tm_hour, local.tm_min, local.tm_sec, stuck_submission,
+          cvars::vulkan_gpu_stall_report_ms, await_submission,
+          GetCurrentSubmission(), frame_current_, stall_reports_,
+          kMaxStallReports);
+      LogRecentSubmissions("stall");
+    }
   }
 
   completion_timeline_.AwaitSubmissionAndUpdateCompleted(await_submission);
@@ -5259,6 +5914,19 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
       is_opening_frame
           ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight]
           : 0;
+  // Optional cap on submissions still executing on the GPU. With the fence
+  // waiter the command processor no longer stalls on fence polls, so on
+  // Turnip/kgsl many more submissions are in flight than before; system-wide
+  // GPU hangs appeared with that (2026-10-07, AC6) and went away with the
+  // waiter off.
+  if (cvars::vulkan_max_submissions_in_flight) {
+    const uint64_t current = GetCurrentSubmission();
+    if (current > cvars::vulkan_max_submissions_in_flight) {
+      await_submission = std::max(
+          await_submission,
+          current - uint64_t(cvars::vulkan_max_submissions_in_flight));
+    }
+  }
   CheckSubmissionCompletionAndDeviceLoss(await_submission);
   const uint64_t completed_submission = GetCompletedSubmission();
   if (device_lost_ || completed_submission < await_submission) {
@@ -5466,6 +6134,7 @@ void VulkanCommandProcessor::CollectCompletedGpuTimeQueries() {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+  gpu_thread_heartbeat_ms_.store(SteadyMs(), std::memory_order_relaxed);
   ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -5525,6 +6194,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
 
+    TagPassEnd(PassEndReason::kSubmit);
     EndRenderPass();
 
     render_target_cache_->EndSubmission();
@@ -5590,6 +6260,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Can't cross command buffer boundaries. Close the active segment first.
     CloseQuerySegment();
 
+    TagPassEnd(PassEndReason::kSubmit);
     SubmitBarriers(true);
 
     assert_false(command_buffers_writable_.empty());
@@ -5641,6 +6312,24 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       gpu_time_query_submissions_[gpu_time_slot] = GetCurrentSubmission();
       gpu_time_query_slot_ =
           (gpu_time_query_slot_ + 1) % kGpuTimeQuerySubmissions;
+    }
+    if (completion_hint_buffer_ != VK_NULL_HANDLE) {
+      // Execution dependency only: the write must land after everything
+      // before it in the queue has executed. Then make it visible to the host.
+      VkMemoryBarrier hint_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      dfn.vkCmdPipelineBarrier(command_buffer.buffer,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                               &hint_barrier, 0, nullptr, 0, nullptr);
+      const uint32_t hint_value = uint32_t(GetCurrentSubmission());
+      dfn.vkCmdFillBuffer(command_buffer.buffer, completion_hint_buffer_, 0,
+                          sizeof(hint_value), hint_value);
+      hint_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      hint_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+      dfn.vkCmdPipelineBarrier(command_buffer.buffer,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hint_barrier,
+                               0, nullptr, 0, nullptr);
     }
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       XELOGE("Failed to end a Vulkan command buffer");
@@ -5722,6 +6411,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     }
 
     frame_open_ = false;
+    if (cvars::xdroid_draw_blackbox) {
+      draw_blackbox_.OnFrameEnd(*memory_, frame_current_);
+    }
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] =
         GetCurrentSubmission() - 1;
@@ -7000,6 +7692,20 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
   if (!texture_count && !sampler_count) {
     return 0;
   }
+  // Never write bindings into a set whose layout has none (a placeholder
+  // pipeline's minimal layout): Turnip does not bounds-check dstBinding, so
+  // that corrupts neighbouring descriptors.
+  if (descriptor_set_layout == descriptor_set_layout_empty_) {
+    static uint32_t mismatch_logs = 0;
+    if (mismatch_logs < 64) {
+      ++mismatch_logs;
+      XELOGW(
+          "Vulkan: {} draw with {} textures and {} samplers has an empty "
+          "texture descriptor set layout, skipped",
+          is_vertex ? "vertex" : "pixel", texture_count, sampler_count);
+    }
+    return 0;
+  }
   TextureDescriptorSetLayoutKey texture_descriptor_set_layout_key;
   texture_descriptor_set_layout_key.texture_count = texture_count;
   texture_descriptor_set_layout_key.sampler_count = sampler_count;
@@ -7075,6 +7781,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
 #define COMMAND_PROCESSOR VulkanCommandProcessor
 #include "../pm4_command_processor_implement.h"
 #undef COMMAND_PROCESSOR
+
 }  // namespace vulkan
 }  // namespace gpu
 }  // namespace xe

@@ -111,6 +111,13 @@ class SharedMemory {
   void RangeWrittenByGpu(uint32_t start, uint32_t length,
                          bool written_to_buffer = true);
 
+  // XDroid360 HUD-1 forensics (temp, revert-planned). Whether every page of
+  // the range is valid, so RequestRange would copy nothing.
+  bool XdroidRangeValid(uint32_t start, uint32_t length);
+  // Arm H3: marks the CPU-owned pages of the range invalid so the next
+  // RequestRange copies them again. Pages holding GPU-written data are kept.
+  void XdroidForceReupload(uint32_t start, uint32_t length);
+
  protected:
   SharedMemory(Memory& memory);
   // Call in implementation-specific initialization.

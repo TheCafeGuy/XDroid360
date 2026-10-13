@@ -315,7 +315,9 @@ else()
         $<$<COMPILE_LANGUAGE:CXX>:-Wno-nontrivial-memcall>
       )
     endif()
-    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 21)
+    # The NDK's clang 21 predates -Wcharacter-conversion.
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 21 AND
+       NOT CMAKE_SYSTEM_NAME STREQUAL "Android")
       add_compile_options(
         $<$<COMPILE_LANGUAGE:CXX>:-Wno-character-conversion>
       )

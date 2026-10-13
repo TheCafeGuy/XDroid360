@@ -10,8 +10,13 @@
 #ifndef XENIA_UI_VULKAN_VULKAN_GPU_COMPLETION_TIMELINE_H_
 #define XENIA_UI_VULKAN_VULKAN_GPU_COMPLETION_TIMELINE_H_
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -83,6 +88,8 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
                   completion_timeline_->GetUpcomingSubmission());
           completion_timeline_->pending_submission_fences_.emplace_back(
               completion_timeline_->GetUpcomingSubmission(), fence_);
+          completion_timeline_->OnFenceSubmitted(
+              completion_timeline_->GetUpcomingSubmission(), fence_);
           completion_timeline_->IncrementUpcomingSubmission();
         } else {
           completion_timeline_->free_fences_.push_back(fence_);
@@ -130,6 +137,21 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 
   void UpdateCompletedSubmission() override;
 
+  // XDroid360: waits up to timeout_ms for a submission without updating the
+  // completed submission. False only on timeout; a completed submission or a
+  // failed wait returns true (the regular await reports failures).
+  bool WaitSubmissionFor(uint64_t awaited_submission, uint32_t timeout_ms);
+
+  // Optional host-visible, host-coherent word the GPU overwrites with the low
+  // 32 bits of each submission index once everything before it in the queue
+  // has executed. When set, fences are queried only for submissions it already
+  // reports as done, so polling costs a memory load instead of a fence status
+  // query (which sleeps in the kernel on Turnip / kgsl). The fence remains the
+  // authority: a premature value only costs one query.
+  void SetCompletionHint(const volatile uint32_t* hint) {
+    completion_hint_ = hint;
+  }
+
  protected:
   void AwaitSubmissionImpl(uint64_t awaited_submission) override;
 
@@ -145,6 +167,29 @@ class VulkanGPUCompletionTimeline : public GPUCompletionTimeline {
 #ifndef NDEBUG
   size_t fences_acquired_ = 0;
 #endif
+
+  // Optional fence waiter thread (cvar vulkan_async_fence_waiter). On drivers
+  // where vkGetFenceStatus sleeps in the kernel (Turnip on kgsl), polling the
+  // fences from the submitting thread blocks it on every check. The waiter
+  // blocks on the fences in submission order instead and publishes the last
+  // completed submission, so checks become an atomic load.
+  void OnFenceSubmitted(uint64_t submission, VkFence fence);
+  void WaiterMain();
+  void StopWaiter();
+  bool waiter_decided_ = false;
+  bool waiter_enabled_ = false;
+  bool waiter_lost_reported_ = false;
+  std::thread waiter_thread_;
+  std::mutex waiter_mutex_;
+  std::condition_variable waiter_cv_;
+  std::condition_variable completed_cv_;
+  // Submitted fences not yet awaited by the waiter, in submission order.
+  std::deque<std::pair<uint64_t, VkFence>> waiter_queue_;
+  std::atomic<uint64_t> waiter_completed_{0};
+  std::atomic<bool> waiter_lost_{false};
+  std::atomic<bool> waiter_stop_{false};
+  std::chrono::steady_clock::time_point last_poll_time_{};
+  const volatile uint32_t* completion_hint_ = nullptr;
 };
 
 }  // namespace vulkan

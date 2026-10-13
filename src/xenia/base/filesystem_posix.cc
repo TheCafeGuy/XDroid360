@@ -10,6 +10,7 @@
 #include "xenia/base/assert.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/platform.h"
 #include "xenia/base/string.h"
 #include "xenia/xbox.h"
 
@@ -298,6 +299,9 @@ std::vector<FileInfo> ListFilesUnsorted(const std::filesystem::path& path) {
 
 }  // namespace internal
 
+// filesystem_android.cc has the Android SetAttributes (no chmod on shared
+// storage), and both files build there.
+#if !XE_PLATFORM_ANDROID
 bool SetAttributes(const std::filesystem::path& path, uint64_t attributes) {
   struct stat st;
   if (stat(path.c_str(), &st) != 0) {
@@ -311,6 +315,7 @@ bool SetAttributes(const std::filesystem::path& path, uint64_t attributes) {
   }
   return chmod(path.c_str(), mode) == 0;
 }
+#endif  // !XE_PLATFORM_ANDROID
 
 }  // namespace filesystem
 }  // namespace xe

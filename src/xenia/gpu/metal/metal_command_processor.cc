@@ -35,6 +35,7 @@
 #include "metal_irconverter_runtime.h"
 
 #include "third_party/fmt/include/fmt/format.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"

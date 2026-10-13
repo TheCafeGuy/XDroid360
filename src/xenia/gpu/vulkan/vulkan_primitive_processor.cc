@@ -12,11 +12,17 @@
 #include <cstdint>
 
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
+
+DEFINE_bool(vulkan_expand_points_rects_in_vs, false,
+            "Expand point sprites and rectangle lists in the vertex shader "
+            "instead of a geometry shader.",
+            "Vulkan");
 
 namespace xe {
 namespace gpu {
@@ -29,10 +35,19 @@ bool VulkanPrimitiveProcessor::Initialize() {
       command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Properties& device_properties =
       vulkan_device->properties();
+  // Geometry shaders on Adreno (Turnip) misplace or drop expanded point
+  // sprites and rectangles (AC6 afterburners, smoke, clouds); expanding them
+  // in the vertex shader avoids the geometry stage. The AC6 static recomp
+  // (sal063/AC6_recomp, BSD-3) made VS point-list expansion its default for
+  // the same particle and trail glitches. Opt-in here until it is verified on
+  // device.
+  const bool gs_expansion =
+      device_properties.geometryShader &&
+      !cvars::vulkan_expand_points_rects_in_vs;
   if (!InitializeCommon(
           device_properties.fullDrawIndexUint32, device_properties.triangleFans,
-          false, device_properties.geometryShader,
-          device_properties.geometryShader, device_properties.geometryShader)) {
+          false, device_properties.geometryShader, gs_expansion,
+          gs_expansion)) {
     Shutdown();
     return false;
   }
@@ -90,6 +105,7 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
     // been used yet, and builtin_index_buffer_upload_ is written before
     // submitting commands reading it.
 
+    command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kSubmit);
     command_processor_.EndRenderPass();
 
     DeferredCommandBuffer& command_buffer =

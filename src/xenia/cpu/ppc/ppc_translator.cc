@@ -128,6 +128,9 @@ PPCTranslator::PPCTranslator(PPCFrontend* frontend) : frontend_(frontend) {
   // compiler_->AddPass(std::make_unique<passes::DeadStoreEliminationPass>());
   // if (validate)
   // compiler_->AddPass(std::make_unique<passes::ValidationPass>());
+  // After context promotion, which turned same-block CR loads into SSA uses,
+  // so only reads that cross blocks keep a CR store live.
+  compiler_->AddPass(std::make_unique<passes::DeadCRStoreEliminationPass>());
   compiler_->AddPass(std::make_unique<passes::DeadCodeEliminationPass>());
   if (validate) {
     compiler_->AddPass(std::make_unique<passes::ValidationPass>());

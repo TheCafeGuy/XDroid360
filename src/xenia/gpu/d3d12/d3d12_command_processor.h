@@ -246,13 +246,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
                                D3D12_RESOURCE_STATES new_state);
 
   // If this shared memory range holds memexport output (which lives in the host
-  // buffer under two-buffer routing), copies just it into the device buffer so
-  // a following texture load reading the device buffer sees it. No-op for
-  // normal ranges and when the host buffer is unavailable. Called by the
-  // texture cache before loading.
+  // buffer under two-buffer routing), copies the pages holding it into the
+  // device buffer so a following texture load reading the device buffer sees
+  // it, or all of the range with whole_range. No-op for normal ranges and when
+  // the host buffer is unavailable. Called by the texture cache before loading.
   // Returns whether it copied, so an upload of the same range can be skipped.
   bool EnsureMemexportRangeInDeviceBuffer(uint32_t base_bytes,
-                                          uint32_t size_bytes);
+                                          uint32_t size_bytes,
+                                          bool whole_range = false);
 
   // Returns a pipeline with deferred creation by its handle. May return nullptr
   // if failed to create the pipeline.
@@ -420,6 +421,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint64_t key;
     uint32_t address;
     uint32_t length;
+    // Where address lies in the slot's buffer.
+    uint32_t offset;
   };
   std::vector<MemexportStagedRange> memexport_staged_;
 

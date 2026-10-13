@@ -791,6 +791,8 @@ bool Memory::AccessViolationCallback(
   // Will be rounded to physical page boundaries internally, so just pass 1 as
   // the length - guranteed not to cross page boundaries also.
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
+  physical_heap->ProvideReadWatchedPage(global_lock_locked_once,
+                                        virtual_address, is_write);
   return physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
                                          virtual_address, 1, is_write, false);
 }
@@ -861,6 +863,8 @@ void Memory::UnregisterPhysicalMemoryReadCallback(void* callback_handle) {
       physical_memory_read_callbacks_.erase(it);
     }
   }
+  std::unique_lock<std::shared_mutex> calls_lock(
+      physical_memory_read_callback_calls_mutex_);
   delete entry;
 }
 
@@ -2351,14 +2355,21 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
   // in this loop, but very little spent actually calling Protect
   uint32_t i = system_page_first;
   for (; i <= system_page_last; ++i) {
-    if constexpr (!enable_invalidation_notifications && enable_data_providers) {
-      // Re-arming a read watch over pages it still covers, most of them for a
-      // resolve redone every frame, has nothing to do there, so skip the rest
-      // of a flags block armed throughout.
+    {
+      // Pages still armed, as most are when a resolve or memexport range is
+      // re-armed every frame, need nothing, so skip a fully armed block.
       uint32_t block_last = std::min(i | 63, system_page_last);
       uint64_t block_mask = (~uint64_t(0) >> (63 - (block_last & 63))) &
                             (~uint64_t(0) << (i & 63));
-      if ((sys_page_flags[i >> 6].notify_on_read & block_mask) == block_mask) {
+      const SystemPageFlagsBlock& block = sys_page_flags[i >> 6];
+      uint64_t armed = ~uint64_t(0);
+      if constexpr (enable_invalidation_notifications) {
+        armed &= block.notify_on_invalidation;
+      }
+      if constexpr (enable_data_providers) {
+        armed &= block.notify_on_read;
+      }
+      if ((armed & block_mask) == block_mask) {
         if (protect_system_page_first != UINT32_MAX) {
           xe::memory::Protect(
               protect_base + (protect_system_page_first << system_page_shift_),
@@ -2458,6 +2469,53 @@ XE_NOINLINE void PhysicalHeap::EnableAccessCallbacksInner(
         protect_access);
   }
 }
+
+void PhysicalHeap::ProvideReadWatchedPage(
+    global_unique_lock_type& global_lock_locked_once, uint32_t virtual_address,
+    bool is_write) {
+  if (virtual_address < heap_base_ ||
+      virtual_address - heap_base_ >= heap_size_) {
+    return;
+  }
+  uint32_t heap_relative_address = virtual_address - heap_base_;
+  uint32_t system_page =
+      (heap_relative_address + host_address_offset()) >> system_page_shift_;
+  if (system_page >= system_page_count_ ||
+      !(system_page_flags_[system_page >> 6].notify_on_read &
+        (uint64_t(1) << (system_page & 63)))) {
+    return;
+  }
+  std::shared_lock<std::shared_mutex> calls_lock(
+      memory_->physical_memory_read_callback_calls_mutex_);
+  // Copied, as the list may change once the lock is released.
+  std::pair<Memory::PhysicalMemoryReadCallback, void*> callbacks[4];
+  size_t callback_count = memory_->physical_memory_read_callbacks_.size();
+  if (!callback_count || callback_count > xe::countof(callbacks)) {
+    return;
+  }
+  for (size_t i = 0; i < callback_count; ++i) {
+    callbacks[i] = *memory_->physical_memory_read_callbacks_[i];
+  }
+  uint32_t physical_address_offset = GetPhysicalAddress(heap_base_);
+  uint32_t physical_address_start =
+      xe::sat_sub(system_page << system_page_shift_, host_address_offset()) +
+      physical_address_offset;
+  uint32_t physical_length = std::min(
+      xe::sat_sub((system_page << system_page_shift_) + system_page_size_,
+                  host_address_offset()) +
+          physical_address_offset - physical_address_start,
+      heap_size_ - (physical_address_start - physical_address_offset));
+  Memory::PhysicalAccess access =
+      is_write ? Memory::PhysicalAccess::kWrite : Memory::PhysicalAccess::kRead;
+  global_lock_locked_once.unlock();
+  for (size_t i = 0; i < callback_count; ++i) {
+    callbacks[i].first(callbacks[i].second, physical_address_start,
+                       physical_length, access);
+  }
+  calls_lock.unlock();
+  global_lock_locked_once.lock();
+}
+
 bool PhysicalHeap::TriggerCallbacks(
     global_unique_lock_type global_lock_locked_once, uint32_t virtual_address,
     uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect,

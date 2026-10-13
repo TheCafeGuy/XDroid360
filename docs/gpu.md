@@ -31,7 +31,9 @@ waiting for a fixed 60hz timer.
 
 ### Vulkan
 
-See the top of [src/xenia/gpu/vulkan/vulkan_gpu_flags.cc](../src/xenia/gpu/vulkan/vulkan_gpu_flags.cc).
+See [src/xenia/gpu/gpu_flags.cc](../src/xenia/gpu/gpu_flags.cc) and the
+`DEFINE_*` flags at the top of the Vulkan backend sources in
+[src/xenia/gpu/vulkan](../src/xenia/gpu/vulkan).
 
 `vulkan_dump_disasm=true` "Dump shader disassembly. NVIDIA only supported."
 

@@ -11,7 +11,8 @@
 // processors. This is #included into each backend's class body (like the pm4
 // command processor sections) so each backend gets its own inlinable copy with
 // no inheritance or virtual dispatch. The include site must already provide
-// SharedMemory, Shader, RegisterFile, xenos, xe::bit_scan_forward and <array>.
+// SharedMemory, Shader, RegisterFile, xenos, xe::bit_scan_forward, <array> and
+// <vector>.
 // No include guard: this is injected into a class body, not a standalone
 // header.
 //
@@ -129,6 +130,41 @@ bool VertexFetchInMemexportRange(const RegisterFile& regs,
   return false;
 }
 
+// Fills memexport_copy_runs_ with the parts of a range on pages memexport
+// wrote, or all of it with whole_range, as other pages may hold GPU output only
+// the device buffer has. False if memexport wrote none of it.
+bool GatherMemexportCopyRuns(uint32_t base_bytes, uint32_t size_bytes,
+                             bool whole_range) {
+  memexport_copy_runs_.clear();
+  if (!IsMemexportRange(base_bytes, size_bytes)) {
+    return false;
+  }
+  size_bytes = std::min(size_bytes, SharedMemory::kBufferSize - base_bytes);
+  uint32_t end = base_bytes + size_bytes;
+  if (whole_range) {
+    memexport_copy_runs_.emplace_back(base_bytes, size_bytes);
+    return true;
+  }
+  uint32_t first_page = std::max(base_bytes >> 12, memexport_written_page_min_);
+  uint32_t last_page = std::min((end - 1) >> 12, memexport_written_page_max_);
+  for (uint32_t page = first_page; page <= last_page; ++page) {
+    if (!(memexport_written_pages_[page >> 6] & (uint64_t(1) << (page & 63)))) {
+      continue;
+    }
+    uint32_t run_start = std::max(base_bytes, page << 12);
+    uint32_t run_end = std::min(end, (page + 1) << 12);
+    if (!memexport_copy_runs_.empty()) {
+      std::pair<uint32_t, uint32_t>& last_run = memexport_copy_runs_.back();
+      if (last_run.first + last_run.second == run_start) {
+        last_run.second += run_end - run_start;
+        continue;
+      }
+    }
+    memexport_copy_runs_.emplace_back(run_start, run_end - run_start);
+  }
+  return true;
+}
+
 // Resets all tracking, called from each backend's ShutdownContext.
 void ResetMemexportPages() {
   memexport_written_pages_.fill(0);
@@ -150,3 +186,5 @@ bool memexport_await_pending_ = false;
 // the memexport region in O(1). Empty (min > max) until the first memexport.
 uint32_t memexport_written_page_min_ = kMemexportPageCount;
 uint32_t memexport_written_page_max_ = 0;
+// GatherMemexportCopyRuns output, as (base, size).
+std::vector<std::pair<uint32_t, uint32_t>> memexport_copy_runs_;

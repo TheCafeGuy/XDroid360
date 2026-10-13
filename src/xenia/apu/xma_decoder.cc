@@ -67,6 +67,16 @@ DEFINE_bool(use_dedicated_xma_thread, false,
             "APU");
 UPDATE_from_bool(use_dedicated_xma_thread, 2026, 8, 21, 0, true);
 
+DEFINE_uint32(xma_worker_poll_ms, 0,
+              "With use_dedicated_xma_thread, also re-check XMA contexts every "
+              "this many milliseconds, not only when the title kicks one. "
+              "0 = kicks only.",
+              "APU");
+// Every decoder's Work() returns at once unless a kick enabled the context,
+// and a kick also wakes the worker, so a timed re-check never finds work; at
+// 1 ms it only cost ~1 kHz wakeups.
+UPDATE_from_uint32(xma_worker_poll_ms, 2026, 10, 9, 12, 1);
+
 DEFINE_string(
     xma_decoder, "new",
     "Decoder version used to process XMA audio.\n"
@@ -218,7 +228,15 @@ void XmaDecoder::WorkerThreadMain() {
     if (did_work) {
       continue;
     }
-    xe::threading::Wait(work_event_.get(), false);
+    // A kick enables its contexts before setting work_event_, so sleeping
+    // until the next one loses no work.
+    if (cvars::xma_worker_poll_ms) {
+      xe::threading::Wait(
+          work_event_.get(), false,
+          std::chrono::milliseconds(cvars::xma_worker_poll_ms));
+    } else {
+      xe::threading::Wait(work_event_.get(), false);
+    }
   }
 }
 

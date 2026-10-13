@@ -25,6 +25,7 @@
 #include "xenia/cpu/stack_walker.h"
 #include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xdroid_wait_probe.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/kernel/xthread.h"
 
@@ -668,6 +669,22 @@ void GuestScheduler::LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head) {
       (cvars::guest_scheduler_stats || cvars::guest_scheduler_spin_quanta)
           ? Clock::host_tick_count_raw()
           : 0;
+  // XDroid360 AUD-2: time the audio producer from ready to dispatch, and run
+  // it first when the producer boost asked for it.
+  bool xdroid_boost = false;
+  XdroidAudioWatch& watch = xdroid_audio_watch;
+  const uint32_t producer_tid =
+      watch.signaler_tid.load(std::memory_order_relaxed);
+  if (producer_tid && thread->thread_id() == producer_tid) {
+    watch.producer_ready_tick.store(XdroidNowUs(), std::memory_order_relaxed);
+    uint32_t expected = producer_tid;
+    if (watch.boost_pending_tid.compare_exchange_strong(
+            expected, 0, std::memory_order_acq_rel)) {
+      xdroid_boost = true;
+      at_head = true;
+      watch.boosts.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
   if (at_head) {
     LinkHeadLocked(cpu.ready_head[prio], cpu.ready_tail[prio], thread);
   } else {
@@ -678,7 +695,7 @@ void GuestScheduler::LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head) {
   // and the dispatcher picks us.
   XThread* running = cpu.current_thread;
   if (running && running != thread &&
-      prio > ClampPriority(running->priority())) {
+      (prio > ClampPriority(running->priority()) || xdroid_boost)) {
     running->scheduler_links().preempted = true;
     running->thread_state()->context()->preempt_requested = 1;
   }
@@ -714,6 +731,39 @@ void GuestScheduler::RequeueForPriority(XThread* thread) {
     cpu.ready_summary &= ~(uint32_t(1) << old);
   }
   LinkReadyLocked(cpu, thread, false);
+}
+
+int GuestScheduler::XdroidThreadState(XThread* thread) {
+  std::lock_guard<std::mutex> lock(lock_);
+  auto& links = thread->scheduler_links();
+  if (links.running) {
+    return 0;
+  }
+  if (links.queued) {
+    return 1;
+  }
+  if (links.blocked) {
+    return 2;
+  }
+  return 3;
+}
+
+bool GuestScheduler::XdroidBoostReady(XThread* thread) {
+  std::lock_guard<std::mutex> lock(lock_);
+  auto& links = thread->scheduler_links();
+  if (!links.queued || links.running || links.cpu < 0) {
+    return false;
+  }
+  Cpu& cpu = cpus_[links.cpu];
+  int prio = links.queued_prio;
+  UnlinkLocked(cpu.ready_head[prio], cpu.ready_tail[prio], thread);
+  LinkHeadLocked(cpu.ready_head[prio], cpu.ready_tail[prio], thread);
+  XThread* running = cpu.current_thread;
+  if (running && running != thread) {
+    running->scheduler_links().preempted = true;
+    running->thread_state()->context()->preempt_requested = 1;
+  }
+  return true;
 }
 
 void GuestScheduler::MigrateForAffinity(XThread* thread) {
@@ -875,6 +925,23 @@ void GuestScheduler::SwitchTo(XThread* next) {
     cpus_[t_current_cpu].quantum_deadline_tick = links.quantum_deadline_tick;
   }
   stats_.switches.fetch_add(1, std::memory_order_relaxed);
+  {
+    XdroidAudioWatch& watch = xdroid_audio_watch;
+    if (next->thread_id() ==
+        watch.signaler_tid.load(std::memory_order_relaxed)) {
+      const uint64_t ready = watch.producer_ready_tick.exchange(
+          0, std::memory_order_relaxed);
+      if (ready) {
+        const uint64_t delay = XdroidNowUs() - ready;
+        watch.dispatch_delay_us.fetch_add(delay, std::memory_order_relaxed);
+        watch.dispatches.fetch_add(1, std::memory_order_relaxed);
+        uint64_t max = watch.dispatch_delay_max_us.load();
+        while (delay > max &&
+               !watch.dispatch_delay_max_us.compare_exchange_weak(max, delay)) {
+        }
+      }
+    }
+  }
   XThread::SetCurrentThread(next);
   next->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_RUNNING;
   // A flag raised while this fiber was off-CPU is stale, the dispatcher
@@ -1865,6 +1932,13 @@ void GuestScheduler::ReportNoProgress() {
   }
 }
 
+void GuestScheduler::SetHostPaused(bool paused) {
+  host_paused_.store(paused);
+  if (!paused && watchdog_event_) {
+    watchdog_event_->Set();
+  }
+}
+
 void GuestScheduler::WatchdogLoop() {
   Profiler::ThreadEnter("GuestScheduler Watchdog");
   // Microseconds, not milliseconds: an integer division to ms floors every
@@ -1876,6 +1950,14 @@ void GuestScheduler::WatchdogLoop() {
     period_us = kMinWatchdogPeriodUs;
   }
   while (!shutting_down_.load()) {
+    if (host_paused_.load()) {
+      // Nothing is dispatched while paused; a 1 kHz tick would only cost
+      // power and count no-progress ticks. Resume and Shutdown set the event.
+      xe::threading::Wait(watchdog_event_.get(), false);
+      last_frame_number_ = xe::logging::GetFrameNumber();
+      no_progress_ticks_ = 0;
+      continue;
+    }
     if (period_us >= 1000) {
       // Event wait so Shutdown's Set is observed immediately.
       xe::threading::Wait(watchdog_event_.get(), false,

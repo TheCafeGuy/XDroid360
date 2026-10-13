@@ -21,6 +21,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/platform.h"
 #include "xenia/ui/redist_installer_wx.h"
+#include "xenia/ui/vulkan/vulkan_loader_hook.h"
 #include "xenia/ui/vulkan/vulkan_presenter.h"
 
 #if XE_PLATFORM_LINUX
@@ -49,6 +50,14 @@ namespace xe {
 namespace ui {
 namespace vulkan {
 
+namespace {
+VulkanLoaderOpener loader_opener = nullptr;
+}  // namespace
+
+void SetVulkanLoaderOpener(VulkanLoaderOpener opener) {
+  loader_opener = opener;
+}
+
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(
     const bool with_surface, const int validation_level) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
@@ -68,8 +77,20 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(
 #else
   const char* const loader_library_name = "libvulkan.so.1";
 #endif
+  if (loader_opener) {
+    vulkan_instance->loader_ = loader_opener();
+    if (vulkan_instance->loader_) {
+      XELOGI("Vulkan: using the driver supplied by the application");
+    } else {
+      XELOGW("Vulkan: the application's driver failed to load, using {}",
+             loader_library_name);
+    }
+  }
   // http://developer.download.nvidia.com/mobile/shield/assets/Vulkan/UsingtheVulkanAPI.pdf
-  vulkan_instance->loader_ = dlopen(loader_library_name, RTLD_NOW | RTLD_LOCAL);
+  if (!vulkan_instance->loader_) {
+    vulkan_instance->loader_ =
+        dlopen(loader_library_name, RTLD_NOW | RTLD_LOCAL);
+  }
   if (!vulkan_instance->loader_) {
     XELOGE("Failed to load {}", loader_library_name);
     return nullptr;

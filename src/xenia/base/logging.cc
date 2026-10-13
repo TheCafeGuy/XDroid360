@@ -46,6 +46,10 @@
 #if XE_PLATFORM_ANDROID
 DEFINE_bool(log_to_logcat, true, "Write log output to Android Logcat.",
             "Logging");
+// Off unless the app sets a path: logcat drops lines past its per-process
+// quota, and the app keeps the file as the crash report of a dead session.
+DEFINE_path(log_file, "", "Also write the log to this file (empty = off).",
+            "Logging");
 #else
 DEFINE_path(log_file, "", "Logs are written to the given file", "Logging");
 DEFINE_transient_bool(log_append, false,
@@ -440,6 +444,12 @@ void InitializeLogging(const std::string_view app_name) {
   // huge.
   if (cvars::log_to_logcat) {
     logger_->AddLogSink(std::make_unique<AndroidLogSink>(app_name));
+  }
+  if (!cvars::log_file.empty()) {
+    xe::filesystem::CreateParentFolder(cvars::log_file);
+    if (FILE* log_file = xe::filesystem::OpenFile(cvars::log_file, "wt")) {
+      logger_->AddLogSink(std::make_unique<FileLogSink>(log_file, true));
+    }
   }
 #else
   {

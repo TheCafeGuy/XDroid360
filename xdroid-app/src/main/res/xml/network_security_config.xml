@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Box art comes from Xbox's legacy marketplace image host, which only
+     serves plain HTTP. Allow cleartext for that host alone. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">download.xbox.com</domain>
+    </domain-config>
+</network-security-config>

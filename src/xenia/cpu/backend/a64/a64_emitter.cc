@@ -930,6 +930,7 @@ void A64Emitter::EmitDynamicCallLookup(bool tail) {
 void A64Emitter::CallNative(void* fn) { CallNativeSafe(fn); }
 
 void A64Emitter::CallNativeSafe(void* fn) {
+  ForgetFpcrMode();
   // GuestToHostThunk: x0=target function, x1/x2=args (set by caller).
   // The thunk rearranges: saves x0 in x9, sets x0=context, calls x9.
   mov(x0, reinterpret_cast<uint64_t>(fn));

@@ -24,11 +24,20 @@
 #include "xenia/gpu/texture_util.h"
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
+#include "xenia/ui/graphics_provider.h"
 #include "xenia/ui/vulkan/ui_samplers.h"
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(tiled_shared_memory);
+
+DEFINE_bool(
+    vulkan_texture_load_scratch_blit, true,
+    "Move loaded texture data into the texture through a compute blit into an "
+    "integer staging image plus an image copy, instead of "
+    "vkCmdCopyBufferToImage. Faster on NVIDIA; always skipped on Qualcomm "
+    "(Adreno), where the copy is faster.",
+    "Vulkan");
 
 namespace xe {
 namespace gpu {
@@ -540,6 +549,7 @@ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
           VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
           VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
     }
+    command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kSubmit);
     command_processor_.SubmitBarriers(true);
     DeferredCommandBuffer& command_buffer =
         command_processor_.deferred_command_buffer();
@@ -1728,12 +1738,15 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             offsetof(LoadConstants, host_offset),
             sizeof(load_constants.host_offset), &load_constants.host_offset);
       }
+      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
       command_processor_.SubmitBarriers(true);
       // Debug: show dispatch info with source offset
       command_processor_.InsertDebugMarker(
           "Dispatch: guest_off=0x%X host_off=0x%X groups=%ux%ux%u",
           load_constants.guest_offset, load_constants.host_offset,
           group_count_x, group_count_y, load_constants.size_blocks[2]);
+      command_processor_.TagDispatch(
+          VulkanGpuBreadcrumbs::WorkKind::kTextureLoad);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                    load_constants.size_blocks[2]);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
@@ -1901,6 +1914,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VK_ACCESS_SHADER_WRITE_BIT, blit_staging.layout,
           VK_IMAGE_LAYOUT_GENERAL);
       blit_staging.layout = VK_IMAGE_LAYOUT_GENERAL;
+      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
       command_processor_.SubmitBarriers(true);
 
       command_processor_.BindExternalComputePipeline(
@@ -1922,6 +1936,8 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
         command_buffer.CmdVkPushConstants(
             scratch_blit_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
             sizeof(blit_constants), &blit_constants);
+        command_processor_.TagDispatch(
+            VulkanGpuBreadcrumbs::WorkKind::kTextureBlit);
         command_buffer.CmdVkDispatch((blit_level.size_blocks_x + 7) / 8,
                                      (blit_level.size_blocks_y + 7) / 8,
                                      array_size);
@@ -1971,14 +1987,18 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   } else {
     // Same layout/usage but another upload may have written the image earlier
     // in this submission - emit a TRANSFER_WRITE -> TRANSFER_WRITE barrier so
-    // the next copy into it is ordered after any prior one.
+    // the next copy into it is ordered after any prior one. Its source and
+    // destination masks are equal, so it must not be skipped as a no-op
+    // (xenia-canary c8f214e2a).
     command_processor_.PushImageMemoryBarrier(
         vulkan_texture.image(), ui::vulkan::util::InitializeSubresourceRange(),
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
   }
+  command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTextureLoad);
   command_processor_.SubmitBarriers(true);
   command_processor_.InsertDebugMarker(
       "Texture Upload: %ux%ux%u fmt:%s mips:%u-%u", width, height,
@@ -3474,6 +3494,17 @@ uint32_t VulkanTextureCache::GetScratchBlitShaderIndex(
 
 VkFormat VulkanTextureCache::GetScratchBlitStagingFormat(
     const TextureKey& key) const {
+  if (!cvars::vulkan_texture_load_scratch_blit) {
+    return VK_FORMAT_UNDEFINED;
+  }
+  // On Qualcomm Adreno (Turnip), the extra blit pass and its barriers cost
+  // more than vkCmdCopyBufferToImage saves: AC6 mission texture loads took
+  // ~7.5 ms of GPU time per frame with the blit, ~4.4 ms with the copy
+  // (2026-10-06, 87 loads per frame). Detected from the vendor ID.
+  if (command_processor_.GetVulkanDevice()->properties().vendorID ==
+      uint32_t(ui::GraphicsProvider::GpuVendorID::kQualcomm)) {
+    return VK_FORMAT_UNDEFINED;
+  }
   // 3D needs a uimage3D shader - everything 2D-shaped goes through the array
   // view, and cubes are arrays of six as far as the copy is concerned.
   if (key.dimension == xenos::DataDimension::k3D) {

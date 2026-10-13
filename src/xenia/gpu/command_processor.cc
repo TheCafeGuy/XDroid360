@@ -14,6 +14,7 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image_write.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -26,6 +27,7 @@
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/sampler_info.h"
 #include "xenia/gpu/texture_info.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
@@ -35,6 +37,13 @@
 
 #define XE_ENABLE_GPU_REG_WRITE_LOGGING 1
 #endif
+DEFINE_bool(
+    gpu_wait_reg_mem_vblank_event, true,
+    "With guest_display_refresh_cap, let a WAIT_REG_MEM that sleeps out the "
+    "guest poll interval wake as soon as the vblank interrupt has run, "
+    "instead of after the full sleep (1-2 ms late on Android).",
+    "GPU");
+
 DEFINE_bool(
     log_guest_driven_gpu_register_written_values, false,
     "Only does anything in debug builds, if set will log every write to a gpu "
@@ -187,6 +196,7 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(xe::threading::Event::CreateAutoResetEvent(false)),
+      vblank_event_(xe::threading::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
   assert_not_null(write_ptr_index_event_);
   // Parse and cache ZPD mode once.
@@ -508,6 +518,12 @@ void CommandProcessor::WorkerThreadMain() {
     }
     assert_true(read_ptr_index_ != write_ptr_index);
 
+    // XDroid360 (HUD-1): title code may hold the commands back briefly.
+    if (auto before_execute = GetXdroidGpuHooks().before_execute.load(
+            std::memory_order_acquire)) {
+      before_execute(write_ptr_index);
+    }
+
     // Execute. Note that we handle wraparound transparently.
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
 
@@ -638,7 +654,16 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
     LogKickoffInitator(value);
   }
   write_ptr_index_ = value;
+  if (auto on_kick =
+          GetXdroidGpuHooks().on_kick.load(std::memory_order_acquire)) {
+    on_kick(value);
+  }
   write_ptr_index_event_->SetBoostPriority();
+}
+
+XdroidGpuHooks& GetXdroidGpuHooks() {
+  static XdroidGpuHooks hooks;
+  return hooks;
 }
 
 void CommandProcessor::LogRegisterSet(uint32_t register_index, uint32_t value) {

@@ -18,6 +18,8 @@ DECLARE_path(dump_shaders);
 
 DECLARE_bool(guest_display_refresh_cap);
 
+DECLARE_bool(gpu_wait_reg_mem_vblank_event);
+
 DECLARE_uint32(framerate_limit);
 
 void SetGuestDisplayRefreshCap(bool value);
@@ -49,6 +51,12 @@ DECLARE_bool(occlusion_query_full_counters);
 // Returns the guest vblank rate in Hz (50 for PAL, 60 for NTSC).
 // Based on use_50Hz_mode cvar.
 uint32_t GetGuestVblankRateHz();
+void SetFastForward(bool enabled);
+// 1 normally, the fast forward multiplier while it is on.
+uint32_t GetFastForwardMultiplier();
+// AMOLED highlight compression (0 = off .. 1), live-settable.
+void SetDisplayToneStrength(float strength);
+float GetDisplayToneStrength();
 
 DECLARE_int32(anisotropic_override);
 

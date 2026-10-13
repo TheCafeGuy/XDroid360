@@ -58,12 +58,21 @@ void AndroidWindowedAppContext::PlatformQuitFromUIThread() {
 
 void AndroidWindowedAppContext::PostInvalidateWindowSurface() {
   // May be called from non-UI threads.
-  JNIEnv* jni_env = GetAndroidThreadJniEnv();
-  if (!jni_env) {
+  // XDroid360: the activity's SurfaceView has no draw callback into
+  // paintWindow, so invalidating it on the Java side dropped every presenter
+  // paint request, including the reconnection of an outdated swapchain (a
+  // live swapchain change left the picture frozen while the game ran,
+  // 2026-10-11). Paint on the UI thread through the looper instead; requests
+  // that arrive while one is queued are coalesced into it.
+  if (window_paint_posted_.exchange(true, std::memory_order_acq_rel)) {
     return;
   }
-  jni_env->CallVoidMethod(activity_,
-                          activity_method_post_invalidate_window_surface_);
+  if (!CallInUIThreadDeferred([this]() {
+        window_paint_posted_.store(false, std::memory_order_release);
+        JniActivityPaintWindow(false);
+      })) {
+    window_paint_posted_.store(false, std::memory_order_release);
+  }
 }
 
 AndroidWindowedAppContext*

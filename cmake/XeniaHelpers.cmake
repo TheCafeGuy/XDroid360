@@ -62,6 +62,20 @@ function(xe_platform_sources target base_path)
       "${base_path}/*_mac.h"
       "${base_path}/*_mac.cc"
     )
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Android")
+    # Android has Bionic, not glibc/X11/GTK: POSIX core + Android-specific
+    # files only. _linux/_gnulinux/_x11/_gtk are desktop-Linux-only.
+    file(${glob_mode} _plat_sources
+      "${base_path}/*_posix.h"
+      "${base_path}/*_posix.cc"
+      "${base_path}/*_android.h"
+      "${base_path}/*_android.cc"
+    )
+    # NOTE: _posix/_android twins are intentionally BOTH compiled: the
+    # _android file is a partial override (e.g. filesystem_android.cc holds
+    # SAF/JNI helpers plus a SetAttributes stub) while the _posix file holds
+    # the rest. Any symbol defined in both must be guarded with
+    # #if !XE_PLATFORM_ANDROID in the _posix file instead.
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     file(${glob_mode} _plat_sources
       "${base_path}/*_posix.h"

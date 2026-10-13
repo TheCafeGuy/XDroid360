@@ -436,6 +436,7 @@ void PipelineCache::InitializeShaderStorage(
           // Creation thread builds the Mesa DXIL off the main thread (the
           // deferred block in EnsurePipelineShadersTranslated), then the PSO.
           // Nothing is drawing these yet, so they publish as they are built.
+          new_pipeline->creation_pending.store(true, std::memory_order_relaxed);
           creation_queue_.PushUnordered(new_pipeline);
         } else {
           // No creation threads: build the DXIL + create the PSO here.
@@ -1454,6 +1455,7 @@ bool PipelineCache::ConfigurePipeline(
             pixel_shader ? pixel_shader->shader().ucode_data_hash() : 0);
       }
     }
+    new_pipeline->creation_pending.store(true, std::memory_order_relaxed);
     creation_queue_.Push(new_pipeline);
   } else {
     // Sync mode or no creation threads: create synchronously.
@@ -2412,7 +2414,11 @@ ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
         }
         blend_desc.BlendOpAlpha = kBlendOpMap[uint32_t(rt.blend_op_alpha)];
       }
-      blend_desc.RenderTargetWriteMask = rt.write_mask;
+      // Not writing an output leaves the target undefined, not unchanged.
+      blend_desc.RenderTargetWriteMask =
+          state_desc.PS.pShaderBytecode == shaders::placeholder_ps
+              ? 0
+              : rt.write_mask;
     }
   }
 
@@ -2515,6 +2521,7 @@ void PipelineCache::StoreCreatedPipeline(Pipeline* pipeline,
       deferred_destroy_pipelines_.emplace_back(
           old_state, command_processor_.GetCurrentSubmission());
     }
+    pipeline->creation_pending.store(false, std::memory_order_release);
     return;
   }
   // Real creation failed. Keep any placeholder in use, but stop reporting it as
@@ -2530,6 +2537,7 @@ void PipelineCache::StoreCreatedPipeline(Pipeline* pipeline,
   // After the log: this is what wants_rebuild() waits on, and the rebuild
   // overwrites the description the log just read.
   pipeline->creation_failed.store(true, std::memory_order_release);
+  pipeline->creation_pending.store(false, std::memory_order_release);
 }
 
 }  // namespace d3d12
