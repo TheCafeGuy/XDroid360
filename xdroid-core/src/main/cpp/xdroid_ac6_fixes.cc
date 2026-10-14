@@ -61,6 +61,8 @@
 
 #include "xdroid_ac6_fixes.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 
@@ -73,6 +75,7 @@
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/gpu/spirv_shader_translator.h"
+#include "xenia/kernel/guest_scheduler.h"
 #include "xenia/memory.h"
 
 DEFINE_bool(ac6_effect_mode_fix, true,
@@ -86,6 +89,16 @@ DEFINE_bool(ac6_cloud_deswizzle_fix, true,
             "by sampling linearly where the game de-swizzles EDRAM tiles by "
             "hand (port of the AC6_recomp fix).",
             "XDroid360");
+
+DEFINE_bool(ac6_hud_slot_join, true,
+            "Ace Combat 6 HUD fix: the render thread "
+            "picks the HUD vertex set (0x82138048) only after the main loop "
+            "advanced the frame counter it uses (0x826E4DD0) since the last "
+            "pick, waiting at most ac6_hud_slot_join_us. Live.",
+            "XDroid360");
+DEFINE_int32(ac6_hud_slot_join_us, 8000,
+             "Longest wait of ac6_hud_slot_join per HUD set pick. Live.",
+             "XDroid360");
 
 namespace xdroid {
 namespace {
@@ -107,6 +120,73 @@ constexpr uint32_t kEffModeOffset = 0xA1E84;
 
 uint32_t Load32(const uint8_t* membase, uint32_t address) {
   return xe::load_and_swap<uint32_t>(membase + address);
+}
+
+// HUD-1 (docs/runs/2026-10-10/gfx-hunt.md, hud1-s): the HUD draws use vertex
+// set (counter + 2) % 3 (0x82138048 at 0x82138078); the main loop advances
+// the counter once per iteration (0x821D7ECC). A pick that sees the same
+// counter as the previous pick reuses the previous frame's set, which the
+// game is already refilling: the HUD-1 garbage.
+constexpr uint32_t kHudSetPickLoad = 0x82138078;   // lwz r11, 4(r11)
+constexpr uint32_t kHudCounterStore = 0x821D7ECC;  // stw r11, 4(r31)
+constexpr uint32_t kHudCounter = 0x826E4DD0;
+constexpr uint32_t kHudSetPickLoadWord = 0x816B0004;
+constexpr uint32_t kHudCounterStoreWord = 0x917F0004;
+
+struct HudJoin {
+  std::atomic<uint64_t> advances{0};
+  uint64_t last_pick_advances = UINT64_MAX;
+  uint32_t last_pick_counter = UINT32_MAX;
+  uint64_t picks = 0, repeats = 0, waits = 0, timeouts = 0, waited_us = 0;
+  uint64_t last_report_us = 0;
+} g_hud;
+
+uint64_t HudNowUs() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
+
+// Main loop thread, before the counter store.
+void HudCounterStoreHook(xe::cpu::ppc::PPCContext*, void*, void*) {
+  g_hud.advances.fetch_add(1, std::memory_order_release);
+}
+
+// Render thread, before the load of the counter in the HUD set pick. Only
+// this thread touches the non-atomic fields.
+void HudSetPickHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
+  const uint8_t* membase = ctx->virtual_membase;
+  const uint64_t now = HudNowUs();
+  ++g_hud.picks;
+  uint64_t advances = g_hud.advances.load(std::memory_order_acquire);
+  if (advances == g_hud.last_pick_advances) {
+    // No advance since the last pick: this pick would reuse its set.
+    ++g_hud.repeats;
+    if (cvars::ac6_hud_slot_join) {
+      ++g_hud.waits;
+      const uint64_t deadline =
+          now + uint64_t(std::max(cvars::ac6_hud_slot_join_us, 0));
+      while ((advances = g_hud.advances.load(std::memory_order_acquire)) ==
+                 g_hud.last_pick_advances &&
+             HudNowUs() < deadline) {
+        xe::kernel::GuestScheduler::SpinYield();
+      }
+      if (advances == g_hud.last_pick_advances) {
+        ++g_hud.timeouts;
+      }
+      g_hud.waited_us += HudNowUs() - now;
+    }
+  }
+  g_hud.last_pick_advances = advances;
+  g_hud.last_pick_counter = Load32(membase, kHudCounter);
+  if (now - g_hud.last_report_us >= 10'000'000) {
+    g_hud.last_report_us = now;
+    XELOGI(
+        "XDROID-HUDSET: picks {} repeats {} (stale set without a join); "
+        "join waits {} timeouts {} waited {} ms (totals)",
+        g_hud.picks, g_hud.repeats, g_hud.waits, g_hud.timeouts,
+        g_hud.waited_us / 1000);
+  }
 }
 
 struct Entry {
@@ -218,6 +298,25 @@ void OnLaunch(xe::Emulator* emulator, uint32_t title_id) {
   // vtables must route vtbl[+0x04] to the dispatcher and vtbl[+0x100] to the
   // known draws.
   const uint8_t* membase = emulator->memory()->virtual_membase();
+  // HUD set pick (HUD-1): hooked whenever both instruction words match, so
+  // the repeat counter runs in every arm; the wait itself is live.
+  if (Load32(membase, kHudSetPickLoad) == kHudSetPickLoadWord &&
+      Load32(membase, kHudCounterStore) == kHudCounterStoreWord) {
+    xe::cpu::Processor* hud_processor = emulator->processor();
+    hud_processor->SetGuestHook(
+        kHudCounterStore,
+        hud_processor->DefineBuiltin("XDroidAc6HudCounter",
+                                     HudCounterStoreHook, nullptr, nullptr),
+        xe::cpu::Processor::GuestHookKind::kInstruction);
+    hud_processor->SetGuestHook(
+        kHudSetPickLoad,
+        hud_processor->DefineBuiltin("XDroidAc6HudSetPick", HudSetPickHook,
+                                     nullptr, nullptr),
+        xe::cpu::Processor::GuestHookKind::kInstruction);
+    XELOGI("XDroid360: AC6 HUD set pick hooks installed");
+  } else {
+    XELOGW("XDroid360: AC6 HUD set pick hooks not installed (code differs)");
+  }
   bool effect = cvars::ac6_effect_mode_fix;
   if (effect && (Load32(membase, kVtblX360 + 4) != kEffDispatcher ||
                  Load32(membase, kVtblAce6 + 4) != kEffDispatcher ||
