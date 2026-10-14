@@ -1,5 +1,6 @@
 package xdroid360.app
 
+import android.view.KeyEvent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
@@ -26,6 +27,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -51,6 +53,22 @@ class InGameState {
   var gpu by mutableStateOf("")
   var thermal by mutableStateOf("")
   var detail by mutableStateOf("")
+
+  // Touch pad and controller.
+  var touchShow by mutableStateOf(true)
+  var touchAutoHide by mutableStateOf(true)
+  var touchHaptics by mutableStateOf(true)
+  var gamepadConnected by mutableStateOf(false)
+  var touchEditing by mutableStateOf(false)
+  var touchSelected by mutableStateOf("")
+  var touchScale by mutableStateOf(1f)
+  var touchSelHidden by mutableStateOf(false)
+  var touchOpacity by mutableStateOf(TouchPadView.DEFAULT_OPACITY)
+  var remapOpen by mutableStateOf(false)
+  // Target being captured: the next controller key is bound to it.
+  var remapTarget by mutableStateOf<Int?>(null)
+  // Android keycode to target (XInput mask, TARGET_LT or TARGET_RT).
+  var remapOverrides by mutableStateOf(mapOf<Int, Int>())
 }
 
 /** Callbacks into GameActivity. */
@@ -60,14 +78,21 @@ class InGameActions(
   val markGlitch: () -> Unit,
   val quit: () -> Unit,
   val persist: () -> Unit,
+  val touch: TouchActions,
 )
 
 @Composable
 fun InGameOverlay(state: InGameState, actions: InGameActions) {
   MaterialThemeOverlay {
+    // The pad hides with a controller (auto mode) and under the menu; edit
+    // mode always shows it.
+    val padVisible = state.touchEditing ||
+      (state.touchShow && !(state.touchAutoHide && state.gamepadConnected) && !state.menuOpen)
+    LaunchedEffect(padVisible, state.touchEditing) { actions.touch.apply(padVisible, state.touchEditing) }
     Box(Modifier.fillMaxSize()) {
+      if (state.touchEditing) TouchEditBar(state, actions, Modifier.align(Alignment.TopCenter))
       // Compact stats (top-left), tap to open the menu.
-      if (state.showStats && !state.menuOpen) {
+      if (state.showStats && !state.menuOpen && !state.touchEditing) {
         Column(
           modifier = Modifier
             .padding(start = 40.dp, top = 8.dp)
@@ -91,7 +116,7 @@ fun InGameOverlay(state: InGameState, actions: InGameActions) {
       }
       // Glitch flag (top-center): tap reports a glitch, hold opens the menu
       // (controllers open it with Select+Start, touch players need a way).
-      if (!state.menuOpen) {
+      if (!state.menuOpen && !state.touchEditing) {
         Text(
           "⚑",
           color = Color(0x88FFFFFF),
@@ -168,6 +193,7 @@ fun InGameOverlay(state: InGameState, actions: InGameActions) {
               steps = 9,
             )
           }
+          if (state.remapOpen) RemapPanel(state, actions) else ControlsSection(state, actions)
           Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(onClick = {
               actions.markGlitch()
@@ -178,7 +204,7 @@ fun InGameOverlay(state: InGameState, actions: InGameActions) {
             Button(onClick = { actions.quit() }) { Text("Exit game") }
           }
           Text(
-            "Select+Start or controller Back: this menu · PS/Home: fast forward · ⚑ top: tap reports a glitch, hold opens this menu · Swipe back: exit to the library",
+            "Select+Start, controller Back or the on-screen ≡: this menu · PS/Home: fast forward · ⚑ top: tap reports a glitch, hold opens this menu · Swipe back: exit to the library",
             style = MaterialTheme.typography.labelSmall,
             color = Color.Gray,
           )
@@ -200,4 +226,143 @@ private fun ToggleRow(label: String, checked: Boolean, onChange: (Boolean) -> Un
 @Composable
 private fun MaterialThemeOverlay(content: @Composable () -> Unit) {
   MaterialTheme(colorScheme = XdColors, content = content)
+}
+
+@Composable
+private fun ControlsSection(state: InGameState, actions: InGameActions) {
+  Column(
+    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF1A1A22)).padding(12.dp),
+    verticalArrangement = Arrangement.spacedBy(6.dp),
+  ) {
+    Text("Controls", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+    Text(
+      if (state.gamepadConnected) "Controller connected" else "No controller connected",
+      style = MaterialTheme.typography.bodySmall,
+      color = Color.Gray,
+    )
+    ToggleRow("Touch controls", state.touchShow) {
+      state.touchShow = it
+      actions.touch.settingsChanged()
+    }
+    ToggleRow("Hide them when a controller is connected", state.touchAutoHide) {
+      state.touchAutoHide = it
+      actions.touch.settingsChanged()
+    }
+    ToggleRow("Vibrate on touch", state.touchHaptics) {
+      state.touchHaptics = it
+      actions.touch.settingsChanged()
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      OutlinedButton(onClick = {
+        state.menuOpen = false
+        state.touchEditing = true
+      }) { Text("Edit touch layout") }
+      OutlinedButton(onClick = { state.remapOpen = true }) { Text("Remap controller") }
+    }
+  }
+}
+
+@Composable
+private fun RemapPanel(state: InGameState, actions: InGameActions) {
+  Column(
+    Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Color(0xFF1A1A22)).padding(12.dp),
+    verticalArrangement = Arrangement.spacedBy(4.dp),
+  ) {
+    Text("Remap controller", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+    Text(
+      "Buttons map automatically to the standard layout. Tap an input, then press the controller button you want for it.",
+      style = MaterialTheme.typography.bodySmall,
+      color = Color.Gray,
+    )
+    for ((name, target) in PAD_TARGETS) {
+      val keys = state.remapOverrides.filterValues { it == target }.keys
+      val binding = when {
+        state.remapTarget == target -> "Press a button…"
+        keys.isEmpty() -> "Automatic"
+        else -> keys.joinToString { KeyEvent.keyCodeToString(it).removePrefix("KEYCODE_") }
+      }
+      Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+          .clickable { state.remapTarget = if (state.remapTarget == target) null else target }
+          .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text(name, modifier = Modifier.weight(1f))
+        Text(
+          binding,
+          fontFamily = FontFamily.Monospace,
+          fontSize = 12.sp,
+          color = if (state.remapTarget == target) Color(0xFF7CFFB2) else Color(0xFFB8B8C8),
+        )
+      }
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      OutlinedButton(onClick = {
+        state.remapTarget = null
+        state.remapOverrides = emptyMap()
+        actions.touch.remapChanged()
+      }) { Text("Reset to automatic") }
+      Spacer(Modifier.weight(1f))
+      Button(onClick = {
+        state.remapTarget = null
+        state.remapOpen = false
+      }) { Text("Done") }
+    }
+  }
+}
+
+@Composable
+private fun TouchEditBar(state: InGameState, actions: InGameActions, modifier: Modifier) {
+  Column(
+    modifier = modifier
+      .padding(top = 8.dp)
+      .widthIn(max = 420.dp)
+      .clip(RoundedCornerShape(16.dp))
+      .background(Color(0xDD101016))
+      .padding(horizontal = 14.dp, vertical = 8.dp),
+  ) {
+    Text(
+      if (state.touchSelected.isEmpty()) "Drag a control to move it, tap it to resize or hide it"
+      else "Selected: ${state.touchSelected}",
+      style = MaterialTheme.typography.bodySmall,
+    )
+    if (state.touchSelected.isNotEmpty()) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Size", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.bodySmall)
+        Slider(
+          value = state.touchScale,
+          onValueChange = {
+            state.touchScale = it
+            actions.touch.setScale(it)
+          },
+          valueRange = TouchPadView.MIN_SCALE..TouchPadView.MAX_SCALE,
+          modifier = Modifier.weight(1f),
+        )
+      }
+      ToggleRow("Hide this control", state.touchSelHidden) {
+        state.touchSelHidden = it
+        actions.touch.setHidden(it)
+      }
+    }
+    Row(verticalAlignment = Alignment.CenterVertically) {
+      Text("Opacity", modifier = Modifier.width(64.dp), style = MaterialTheme.typography.bodySmall)
+      Slider(
+        value = state.touchOpacity,
+        onValueChange = {
+          state.touchOpacity = it
+          actions.touch.setOpacity(it)
+        },
+        valueRange = 0.1f..1f,
+        modifier = Modifier.weight(1f),
+      )
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+      OutlinedButton(onClick = { actions.touch.resetLayout() }) { Text("Reset") }
+      Spacer(Modifier.weight(1f))
+      Button(onClick = {
+        state.touchEditing = false
+        actions.touch.settingsChanged()
+      }) { Text("Done") }
+    }
+  }
 }
