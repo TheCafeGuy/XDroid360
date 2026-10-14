@@ -8,6 +8,7 @@ import android.os.Environment
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
@@ -33,6 +34,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.FilterChip
@@ -542,6 +544,173 @@ class MainActivity : ComponentActivity() {
   }
   private var installProgress by mutableStateOf(0f)
 
+  // ---------------------------------------------------- Saves and settings
+
+  private val dataRoot get() = File(filesDir, "xdroid")
+  private var exportDialog by mutableStateOf(false)
+  private var pendingExport: Pair<Set<String>, Boolean>? = null
+  private var importUri by mutableStateOf<Uri?>(null)
+  private var importContents by mutableStateOf<Backup.Contents?>(null)
+
+  private val exportLauncher =
+    registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+      val (titles, settings) = pendingExport ?: return@registerForActivityResult
+      pendingExport = null
+      if (uri == null) return@registerForActivityResult
+      installExecutor.execute {
+        val msg =
+          try {
+            contentResolver.openOutputStream(uri)?.use { Backup.export(dataRoot, prefs(), it, titles, settings) }
+            "Backup saved"
+          } catch (e: Exception) {
+            "Backup failed: ${e.message}"
+          }
+        runOnUiThread { status = msg }
+      }
+    }
+
+  private val importLauncher =
+    registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+      if (uri == null) return@registerForActivityResult
+      installExecutor.execute {
+        val contents =
+          try {
+            contentResolver.openInputStream(uri)?.use { Backup.inspect(it) }
+          } catch (e: Exception) {
+            null
+          }
+        runOnUiThread {
+          if (contents == null) {
+            status = "Not an XDroid360 backup"
+          } else {
+            importUri = uri
+            importContents = contents
+          }
+        }
+      }
+    }
+
+  private fun runImport(replace: Boolean) {
+    val uri = importUri ?: return
+    importUri = null
+    importContents = null
+    installExecutor.execute {
+      val msg =
+        try {
+          val n = contentResolver.openInputStream(uri)?.use { Backup.import(dataRoot, prefs(), it, replace) } ?: 0
+          "Imported $n files"
+        } catch (e: Exception) {
+          "Import failed: ${e.message}"
+        }
+      runOnUiThread {
+        status = msg
+        settingsRevision++
+      }
+    }
+  }
+
+  @Composable
+  private fun BackupCard() {
+    Card(
+      colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+      modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+    ) {
+      Column(Modifier.padding(12.dp)) {
+        Text("Saves & settings", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        Text(
+          "Back up game saves, emulator settings and controls to a .zip, or restore one.",
+          style = MaterialTheme.typography.bodySmall,
+          color = Color.Gray,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 8.dp)) {
+          OutlinedButton(onClick = { exportDialog = true }) { Text("Export…") }
+          OutlinedButton(onClick = { importLauncher.launch(arrayOf("application/zip", "application/octet-stream")) }) {
+            Text("Import…")
+          }
+        }
+      }
+    }
+    if (exportDialog) ExportDialog()
+    importContents?.let { ImportDialog(it) }
+  }
+
+  @Composable
+  private fun ExportDialog() {
+    val saved = remember { Backup.savedTitles(dataRoot) }
+    val chosen = remember { mutableStateListOf<String>().apply { addAll(saved) } }
+    var settings by remember { mutableStateOf(true) }
+    val names = knownTitles()
+    AlertDialog(
+      onDismissRequest = { exportDialog = false },
+      title = { Text("Export") },
+      text = {
+        Column {
+          CheckRow("Settings and controls", settings) { settings = it }
+          if (saved.isEmpty()) Text("No game saves yet.", color = Color.Gray)
+          for (t in saved) {
+            CheckRow("Saves: ${names[t] ?: t}", t in chosen) { if (it) chosen.add(t) else chosen.remove(t) }
+          }
+        }
+      },
+      confirmButton = {
+        TextButton(
+          enabled = settings || chosen.isNotEmpty(),
+          onClick = {
+            exportDialog = false
+            pendingExport = chosen.toSet() to settings
+            val day = java.time.LocalDate.now()
+            exportLauncher.launch("XDroid360-backup-$day.zip")
+          },
+        ) { Text("Export") }
+      },
+      dismissButton = { TextButton(onClick = { exportDialog = false }) { Text("Cancel") } },
+    )
+  }
+
+  @Composable
+  private fun ImportDialog(c: Backup.Contents) {
+    val names = knownTitles()
+    val parts = c.titles.map { "saves for ${names[it] ?: it}" } + if (c.settings) listOf("settings and controls") else emptyList()
+    val dismiss = {
+      importUri = null
+      importContents = null
+    }
+    AlertDialog(
+      onDismissRequest = dismiss,
+      title = { Text("Import backup") },
+      text = {
+        Text(
+          "This backup has " + parts.joinToString(", ").ifEmpty { "nothing" } + "." +
+            if (c.titles.isNotEmpty()) {
+              "\n\nMerge keeps your other save files and overwrites the ones in the backup. " +
+                "Replace deletes the current saves of those games first."
+            } else {
+              ""
+            },
+        )
+      },
+      confirmButton = {
+        if (c.titles.isNotEmpty()) {
+          Row {
+            TextButton(onClick = { runImport(replace = true) }) { Text("Replace") }
+            TextButton(onClick = { runImport(replace = false) }) { Text("Merge") }
+          }
+        } else {
+          TextButton(onClick = { runImport(replace = false) }) { Text("Import") }
+        }
+      },
+      dismissButton = { TextButton(onClick = dismiss) { Text("Cancel") } },
+    )
+  }
+
+  @Composable
+  private fun CheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { onChange(!checked) }) {
+      Checkbox(checked = checked, onCheckedChange = onChange)
+      Text(label)
+    }
+  }
+
   @Composable
   private fun ContentTab() {
     var picker by remember { mutableStateOf(false) }
@@ -566,6 +735,7 @@ class MainActivity : ComponentActivity() {
     if (installing) {
       LinearProgressIndicator(progress = { installProgress }, modifier = Modifier.fillMaxWidth())
     }
+    BackupCard()
     LazyColumn(modifier = Modifier.fillMaxSize()) {
       if (installLog.isNotEmpty()) {
         item { SectionTitle("Last install") }
