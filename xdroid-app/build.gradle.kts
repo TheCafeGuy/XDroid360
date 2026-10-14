@@ -81,11 +81,11 @@ android {
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "xdroid360"
+        applicationId = "io.github.thecafeguy.xdroid360"
         minSdk = 29
         targetSdk = 35
         versionCode = 1
-        versionName = "0.1-skeleton"
+        versionName = "0.1.0"
     }
 
     compileOptions {

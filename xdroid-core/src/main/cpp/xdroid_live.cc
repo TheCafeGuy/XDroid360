@@ -55,6 +55,8 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_cp_defer_to_swap_us",
     "xdroid_vfetch_reupload_max_kb",
     "xdroid_draw_blackbox",
+    "ac6_hud_slot_join",
+    "ac6_hud_slot_join_us",
     "xdroid_job_tracer",
     "xdroid_audio_conceal",
     "xdroid_audio_worker_nice",
