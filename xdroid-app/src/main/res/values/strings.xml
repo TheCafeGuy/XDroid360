@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_game">Game</string>
+    <string name="done">Done</string>
+    <string name="off">Off</string>
+
+    <!-- Quick menu -->
+    <string name="tab_home">Home</string>
+    <string name="tab_controls">Controls</string>
+    <string name="tab_graphics">Graphics &amp; performance</string>
+    <string name="tab_diag">Diagnostics</string>
+    <string name="resume">Resume</string>
+    <string name="report_glitch">Report glitch</string>
+    <string name="exit_game">Exit game</string>
+    <string name="exit_title">Exit game?</string>
+    <string name="exit_message">Progress since the last save will be lost.</string>
+    <string name="exit_confirm">Exit</string>
+    <string name="exit_cancel">Keep playing</string>
+    <string name="perf_title">Performance</string>
+    <string name="stats_overlay">Show stats overlay</string>
+    <string name="detailed_stats">Detailed stats</string>
+    <string name="fast_forward">Fast forward</string>
+    <string name="hint_fast_forward">Also on the on-screen ▶▶ button (hidden by default; show it in the layout editor).</string>
+    <string name="tone_mapping">AMOLED tone mapping</string>
+    <string name="hint_tone">Softens highlights that burn out on OLED (snow, sky, white HUD).</string>
+    <string name="opt_debug">Input values on screen</string>
+    <string name="hint_debug">Stick, trigger and button values and touch-to-send latency.</string>
+    <string name="opt_menu_pause">Pause while this menu is open</string>
+    <string name="hint_menu_pause">The game stops behind the menu and resumes when it closes.</string>
+    <string name="diag_info">Version %1$s · title %2$s</string>
+    <string name="menu_help">Open this menu: on-screen ≡, controller Home/Guide, Back or Select+Start, or hold ⚑. In the menu: D-pad moves, A picks, B goes back, LB/RB switch tabs. Swipe back: exit to the library.</string>
+
+    <!-- Controls -->
+    <string name="sec_touch">Touch controls</string>
+    <string name="sec_sticks">Sticks</string>
+    <string name="sec_buttons">Buttons and triggers</string>
+    <string name="sec_layout">Layout</string>
+    <string name="sec_controller">Controller</string>
+    <string name="pad_connected">Controller connected</string>
+    <string name="pad_none">No controller connected</string>
+    <string name="opt_show">Touch controls</string>
+    <string name="opt_autohide">Hide them while a controller is connected</string>
+    <string name="opt_opacity">Opacity</string>
+    <string name="opt_haptics">Vibrate on touch</string>
+    <string name="hint_haptics">Works even with the system touch vibration off.</string>
+    <string name="opt_haptic_strength">Vibration strength</string>
+    <string name="opt_auto_dim">Fade when idle</string>
+    <string name="hint_auto_dim">Controls fade to 20 % when untouched; a touch brings them back.</string>
+    <string name="opt_auto_dim_seconds">Fade after</string>
+    <string name="opt_edge_margin">Edge margin (curved screens)</string>
+    <string name="opt_palm">Ignore palm touches</string>
+    <string name="opt_low_latency">Low-latency touch</string>
+    <string name="hint_low_latency">Touches reach the game without waiting for the next screen refresh.</string>
+    <string name="opt_deadzone">Dead zone</string>
+    <string name="opt_anti_deadzone">Anti-dead zone</string>
+    <string name="hint_anti_deadzone">Xbox 360 games ignore small stick moves; this starts the output past that zone so fine moves respond at once.</string>
+    <string name="opt_curve">Response curve</string>
+    <string name="curve_linear">Linear</string>
+    <string name="curve_exp">Exponential</string>
+    <string name="opt_sensitivity">Sensitivity</string>
+    <string name="opt_floating">Floating left stick</string>
+    <string name="hint_floating">Touch anywhere on the left third to place the stick under your thumb.</string>
+    <string name="opt_follow">Stick follows the thumb</string>
+    <string name="hint_follow">Past the ring the stick center moves with your thumb.</string>
+    <string name="opt_double_tap">Double tap a stick to click it (L3/R3)</string>
+    <string name="hint_double_tap">Only for two taps on the same spot. L3/R3 buttons can also be shown in the editor.</string>
+    <string name="opt_analog_triggers">Analog triggers</string>
+    <string name="hint_analog_triggers">Lower on the trigger = pulled further.</string>
+    <string name="opt_slide">Slide between buttons</string>
+    <string name="hint_slide">A finger can move from one button to the next without lifting.</string>
+    <string name="opt_guide_long">Hold ≡ to open the menu</string>
+    <string name="hint_guide_long">Off: the menu opens when you lift your finger on ≡.</string>
+    <string name="opt_preset">Screen preset</string>
+    <string name="preset_auto">Auto</string>
+    <string name="preset_phone20">Phone 20:9</string>
+    <string name="preset_phone16">Phone 16:9</string>
+    <string name="preset_tablet">Tablet</string>
+    <string name="preset_fold">Foldable</string>
+    <string name="opt_mirror">Left-handed</string>
+    <string name="hint_mirror">Swaps the sticks, the D-pad and A B X Y between sides.</string>
+    <string name="opt_per_game">Separate layout per game</string>
+    <string name="hint_per_game">Each game keeps its own layout; new games start from the shared one.</string>
+    <string name="opt_grid">Snap to grid in the editor</string>
+    <string name="edit_layout">Edit touch layout</string>
+    <string name="hint_remap">Controllers map automatically to the Xbox 360 layout. You can reassign any button.</string>
+    <string name="remap">Remap controller</string>
+    <string name="remap_how">Tap an input, then press the controller button you want for it.</string>
+    <string name="remap_press">Press a button…</string>
+    <string name="remap_auto">Automatic</string>
+    <string name="remap_reset">Reset to automatic</string>
+
+    <!-- Layout editor -->
+    <string name="edit_hint">Drag to move, pinch to resize, tap to select</string>
+    <string name="edit_selected">Selected: %1$s</string>
+    <string name="edit_testing">Test: play with this layout; values show on screen</string>
+    <string name="edit_size">Size</string>
+    <string name="edit_opacity">Opacity</string>
+    <string name="edit_hide">Hide this control</string>
+    <string name="edit_undo">Undo</string>
+    <string name="edit_reset">Reset</string>
+    <string name="edit_test">Test</string>
+    <string name="edit_back">Edit</string>
+    <string name="editor_title">Touch layout</string>
+
+    <!-- Control names -->
+    <string name="ctl_ls">Left stick</string>
+    <string name="ctl_rs">Right stick</string>
+    <string name="ctl_dpad">D-pad</string>
+    <string name="ctl_face">A B X Y</string>
+    <string name="ctl_lt">LT</string>
+    <string name="ctl_lb">LB</string>
+    <string name="ctl_rb">RB</string>
+    <string name="ctl_rt">RT</string>
+    <string name="ctl_back">Back</string>
+    <string name="ctl_guide">Guide (menu)</string>
+    <string name="ctl_start">Start</string>
+    <string name="ctl_l3">L3 (left stick click)</string>
+    <string name="ctl_r3">R3 (right stick click)</string>
+    <string name="ctl_ff">Fast forward</string>
+    <string name="opt_show_ff">Show the fast-forward button</string>
+    <string name="hint_show_ff">An on-screen ▶▶ button, lit while fast forward is on.</string>
+    <string name="opt_ff_mode">Fast-forward button</string>
+    <string name="ff_toggle">Tap toggles</string>
+    <string name="ff_hold">Hold</string>
+    <string name="game_touch_layout">Touch layout for this game</string>
+</resources>
