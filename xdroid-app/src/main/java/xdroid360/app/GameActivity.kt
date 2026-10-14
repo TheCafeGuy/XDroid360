@@ -3,6 +3,7 @@ package xdroid360.app
 import android.app.AlertDialog
 import android.content.ComponentCallbacks2
 import android.content.Intent
+import android.hardware.input.InputManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
@@ -32,8 +33,9 @@ import xdroid360.core.Bridge
 
 /**
  * Fullscreen landscape game session. Boots the game path on creation,
- * forwards controller input with the fixed standard mapping and hosts the
- * quick menu (Back or Select+Start); quitting is a menu action.
+ * forwards controller input (standard mapping plus the user's remap), shows
+ * the touch pad when no controller is connected and hosts the quick menu
+ * (Back, Select+Start or the on-screen Guide); quitting is a menu action.
  *
  * Threads: UI for boot, surface and teardown (the native context needs its
  * looper); one executor for pause, resume and trim, so they apply in order;
@@ -52,6 +54,53 @@ class GameActivity : ComponentActivity() {
   @Volatile private var confirmingExit = false
 
   private val menuState = InGameState()
+  private lateinit var touchPad: TouchPadView
+  private val touchActions =
+    object : TouchActions {
+      override fun settingsChanged() {
+        touchPad.haptics = menuState.touchHaptics
+        persistTouch()
+      }
+
+      override fun apply(visible: Boolean, editing: Boolean) {
+        touchPad.editing = editing
+        if (!visible) touchPad.releaseAll()
+        touchPad.visibility = if (visible) View.VISIBLE else View.GONE
+      }
+
+      override fun setScale(scale: Float) = touchPad.setSelectedScale(scale)
+
+      override fun setOpacity(opacity: Float) {
+        touchPad.opacity = opacity
+      }
+
+      override fun setHidden(hidden: Boolean) = touchPad.setSelectedHidden(hidden)
+
+      override fun resetLayout() {
+        touchPad.resetLayout()
+        menuState.touchOpacity = touchPad.opacity
+      }
+
+      override fun remapChanged() = persistRemap()
+    }
+  private val padSink =
+    object : PadSink {
+      override fun button(mask: Int, down: Boolean) = Bridge.gamepadButton(mask, down)
+
+      override fun axis(axis: Int, value: Float) = sendAxis(axis, value)
+
+      override fun guide() {
+        if (!menuState.menuOpen) toggleMenu()
+      }
+    }
+  private val deviceListener =
+    object : InputManager.InputDeviceListener {
+      override fun onInputDeviceAdded(deviceId: Int) = refreshGamepads()
+
+      override fun onInputDeviceRemoved(deviceId: Int) = refreshGamepads()
+
+      override fun onInputDeviceChanged(deviceId: Int) = refreshGamepads()
+    }
   private val menuActions =
     InGameActions(
       setFastForward = { setFastForward(it) },
@@ -59,6 +108,7 @@ class GameActivity : ComponentActivity() {
       markGlitch = { markGlitch() },
       quit = { quitGame() },
       persist = { persistMenuPrefs() },
+      touch = touchActions,
     )
 
   private val lifecycleExecutor = Executors.newSingleThreadExecutor()
@@ -119,6 +169,14 @@ class GameActivity : ComponentActivity() {
         }
       }
     root.addView(surfaceView, matchParent())
+    // Under the overlay: the stats box and the flag keep their touches.
+    touchPad =
+      TouchPadView(this, padSink) { c ->
+        menuState.touchSelected = c?.label.orEmpty()
+        menuState.touchScale = c?.scale ?: 1f
+        menuState.touchSelHidden = c?.visible == false
+      }
+    root.addView(touchPad, matchParent())
     statusView =
       TextView(this).also {
         it.setTextColor(0xFFFFFFFF.toInt())
@@ -140,6 +198,9 @@ class GameActivity : ComponentActivity() {
     menuState.detailedStats = prefs.getBoolean("ingame_detailed_stats", false)
     menuState.toneStrength = prefs.getFloat("tone_strength", 0f)
     Bridge.setToneStrength(menuState.toneStrength)
+    loadTouchPrefs(prefs)
+    getSystemService(InputManager::class.java).registerInputDeviceListener(deviceListener, null)
+    refreshGamepads()
     root.addView(
       ComposeView(this).also { it.setContent { InGameOverlay(menuState, menuActions) } },
       matchParent(),
@@ -207,6 +268,7 @@ class GameActivity : ComponentActivity() {
   }
 
   override fun onDestroy() {
+    getSystemService(InputManager::class.java).unregisterInputDeviceListener(deviceListener)
     sampler.removeCallbacks(tick)
     if (booted) {
       // The native teardown ends the process (see endSession).
@@ -226,7 +288,14 @@ class GameActivity : ComponentActivity() {
   @Suppress("MissingSuperCall")
   @Deprecated("Back closes the menu or asks to leave the game")
   override fun onBackPressed() {
-    if (menuState.menuOpen) toggleMenu() else confirmExit()
+    when {
+      menuState.touchEditing -> {
+        menuState.touchEditing = false
+        touchActions.settingsChanged()
+      }
+      menuState.menuOpen -> toggleMenu()
+      else -> confirmExit()
+    }
   }
 
   private fun confirmExit() {
@@ -518,7 +587,10 @@ class GameActivity : ComponentActivity() {
 
   private fun toggleMenu() {
     menuState.menuOpen = !menuState.menuOpen
-    if (!menuState.menuOpen) persistMenuPrefs()
+    if (!menuState.menuOpen) {
+      menuState.remapTarget = null
+      persistMenuPrefs()
+    }
   }
 
   private fun setFastForward(on: Boolean) {
@@ -562,11 +634,26 @@ class GameActivity : ComponentActivity() {
       .apply()
   }
 
-  // ---- Controller input: fixed standard map, applied automatically. ----
+  // ---- Controller input: standard map, then the user's remap on top. ----
 
   override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
     if (event.device?.isGamepad != true) return super.onKeyDown(keyCode, event)
     val first = event.repeatCount == 0
+    // Some controllers connect before their device reports gamepad sources.
+    if (!menuState.gamepadConnected) menuState.gamepadConnected = true
+    menuState.remapTarget?.let { target ->
+      if (first) {
+        menuState.remapOverrides =
+          menuState.remapOverrides.filterValues { it != target } + (keyCode to target)
+        menuState.remapTarget = null
+        persistRemap()
+      }
+      return true
+    }
+    menuState.remapOverrides[keyCode]?.let {
+      sendTarget(it, true)
+      return true
+    }
     when (keyCode) {
       // PS / Home: fast forward toggle.
       KeyEvent.KEYCODE_BUTTON_MODE -> if (first) setFastForward(!menuState.fastForward)
@@ -591,6 +678,10 @@ class GameActivity : ComponentActivity() {
 
   override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
     if (event.device?.isGamepad != true) return super.onKeyUp(keyCode, event)
+    menuState.remapOverrides[keyCode]?.let {
+      sendTarget(it, false)
+      return true
+    }
     when (keyCode) {
       KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_BACK -> {}
       KeyEvent.KEYCODE_BUTTON_L2 -> sendAxis(AXIS_LT, 0f)
@@ -628,6 +719,56 @@ class GameActivity : ComponentActivity() {
     if (hatDown[index] == down) return
     hatDown[index] = down
     Bridge.gamepadButton(1 shl index, down)
+  }
+
+  private fun sendTarget(target: Int, down: Boolean) {
+    when (target) {
+      TARGET_LT -> sendAxis(AXIS_LT, if (down) 1f else 0f)
+      TARGET_RT -> sendAxis(AXIS_RT, if (down) 1f else 0f)
+      else -> Bridge.gamepadButton(target, down)
+    }
+  }
+
+  // Auto-hide for the touch pad: any physical gamepad or joystick counts.
+  private fun refreshGamepads() {
+    menuState.gamepadConnected =
+      InputDevice.getDeviceIds().any { id ->
+        InputDevice.getDevice(id)?.let { !it.isVirtual && it.isGamepad } == true
+      }
+  }
+
+  private fun loadTouchPrefs(prefs: android.content.SharedPreferences) {
+    menuState.touchShow = prefs.getBoolean("touch_show", true)
+    menuState.touchAutoHide = prefs.getBoolean("touch_autohide", true)
+    menuState.touchHaptics = prefs.getBoolean("touch_haptics", true)
+    menuState.touchOpacity = prefs.getFloat("touch_opacity", TouchPadView.DEFAULT_OPACITY)
+    touchPad.haptics = menuState.touchHaptics
+    touchPad.opacity = menuState.touchOpacity
+    touchPad.loadJson(prefs.getString("touch_layout", null))
+    // "keycode:target" pairs.
+    menuState.remapOverrides =
+      prefs.getString("pad_remap", "").orEmpty().split(',').mapNotNull {
+        val kv = it.split(':')
+        val k = kv.getOrNull(0)?.toIntOrNull()
+        val v = kv.getOrNull(1)?.toIntOrNull()
+        if (k != null && v != null) k to v else null
+      }.toMap()
+  }
+
+  private fun persistTouch() {
+    prefs().edit()
+      .putBoolean("touch_show", menuState.touchShow)
+      .putBoolean("touch_autohide", menuState.touchAutoHide)
+      .putBoolean("touch_haptics", menuState.touchHaptics)
+      .putFloat("touch_opacity", menuState.touchOpacity)
+      .putString("touch_layout", touchPad.toJson())
+      .apply()
+  }
+
+  private fun persistRemap() {
+    prefs().edit()
+      .putString("pad_remap", menuState.remapOverrides.entries.joinToString(",") { "${it.key}:${it.value}" })
+      .apply()
   }
 
   private fun sendAxis(axis: Int, value: Float) {
