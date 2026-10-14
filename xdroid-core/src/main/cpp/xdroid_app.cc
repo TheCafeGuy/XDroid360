@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "xdroid_ac6_fixes.h"
+#include "xdroid_defaults.h"
 #include "xdroid_audio.h"
 #include "xdroid_build_id.h"
 #include "xdroid_content.h"
@@ -155,6 +156,7 @@ bool XDroidApp::OnInitialize() {
   std::filesystem::create_directories(cache_root, error);
 
   config::SetupConfig(storage_root);
+  ApplyTestedDefaults();
   StartLiveConfig(storage_root / "live.toml");
   SelectVulkanDriver(params_.driver_path, params_.native_lib_dir,
                      (storage_root / "tu_debug.txt").string());
