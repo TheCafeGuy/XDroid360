@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_game">Juego</string>
+    <string name="done">Listo</string>
+    <string name="off">Apagado</string>
+
+    <!-- Menú rápido -->
+    <string name="tab_home">Inicio</string>
+    <string name="tab_controls">Controles</string>
+    <string name="tab_graphics">Gráficos y rendimiento</string>
+    <string name="tab_diag">Diagnóstico</string>
+    <string name="resume">Reanudar</string>
+    <string name="report_glitch">Reportar glitch</string>
+    <string name="exit_game">Salir del juego</string>
+    <string name="exit_title">¿Salir del juego?</string>
+    <string name="exit_message">Se pierde el progreso desde el último guardado.</string>
+    <string name="exit_confirm">Salir</string>
+    <string name="exit_cancel">Seguir jugando</string>
+    <string name="perf_title">Rendimiento</string>
+    <string name="stats_overlay">Mostrar estadísticas</string>
+    <string name="detailed_stats">Estadísticas detalladas</string>
+    <string name="fast_forward">Avance rápido</string>
+    <string name="hint_fast_forward">También con el botón ▶▶ en pantalla (oculto por defecto; se muestra desde el editor).</string>
+    <string name="tone_mapping">Tone mapping AMOLED</string>
+    <string name="hint_tone">Suaviza los blancos que se queman en OLED (nieve, cielo, HUD blanco).</string>
+    <string name="opt_debug">Valores de entrada en pantalla</string>
+    <string name="hint_debug">Valores de sticks, gatillos y botones, y latencia del toque al envío.</string>
+    <string name="opt_menu_pause">Pausar con este menú abierto</string>
+    <string name="hint_menu_pause">El juego se detiene detrás del menú y sigue al cerrarlo.</string>
+    <string name="diag_info">Versión %1$s · título %2$s</string>
+    <string name="menu_help">Abrir este menú: ≡ en pantalla, Home/Guía, Back o Select+Start del control, o mantener ⚑. En el menú: la cruceta mueve, A elige, B vuelve, LB/RB cambian de pestaña. Gesto atrás: volver a la biblioteca.</string>
+
+    <!-- Controles -->
+    <string name="sec_touch">Controles táctiles</string>
+    <string name="sec_sticks">Sticks</string>
+    <string name="sec_buttons">Botones y gatillos</string>
+    <string name="sec_layout">Diseño</string>
+    <string name="sec_controller">Control físico</string>
+    <string name="pad_connected">Control conectado</string>
+    <string name="pad_none">No hay control conectado</string>
+    <string name="opt_show">Controles táctiles</string>
+    <string name="opt_autohide">Ocultarlos con un control conectado</string>
+    <string name="opt_opacity">Opacidad</string>
+    <string name="opt_haptics">Vibrar al tocar</string>
+    <string name="hint_haptics">Funciona aunque la vibración al tocar del sistema esté apagada.</string>
+    <string name="opt_haptic_strength">Intensidad de vibración</string>
+    <string name="opt_auto_dim">Atenuar sin uso</string>
+    <string name="hint_auto_dim">Los controles bajan al 20 % si no los tocas; vuelven al tocar.</string>
+    <string name="opt_auto_dim_seconds">Atenuar después de</string>
+    <string name="opt_edge_margin">Margen lateral (pantallas curvas)</string>
+    <string name="opt_palm">Ignorar la palma</string>
+    <string name="opt_low_latency">Toque de baja latencia</string>
+    <string name="hint_low_latency">Los toques llegan al juego sin esperar el siguiente refresco de pantalla.</string>
+    <string name="opt_deadzone">Zona muerta</string>
+    <string name="opt_anti_deadzone">Anti-zona muerta</string>
+    <string name="hint_anti_deadzone">Los juegos de 360 ignoran movimientos chicos del stick; esto arranca la salida pasada esa zona y el movimiento fino responde al instante.</string>
+    <string name="opt_curve">Curva de respuesta</string>
+    <string name="curve_linear">Lineal</string>
+    <string name="curve_exp">Exponencial</string>
+    <string name="opt_sensitivity">Sensibilidad</string>
+    <string name="opt_floating">Stick izquierdo flotante</string>
+    <string name="hint_floating">Toca en cualquier lugar del tercio izquierdo y el stick aparece bajo tu pulgar.</string>
+    <string name="opt_follow">El stick sigue al pulgar</string>
+    <string name="hint_follow">Si pasas el aro, el centro del stick se mueve con tu pulgar.</string>
+    <string name="opt_double_tap">Doble toque en un stick para clic (L3/R3)</string>
+    <string name="hint_double_tap">Solo con dos toques en el mismo lugar. Los botones L3/R3 también se pueden mostrar desde el editor.</string>
+    <string name="opt_analog_triggers">Gatillos analógicos</string>
+    <string name="hint_analog_triggers">Más abajo en el gatillo = más apretado.</string>
+    <string name="opt_slide">Deslizar entre botones</string>
+    <string name="hint_slide">El dedo pasa de un botón al siguiente sin levantarlo.</string>
+    <string name="opt_guide_long">Mantener ≡ para abrir el menú</string>
+    <string name="hint_guide_long">Apagado: el menú se abre al soltar el dedo sobre ≡.</string>
+    <string name="opt_preset">Preset de pantalla</string>
+    <string name="preset_auto">Auto</string>
+    <string name="preset_phone20">Teléfono 20:9</string>
+    <string name="preset_phone16">Teléfono 16:9</string>
+    <string name="preset_tablet">Tablet</string>
+    <string name="preset_fold">Plegable</string>
+    <string name="opt_mirror">Zurdo</string>
+    <string name="hint_mirror">Intercambia de lado los sticks, la cruceta y A B X Y.</string>
+    <string name="opt_per_game">Diseño propio por juego</string>
+    <string name="hint_per_game">Cada juego guarda su diseño; los juegos nuevos parten del compartido.</string>
+    <string name="opt_grid">Ajustar a grilla en el editor</string>
+    <string name="edit_layout">Editar controles táctiles</string>
+    <string name="hint_remap">Los controles se mapean solos al diseño de Xbox 360. Puedes reasignar cualquier botón.</string>
+    <string name="remap">Remapear control</string>
+    <string name="remap_how">Toca una entrada y luego presiona el botón del control que quieras para ella.</string>
+    <string name="remap_press">Presiona un botón…</string>
+    <string name="remap_auto">Automático</string>
+    <string name="remap_reset">Volver a automático</string>
+
+    <!-- Editor de diseño -->
+    <string name="edit_hint">Arrastra para mover, pellizca para escalar, toca para elegir</string>
+    <string name="edit_selected">Elegido: %1$s</string>
+    <string name="edit_testing">Prueba: juega con este diseño; los valores se ven en pantalla</string>
+    <string name="edit_size">Tamaño</string>
+    <string name="edit_opacity">Opacidad</string>
+    <string name="edit_hide">Ocultar este control</string>
+    <string name="edit_undo">Deshacer</string>
+    <string name="edit_reset">Restaurar</string>
+    <string name="edit_test">Probar</string>
+    <string name="edit_back">Editar</string>
+    <string name="editor_title">Diseño táctil</string>
+
+    <!-- Nombres de controles -->
+    <string name="ctl_ls">Stick izquierdo</string>
+    <string name="ctl_rs">Stick derecho</string>
+    <string name="ctl_dpad">Cruceta</string>
+    <string name="ctl_face">A B X Y</string>
+    <string name="ctl_lt">LT</string>
+    <string name="ctl_lb">LB</string>
+    <string name="ctl_rb">RB</string>
+    <string name="ctl_rt">RT</string>
+    <string name="ctl_back">Back</string>
+    <string name="ctl_guide">Guía (menú)</string>
+    <string name="ctl_start">Start</string>
+    <string name="ctl_l3">L3 (clic stick izquierdo)</string>
+    <string name="ctl_r3">R3 (clic stick derecho)</string>
+    <string name="ctl_ff">Avance rápido</string>
+    <string name="opt_show_ff">Mostrar el botón de avance rápido</string>
+    <string name="hint_show_ff">Un botón ▶▶ en pantalla, iluminado mientras el avance rápido está activo.</string>
+    <string name="opt_ff_mode">Botón de avance rápido</string>
+    <string name="ff_toggle">Tocar alterna</string>
+    <string name="ff_hold">Mantener</string>
+    <string name="game_touch_layout">Diseño táctil de este juego</string>
+</resources>

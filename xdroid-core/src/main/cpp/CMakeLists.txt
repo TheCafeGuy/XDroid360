@@ -83,6 +83,7 @@ add_library(xdroid360 SHARED
   xdroid_app.cc
   xdroid_audio_driver.cc
   xdroid_content.cc
+  xdroid_defaults.cc
   xdroid_driver.cc
   xdroid_gamepad.cc
   xdroid_jni.cc

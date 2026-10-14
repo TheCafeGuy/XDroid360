@@ -25,6 +25,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -73,6 +75,7 @@ import xdroid360.core.Bridge
 private enum class Tab(val label: String, val icon: String) {
   Games("Games", "🎮"),
   Settings("Settings", "⚙"),
+  Controls("Controls", "🕹"),
   Content("DLC", "📦"),
   Driver("Driver", "🧩"),
   About("About", "ℹ"),
@@ -158,6 +161,7 @@ class MainActivity : ComponentActivity() {
             when (tab) {
               Tab.Games -> GamesTab()
               Tab.Settings -> SettingsTab()
+              Tab.Controls -> ControlsTab()
               Tab.Content -> ContentTab()
               Tab.Driver -> DriverTab()
               Tab.About -> AboutTab()
@@ -355,6 +359,17 @@ class MainActivity : ComponentActivity() {
               onClick = { menuFor = null; settingsScope = title; tab = Tab.Settings },
             ) { Text("Game settings") }
             OutlinedButton(
+              enabled = title != null,
+              modifier = Modifier.fillMaxWidth(),
+              onClick = {
+                menuFor = null
+                startActivity(
+                  Intent(this@MainActivity, TouchEditorActivity::class.java)
+                    .putExtra(TouchEditorActivity.EXTRA_TITLE_ID, title),
+                )
+              },
+            ) { Text(getString(R.string.game_touch_layout)) }
+            OutlinedButton(
               modifier = Modifier.fillMaxWidth(),
               onClick = { menuFor = null; tab = Tab.Content },
             ) { Text("Install DLC / updates") }
@@ -529,6 +544,57 @@ class MainActivity : ComponentActivity() {
       status = "Could not save ${def.title}: ${e.message}"
     }
     settingsRevision++
+  }
+
+  // ---------------------------------------------------------------- Controls
+
+  private val controlSettings by lazy { ControlSettings().also { it.load(prefs()) } }
+  private val remapState = RemapState()
+  private var gamepadConnected by mutableStateOf(false)
+
+  private val controlsHost =
+    object : ControlsHost {
+      override fun changed() = controlSettings.save(prefs())
+
+      // The shared layout goes back to the new preset (per-game ones stay).
+      override fun presetChanged() {
+        controlSettings.save(prefs())
+        controlSettings.clearLayout(prefs(), null)
+      }
+
+      override fun editLayout() {
+        startActivity(Intent(this@MainActivity, TouchEditorActivity::class.java))
+      }
+    }
+
+  @Composable
+  private fun ControlsTab() {
+    gamepadConnected =
+      android.view.InputDevice.getDeviceIds().any { id ->
+        android.view.InputDevice.getDevice(id)?.let { d ->
+          !d.isVirtual && (d.sources and android.view.InputDevice.SOURCE_GAMEPAD == android.view.InputDevice.SOURCE_GAMEPAD ||
+            d.sources and android.view.InputDevice.SOURCE_JOYSTICK == android.view.InputDevice.SOURCE_JOYSTICK)
+        } == true
+      }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 12.dp)) {
+      ControlsSettingsPanel(controlSettings, controlsHost, remapState, gamepadConnected)
+    }
+  }
+
+  // A pending remap takes the next controller key.
+  override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+    val src = event.device?.sources ?: 0
+    val pad = src and android.view.InputDevice.SOURCE_GAMEPAD == android.view.InputDevice.SOURCE_GAMEPAD ||
+      src and android.view.InputDevice.SOURCE_JOYSTICK == android.view.InputDevice.SOURCE_JOYSTICK
+    if (pad && remapState.target != null) {
+      if (event.action == android.view.KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+        captureRemap(controlSettings, remapState, event.keyCode)
+      ) {
+        controlSettings.save(prefs())
+      }
+      return true
+    }
+    return super.dispatchKeyEvent(event)
   }
 
   // ------------------------------------------------------------- DLC content

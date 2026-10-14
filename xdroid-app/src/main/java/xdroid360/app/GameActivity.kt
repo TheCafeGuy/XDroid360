@@ -54,34 +54,90 @@ class GameActivity : ComponentActivity() {
   @Volatile private var confirmingExit = false
 
   private val menuState = InGameState()
+  private val settings = ControlSettings()
+  private val remapState = RemapState()
+  private val editorState = EditorState()
   private lateinit var touchPad: TouchPadView
-  private val touchActions =
-    object : TouchActions {
-      override fun settingsChanged() {
-        touchPad.haptics = menuState.touchHaptics
-        persistTouch()
-      }
+  // Title ID for the per-game layout: from an earlier boot, or this one.
+  private var layoutTitle: String? = null
+  private var menuWasOpen = false
+  // The quick menu paused the game (menu_pause); resume only on close.
+  @Volatile private var menuPaused = false
+  // Sampler thread only.
+  private var playSeconds = 0L
 
-      override fun apply(visible: Boolean, editing: Boolean) {
-        touchPad.editing = editing
-        if (!visible) touchPad.releaseAll()
-        touchPad.visibility = if (visible) View.VISIBLE else View.GONE
+  private val editorActions =
+    object : EditorActions {
+      override fun beginEdit() {
+        touchPad.beginEdit()
+        editorState.canUndo = true
       }
 
       override fun setScale(scale: Float) = touchPad.setSelectedScale(scale)
 
-      override fun setOpacity(opacity: Float) {
-        touchPad.opacity = opacity
-      }
-
       override fun setHidden(hidden: Boolean) = touchPad.setSelectedHidden(hidden)
 
-      override fun resetLayout() {
-        touchPad.resetLayout()
-        menuState.touchOpacity = touchPad.opacity
+      override fun setAlpha(alpha: Float) = touchPad.setSelectedAlpha(alpha)
+
+      override fun undo() = touchPad.undo()
+
+      override fun reset() = touchPad.resetLayout()
+
+      // Test: input goes to the game inside the editor, values on screen.
+      override fun test(on: Boolean) {
+        touchPad.editing = !on
+        touchPad.testMode = on
       }
 
-      override fun remapChanged() = persistRemap()
+      override fun done() {
+        touchPad.testMode = false
+        editorState.testing = false
+        menuState.touchEditing = false
+        settings.save(prefs())
+        settings.saveLayout(prefs(), layoutTitle, touchPad.layoutJson())
+      }
+    }
+
+  private val host =
+    object : InGameHost {
+      override val settings get() = this@GameActivity.settings
+      override val remap get() = remapState
+      override val editorState get() = this@GameActivity.editorState
+      override val editor get() = editorActions
+
+      override fun changed() {
+        this@GameActivity.settings.save(prefs())
+        touchPad.settingsChanged()
+      }
+
+      override fun presetChanged() {
+        this@GameActivity.settings.save(prefs())
+        touchPad.resetLayout()
+        this@GameActivity.settings.saveLayout(prefs(), layoutTitle, touchPad.layoutJson())
+      }
+
+      override fun editLayout() {
+        menuState.menuOpen = false
+        menuState.touchEditing = true
+      }
+
+      override fun setFastForward(on: Boolean) = this@GameActivity.setFastForward(on)
+
+      override fun setTone(strength: Float) = Bridge.setToneStrength(strength)
+
+      override fun markGlitch() = this@GameActivity.markGlitch()
+
+      override fun quit() = confirmExit()
+
+      override fun persist() = persistMenuPrefs()
+
+      override fun menuChanged(open: Boolean) = onMenuChanged(open)
+
+      override fun applyPad(visible: Boolean, editing: Boolean) {
+        touchPad.editing = editing
+        if (!visible) touchPad.releaseAll()
+        touchPad.visibility = if (visible) View.VISIBLE else View.GONE
+      }
     }
   private val padSink =
     object : PadSink {
@@ -90,8 +146,10 @@ class GameActivity : ComponentActivity() {
       override fun axis(axis: Int, value: Float) = sendAxis(axis, value)
 
       override fun guide() {
-        if (!menuState.menuOpen) toggleMenu()
+        menuState.menuOpen = true
       }
+
+      override fun setFastForward(on: Boolean) = this@GameActivity.setFastForward(on)
     }
   private val deviceListener =
     object : InputManager.InputDeviceListener {
@@ -101,16 +159,6 @@ class GameActivity : ComponentActivity() {
 
       override fun onInputDeviceChanged(deviceId: Int) = refreshGamepads()
     }
-  private val menuActions =
-    InGameActions(
-      setFastForward = { setFastForward(it) },
-      setTone = { Bridge.setToneStrength(it) },
-      markGlitch = { markGlitch() },
-      quit = { quitGame() },
-      persist = { persistMenuPrefs() },
-      touch = touchActions,
-    )
-
   private val lifecycleExecutor = Executors.newSingleThreadExecutor()
   private val samplerThread = HandlerThread("xdroid-sampler").apply { start() }
   private val sampler = Handler(samplerThread.looper)
@@ -171,11 +219,13 @@ class GameActivity : ComponentActivity() {
     root.addView(surfaceView, matchParent())
     // Under the overlay: the stats box and the flag keep their touches.
     touchPad =
-      TouchPadView(this, padSink) { c ->
-        menuState.touchSelected = c?.label.orEmpty()
-        menuState.touchScale = c?.scale ?: 1f
-        menuState.touchSelHidden = c?.visible == false
+      TouchPadView(this, settings, padSink) { c ->
+        editorState.selectedId = c?.id.orEmpty()
+        editorState.scale = c?.scale ?: 1f
+        editorState.hidden = c != null && touchPad.hidden(c)
+        editorState.alpha = c?.alpha ?: 1f
       }
+    touchPad.onEdited = { editorState.canUndo = touchPad.canUndo }
     root.addView(touchPad, matchParent())
     statusView =
       TextView(this).also {
@@ -198,16 +248,23 @@ class GameActivity : ComponentActivity() {
     menuState.detailedStats = prefs.getBoolean("ingame_detailed_stats", false)
     menuState.toneStrength = prefs.getFloat("tone_strength", 0f)
     Bridge.setToneStrength(menuState.toneStrength)
-    loadTouchPrefs(prefs)
+    settings.load(prefs)
+    menuState.version =
+      runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull().orEmpty()
     getSystemService(InputManager::class.java).registerInputDeviceListener(deviceListener, null)
     refreshGamepads()
     root.addView(
-      ComposeView(this).also { it.setContent { InGameOverlay(menuState, menuActions) } },
+      ComposeView(this).also { it.setContent { InGameOverlay(menuState, host) } },
       matchParent(),
     )
     setContentView(root)
 
     gamePath = intent.getStringExtra(EXTRA_GAME_PATH).orEmpty()
+    menuState.gameName = File(gamePath).nameWithoutExtension.substringBefore(" (").trim()
+    layoutTitle = prefs.getString("title_$gamePath", null)
+    menuState.titleId = layoutTitle.orEmpty()
+    touchPad.setLayout(settings.loadLayout(prefs, layoutTitle))
+    touchPad.settingsChanged()
     if (gamePath.isEmpty()) {
       setStatus("no game path")
       return
@@ -237,7 +294,7 @@ class GameActivity : ComponentActivity() {
     SessionReports.setState(this, "foreground")
     forensics?.event("start")
     // An open exit prompt keeps the game paused until it is answered.
-    if (!confirmingExit) lifecycleExecutor.execute { Bridge.resume() }
+    if (!confirmingExit && !menuPaused) lifecycleExecutor.execute { Bridge.resume() }
     startSampling()
   }
 
@@ -289,10 +346,7 @@ class GameActivity : ComponentActivity() {
   @Deprecated("Back closes the menu or asks to leave the game")
   override fun onBackPressed() {
     when {
-      menuState.touchEditing -> {
-        menuState.touchEditing = false
-        touchActions.settingsChanged()
-      }
+      menuState.touchEditing -> editorActions.done()
       menuState.menuOpen -> toggleMenu()
       else -> confirmExit()
     }
@@ -308,16 +362,16 @@ class GameActivity : ComponentActivity() {
     lifecycleExecutor.execute { Bridge.pause() }
     var leaving = false
     AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-      .setTitle("Exit game?")
-      .setMessage("Progress since the last save will be lost.")
-      .setPositiveButton("Exit") { _, _ -> leaving = true }
-      .setNegativeButton("Keep playing", null)
+      .setTitle(R.string.exit_title)
+      .setMessage(R.string.exit_message)
+      .setPositiveButton(R.string.exit_confirm) { _, _ -> leaving = true }
+      .setNegativeButton(R.string.exit_cancel, null)
       .setOnDismissListener {
         confirmingExit = false
         if (leaving) {
           quitGame()
         } else {
-          if (!stopped) lifecycleExecutor.execute { Bridge.resume() }
+          if (!stopped && !menuPaused) lifecycleExecutor.execute { Bridge.resume() }
           hideSystemUi()
         }
       }
@@ -525,9 +579,21 @@ class GameActivity : ComponentActivity() {
 
     perfHint.update(frames, fps)
     liveFile.poll()?.let { live ->
+      if (settings.applyLive(live)) runOnUiThread { touchPad.settingsChanged() }
       live["xdroid_frame_rate_vote"]?.let { frameRateVoter.enabled = it == "true" }
       // DISP-4 A/B: the stats overlay redraws a full-size layer every second.
       live["xdroid_show_stats"]?.let { show -> runOnUiThread { menuState.showStats = show == "true" } }
+    }
+    if (!menuPaused) playSeconds++
+    if (menuState.menuOpen) {
+      val battery =
+        (getSystemService(BATTERY_SERVICE) as android.os.BatteryManager)
+          .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+      val played = playSeconds
+      runOnUiThread {
+        menuState.playSeconds = played
+        menuState.battery = battery
+      }
     }
     frameRateVoter.update(fps)?.let { rate -> runOnUiThread { applyFrameRate(rate) } }
     if (!everPresented) {
@@ -580,6 +646,10 @@ class GameActivity : ComponentActivity() {
     titleCaptured = true
     val hex = String.format(Locale.US, "%08X", id)
     prefs().edit().putString("title_$gamePath", hex).apply()
+    runOnUiThread {
+      menuState.titleId = hex
+      if (layoutTitle == null) layoutTitle = hex
+    }
     Log.i(TAG, "XDROID-TITLE $hex $gamePath")
   }
 
@@ -587,14 +657,40 @@ class GameActivity : ComponentActivity() {
 
   private fun toggleMenu() {
     menuState.menuOpen = !menuState.menuOpen
-    if (!menuState.menuOpen) {
-      menuState.remapTarget = null
+  }
+
+  // Every open and close, whoever flipped menuOpen (keys, pad, stats box).
+  private fun onMenuChanged(open: Boolean) {
+    if (open == menuWasOpen) return
+    menuWasOpen = open
+    if (open) {
+      releaseGamepad()
+      if (settings.menuPause.value && booted && !menuPaused) {
+        menuPaused = true
+        lifecycleExecutor.execute { Bridge.pause() }
+      }
+    } else {
+      remapState.target = null
       persistMenuPrefs()
+      settings.save(prefs())
+      if (menuPaused) {
+        menuPaused = false
+        if (!stopped && !confirmingExit) lifecycleExecutor.execute { Bridge.resume() }
+      }
     }
+  }
+
+  // Keys held when the menu opens release there: nothing stays pressed.
+  private fun releaseGamepad() {
+    for (bit in 0 until 16) Bridge.gamepadButton(1 shl bit, false)
+    for (axis in 0 until 6) sendAxis(axis, 0f)
+    hatDown.fill(false)
+    selectHeld = false
   }
 
   private fun setFastForward(on: Boolean) {
     menuState.fastForward = on
+    touchPad.fastForwardOn = on
     Bridge.setFastForward(on)
   }
 
@@ -634,31 +730,60 @@ class GameActivity : ComponentActivity() {
       .apply()
   }
 
-  // ---- Controller input: standard map, then the user's remap on top. ----
+  // ---- Controller input: standard map, the user's remap on top. ----
+
+  // Gamepad keys skip the view tree: with the menu closed they go straight
+  // to the game (Compose focus must not eat a D-pad press); with it open
+  // they drive the menu; a pending remap captures the next one.
+  override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+    if (event.device?.isGamepad != true) return super.dispatchKeyEvent(event)
+    if (!menuState.gamepadConnected) menuState.gamepadConnected = true
+    if (remapState.target != null) {
+      if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0 &&
+        captureRemap(settings, remapState, event.keyCode)
+      ) {
+        settings.save(prefs())
+      }
+      return true
+    }
+    if (menuState.menuOpen) return menuKey(event)
+    return when (event.action) {
+      KeyEvent.ACTION_DOWN -> onKeyDown(event.keyCode, event)
+      KeyEvent.ACTION_UP -> onKeyUp(event.keyCode, event)
+      else -> true
+    }
+  }
+
+  // Menu: D-pad moves the focus, A picks, B goes back, LB/RB switch tabs.
+  private fun menuKey(e: KeyEvent): Boolean {
+    val first = e.action == KeyEvent.ACTION_DOWN && e.repeatCount == 0
+    when (e.keyCode) {
+      KeyEvent.KEYCODE_BUTTON_A ->
+        return super.dispatchKeyEvent(KeyEvent(e.downTime, e.eventTime, e.action, KeyEvent.KEYCODE_DPAD_CENTER, e.repeatCount))
+      KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT,
+      KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_CENTER,
+      -> return super.dispatchKeyEvent(e)
+      KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BACK ->
+        if (first) {
+          if (remapState.open) remapState.open = false else menuState.menuOpen = false
+        }
+      KeyEvent.KEYCODE_BUTTON_L1 -> if (first) menuState.tab = (menuState.tab + InGameState.TABS - 1) % InGameState.TABS
+      KeyEvent.KEYCODE_BUTTON_R1 -> if (first) menuState.tab = (menuState.tab + 1) % InGameState.TABS
+      KeyEvent.KEYCODE_BUTTON_START, KeyEvent.KEYCODE_BUTTON_MODE -> if (first) menuState.menuOpen = false
+    }
+    return true
+  }
 
   override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
     if (event.device?.isGamepad != true) return super.onKeyDown(keyCode, event)
     val first = event.repeatCount == 0
-    // Some controllers connect before their device reports gamepad sources.
-    if (!menuState.gamepadConnected) menuState.gamepadConnected = true
-    menuState.remapTarget?.let { target ->
-      if (first) {
-        menuState.remapOverrides =
-          menuState.remapOverrides.filterValues { it != target } + (keyCode to target)
-        menuState.remapTarget = null
-        persistRemap()
-      }
-      return true
-    }
-    menuState.remapOverrides[keyCode]?.let {
+    settings.remap[keyCode]?.let {
       sendTarget(it, true)
       return true
     }
     when (keyCode) {
-      // PS / Home: fast forward toggle.
-      KeyEvent.KEYCODE_BUTTON_MODE -> if (first) setFastForward(!menuState.fastForward)
-      // Some controllers send Back: the menu, never the exit prompt.
-      KeyEvent.KEYCODE_BACK -> if (first) toggleMenu()
+      // Home / Guide and Back: the quick menu (the pad's Guide does the same).
+      KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_BACK -> if (first) toggleMenu()
       // Triggers send keys and analog axes: drive the axis only.
       KeyEvent.KEYCODE_BUTTON_L2 -> sendAxis(AXIS_LT, 1f)
       KeyEvent.KEYCODE_BUTTON_R2 -> sendAxis(AXIS_RT, 1f)
@@ -678,7 +803,7 @@ class GameActivity : ComponentActivity() {
 
   override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
     if (event.device?.isGamepad != true) return super.onKeyUp(keyCode, event)
-    menuState.remapOverrides[keyCode]?.let {
+    settings.remap[keyCode]?.let {
       sendTarget(it, false)
       return true
     }
@@ -702,16 +827,32 @@ class GameActivity : ComponentActivity() {
     ) {
       return super.onGenericMotionEvent(event)
     }
+    val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+    val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
+    if (menuState.menuOpen) {
+      // Hat D-pads (DS4) move the menu focus like D-pad keys.
+      menuHat(0, hatY < -0.5f, KeyEvent.KEYCODE_DPAD_UP)
+      menuHat(1, hatY > 0.5f, KeyEvent.KEYCODE_DPAD_DOWN)
+      menuHat(2, hatX < -0.5f, KeyEvent.KEYCODE_DPAD_LEFT)
+      menuHat(3, hatX > 0.5f, KeyEvent.KEYCODE_DPAD_RIGHT)
+      return true
+    }
     for ((androidAxis, axis) in STICK_AXES) {
       sendAxis(axis, event.getAxisValue(androidAxis))
     }
-    val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
-    val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
     setHat(0, hatY < -0.5f)
     setHat(1, hatY > 0.5f)
     setHat(2, hatX < -0.5f)
     setHat(3, hatX > 0.5f)
     return true
+  }
+
+  private val menuHatDown = BooleanArray(4)
+
+  private fun menuHat(index: Int, down: Boolean, keyCode: Int) {
+    if (menuHatDown[index] == down) return
+    menuHatDown[index] = down
+    super.dispatchKeyEvent(KeyEvent(if (down) KeyEvent.ACTION_DOWN else KeyEvent.ACTION_UP, keyCode))
   }
 
   // Index 0-3 = up, down, left, right = XInput D-pad masks 1, 2, 4, 8.
@@ -735,40 +876,6 @@ class GameActivity : ComponentActivity() {
       InputDevice.getDeviceIds().any { id ->
         InputDevice.getDevice(id)?.let { !it.isVirtual && it.isGamepad } == true
       }
-  }
-
-  private fun loadTouchPrefs(prefs: android.content.SharedPreferences) {
-    menuState.touchShow = prefs.getBoolean("touch_show", true)
-    menuState.touchAutoHide = prefs.getBoolean("touch_autohide", true)
-    menuState.touchHaptics = prefs.getBoolean("touch_haptics", true)
-    menuState.touchOpacity = prefs.getFloat("touch_opacity", TouchPadView.DEFAULT_OPACITY)
-    touchPad.haptics = menuState.touchHaptics
-    touchPad.opacity = menuState.touchOpacity
-    touchPad.loadJson(prefs.getString("touch_layout", null))
-    // "keycode:target" pairs.
-    menuState.remapOverrides =
-      prefs.getString("pad_remap", "").orEmpty().split(',').mapNotNull {
-        val kv = it.split(':')
-        val k = kv.getOrNull(0)?.toIntOrNull()
-        val v = kv.getOrNull(1)?.toIntOrNull()
-        if (k != null && v != null) k to v else null
-      }.toMap()
-  }
-
-  private fun persistTouch() {
-    prefs().edit()
-      .putBoolean("touch_show", menuState.touchShow)
-      .putBoolean("touch_autohide", menuState.touchAutoHide)
-      .putBoolean("touch_haptics", menuState.touchHaptics)
-      .putFloat("touch_opacity", menuState.touchOpacity)
-      .putString("touch_layout", touchPad.toJson())
-      .apply()
-  }
-
-  private fun persistRemap() {
-    prefs().edit()
-      .putString("pad_remap", menuState.remapOverrides.entries.joinToString(",") { "${it.key}:${it.value}" })
-      .apply()
   }
 
   private fun sendAxis(axis: Int, value: Float) {
