@@ -85,6 +85,7 @@ class TouchEditorActivity : ComponentActivity() {
         editorState.alpha = c?.alpha ?: 1f
       }
     pad.onEdited = { editorState.canUndo = pad.canUndo }
+    pad.backdrop = 0xFF20242C.toInt()
     title = intent.getStringExtra(EXTRA_TITLE_ID)
     val t = title
     pad.setLayout(

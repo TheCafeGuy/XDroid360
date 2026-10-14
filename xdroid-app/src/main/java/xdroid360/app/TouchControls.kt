@@ -8,10 +8,15 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.PorterDuff
 import android.graphics.RectF
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.MotionEvent
-import android.view.View
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.WindowInsets
 import java.util.Locale
 import kotlin.math.abs
@@ -48,6 +53,12 @@ interface PadSink {
  * Look: TouchArt bitmaps cached per state; a frame is a few blits. The pad
  * redraws only when its picture changes and dims after a while untouched.
  *
+ * Drawing: its own surface (above the game, under the menu), drawn in
+ * software on its own thread at half resolution (SurfaceFlinger scales it).
+ * Drawn through the UI thread's GPU renderer, every touch made the UI
+ * thread wait for a GPU busy with the game: 5 s waits ended in ANRs
+ * (2026-10-14). Now no touch waits on the GPU and the pad adds no GPU work.
+ *
  * Edit mode: drag to move (grid and symmetry snap), pinch to scale, undo;
  * overlapping controls are outlined red.
  */
@@ -57,25 +68,94 @@ class TouchPadView(
   private val settings: ControlSettings,
   private val sink: PadSink,
   private val onSelect: (TouchControl?) -> Unit,
-) : View(context) {
+) : SurfaceView(context), SurfaceHolder.Callback {
   val controls = TouchLayout.controls()
   private val byId = controls.associateBy { it.id }
   private val density = resources.displayMetrics.density
   private val art = TouchArt(density)
   val haptics = Haptics(context)
 
+  // Guards the pad state: written on the UI thread, read by the renderer.
+  private val lock = Any()
+  // Guards the surface: it must not be locked after surfaceDestroyed.
+  private val surfaceLock = Any()
+  private val renderThread = HandlerThread("xdroid-pad").apply { start() }
+  private val renderHandler = Handler(renderThread.looper)
+  private var surfaceReady = false
+  @Volatile private var renderPending = false
+  @Volatile private var artReset = false
+  private val renderRunnable = Runnable { renderNow() }
+
+  /** Solid backdrop under the pad (editor without a game), 0 = none. */
+  var backdrop = 0
+
+  init {
+    holder.setFormat(PixelFormat.TRANSLUCENT)
+    // Above the game's surface, under the window (menu, stats, flag).
+    setZOrderMediaOverlay(true)
+    holder.addCallback(this)
+  }
+
+  override fun surfaceCreated(h: SurfaceHolder) {}
+
+  override fun surfaceChanged(h: SurfaceHolder, format: Int, w: Int, hh: Int) {
+    synchronized(surfaceLock) { surfaceReady = true }
+    requestRender()
+  }
+
+  override fun surfaceDestroyed(h: SurfaceHolder) {
+    synchronized(surfaceLock) { surfaceReady = false }
+  }
+
+  private fun requestRender() {
+    if (renderPending) return
+    renderPending = true
+    renderHandler.post(renderRunnable)
+  }
+
+  // Render thread. lockCanvas paces it to the display.
+  private fun renderNow() {
+    renderPending = false
+    synchronized(surfaceLock) {
+      if (!surfaceReady || width == 0 || height == 0) return
+      val canvas = try {
+        holder.lockCanvas()
+      } catch (e: IllegalStateException) {
+        null
+      } ?: return
+      try {
+        canvas.drawColor(0, PorterDuff.Mode.CLEAR)
+        if (backdrop != 0) canvas.drawColor(backdrop)
+        canvas.save()
+        canvas.scale(canvas.width / width.toFloat(), canvas.height / height.toFloat())
+        synchronized(lock) {
+          if (artReset) {
+            art.clear()
+            artReset = false
+          }
+          drawContent(canvas)
+        }
+        canvas.restore()
+      } finally {
+        holder.unlockCanvasAndPost(canvas)
+      }
+    }
+  }
+
   var editing = false
     set(value) {
       if (field == value) return
-      releaseAll()
-      field = value
-      select(null)
+      synchronized(lock) {
+        releaseAll()
+        field = value
+        select(null)
+      }
     }
   /** Editor "test": input live inside the editor, values shown. */
   var testMode = false
     set(value) {
       field = value
-      invalidate()
+      requestRender()
     }
   var selected: TouchControl? = null
     private set
@@ -83,7 +163,7 @@ class TouchPadView(
   var fastForwardOn = false
     set(value) {
       field = value
-      invalidate()
+      requestRender()
     }
 
   /** The fast-forward button follows its own setting, the rest the layout. */
@@ -158,7 +238,7 @@ class TouchPadView(
   // ---- Layout. ----
 
   /** Saved layout JSON (null = preset); applied once the view has a size. */
-  fun setLayout(json: String?) {
+  fun setLayout(json: String?): Unit = synchronized(lock) {
     pendingJson = json
     pendingReset = true
     applyPending()
@@ -180,39 +260,40 @@ class TouchPadView(
     TouchLayout.applyPreset(controls, settings.preset.value, settings.mirror.value, width, height, density)
     TouchLayout.fromJson(controls, pendingJson)
     pendingJson = null
-    art.clear()
-    invalidate()
+    artReset = true
+    requestRender()
   }
 
   override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
     super.onSizeChanged(w, h, oldw, oldh)
-    applyPending()
+    holder.setFixedSize((w * RENDER_SCALE).toInt().coerceAtLeast(1), (h * RENDER_SCALE).toInt().coerceAtLeast(1))
+    synchronized(lock) { applyPending() }
   }
 
   override fun onApplyWindowInsets(insets: WindowInsets): WindowInsets {
     val cutout = insets.displayCutout
     insetLeft = cutout?.safeInsetLeft ?: 0
     insetRight = cutout?.safeInsetRight ?: 0
-    invalidate()
+    requestRender()
     return super.onApplyWindowInsets(insets)
   }
 
-  fun setSelectedScale(scale: Float) {
+  fun setSelectedScale(scale: Float): Unit = synchronized(lock) {
     selected?.scale = scale
-    invalidate()
+    requestRender()
   }
 
-  fun setSelectedHidden(hidden: Boolean) {
+  fun setSelectedHidden(hidden: Boolean): Unit = synchronized(lock) {
     pushUndo()
     val c = selected
     if (c?.kind == TouchKind.FAST_FORWARD) settings.showFf.value = !hidden else c?.visible = !hidden
-    invalidate()
+    requestRender()
     onEdited?.invoke()
   }
 
-  fun setSelectedAlpha(alpha: Float) {
+  fun setSelectedAlpha(alpha: Float): Unit = synchronized(lock) {
     selected?.alpha = alpha
-    invalidate()
+    requestRender()
   }
 
   /** Snapshot for undo before a slider drag starts. */
@@ -220,11 +301,11 @@ class TouchPadView(
 
   val canUndo get() = undoStack.isNotEmpty()
 
-  fun undo() {
-    val json = undoStack.removeLastOrNull() ?: return
+  fun undo(): Unit = synchronized(lock) {
+    val json = undoStack.removeLastOrNull() ?: return@synchronized
     TouchLayout.fromJson(controls, json)
     select(selected)
-    invalidate()
+    requestRender()
     onEdited?.invoke()
   }
 
@@ -234,7 +315,7 @@ class TouchPadView(
   }
 
   /** Lifts every finger: no button stays held when the pad hides. */
-  fun releaseAll() {
+  fun releaseAll(): Unit = synchronized(lock) {
     if (tracks.values.any { it.control.kind == TouchKind.FAST_FORWARD } && settings.ffMode.value == "hold") {
       sink.setFastForward(false)
     }
@@ -249,13 +330,13 @@ class TouchPadView(
     haptics.enabled = settings.haptics.value
     haptics.strength = settings.hapticStrength.value
     if (!settings.autoDim.value) animateDim(0f) else scheduleDim()
-    invalidate()
+    requestRender()
   }
 
   private fun select(c: TouchControl?) {
     selected = c
     onSelect(c)
-    invalidate()
+    requestRender()
   }
 
   // ---- Geometry. ----
@@ -321,7 +402,9 @@ class TouchPadView(
   // ---- Touch. ----
 
   @SuppressLint("ClickableViewAccessibility")
-  override fun onTouchEvent(e: MotionEvent): Boolean {
+  override fun onTouchEvent(e: MotionEvent): Boolean = synchronized(lock) { handleTouch(e) }
+
+  private fun handleTouch(e: MotionEvent): Boolean {
     when (e.actionMasked) {
       MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
         // Deliver moves as they come instead of batched at vsync.
@@ -343,7 +426,7 @@ class TouchPadView(
       }
     }
     if (editing) {
-      invalidate()
+      requestRender()
     } else {
       publish(e.eventTime)
     }
@@ -498,7 +581,7 @@ class TouchPadView(
     }
     if (eventTime > 0) lastLatencyMs = SystemClock.uptimeMillis() - eventTime
     // Redraw only when the picture changes.
-    if (changed != 0 || axisChanged || anyStick || tracks.size != lastTrackCount || debugOn()) invalidate()
+    if (changed != 0 || axisChanged || anyStick || tracks.size != lastTrackCount || debugOn()) requestRender()
     lastTrackCount = tracks.size
   }
 
@@ -586,7 +669,7 @@ class TouchPadView(
     if (dim > 0f) {
       dimAnim?.cancel()
       dim = 0f
-      invalidate()
+      requestRender()
     }
     scheduleDim()
   }
@@ -608,7 +691,7 @@ class TouchPadView(
       duration = 400
       addUpdateListener {
         dim = it.animatedValue as Float
-        invalidate()
+        requestRender()
       }
       start()
     }
@@ -617,7 +700,8 @@ class TouchPadView(
   override fun onDetachedFromWindow() {
     removeCallbacks(dimRunnable)
     dimAnim?.cancel()
-    art.clear()
+    renderHandler.post { art.clear() }
+    renderThread.quitSafely()
     super.onDetachedFromWindow()
   }
 
@@ -718,7 +802,7 @@ class TouchPadView(
 
   private fun debugOn() = settings.debugOverlay.value || testMode
 
-  override fun onDraw(canvas: Canvas) {
+  private fun drawContent(canvas: Canvas) {
     val base = settings.opacity.value
     val global = if (editing) max(base, 0.5f) else base + (min(base, DIM_OPACITY) - base) * dim
     for (c in controls) {
@@ -864,6 +948,8 @@ class TouchPadView(
 
   companion object {
     const val DEFAULT_OPACITY = 0.6f
+    // Surface resolution against the view (SurfaceFlinger scales it up).
+    private const val RENDER_SCALE = 0.5f
     const val MIN_SCALE = 0.5f
     const val MAX_SCALE = 2f
     private const val DIM_OPACITY = 0.2f
