@@ -76,6 +76,8 @@
 #include <thread>
 #include <vector>
 
+#include "xdroid_ib_snapshot.h"
+#include "xdroid_latency.h"
 #include "xdroid_time_coupling.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
@@ -124,7 +126,7 @@ DEFINE_int32(xdroid_vdswap_wait_cp_max_lag, 0,
 DEFINE_int32(xdroid_vdswap_wait_cp_us, 4000,
              "Longest wait of xdroid_vdswap_wait_cp per VdSwap. Live.", "XDroid360");
 
-DEFINE_bool(xdroid_cp_defer_to_swap, false,
+DEFINE_bool(xdroid_cp_defer_to_swap, true,
             "HUD-1 arm H1 (temp): the command processor does not execute a "
             "kick of a frame until the guest has called VdSwap for that frame "
             "(bounded by xdroid_cp_defer_to_swap_us; after a timeout it stops "
@@ -472,6 +474,7 @@ void WorkerEndHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
 }
 
 void OnKick(uint32_t write_ptr) {
+  LatNoteKick();
   const uint32_t index = g_kick_count.load(std::memory_order_relaxed);
   Kick& kick = g_kicks[index % kKickRing];
   kick.seq.store(g_seq.load(std::memory_order_acquire),
@@ -506,6 +509,7 @@ void BeforeExecute(uint32_t write_ptr) {
       g_defer_wait[2].fetch_add(Ac6NowUs() - begin, std::memory_order_relaxed);
     }
   }
+  LatNoteCpExecute();
   const uint32_t kicks = g_kick_count.load(std::memory_order_acquire);
   if (!kicks) {
     return;
@@ -581,6 +585,7 @@ void BeforeExecute(uint32_t write_ptr) {
 
 void OnGuestSwap() {
   TimeCouplingOnGuestSwap();
+  LatNoteGuestSwap();
   const uint64_t swaps = g_guest_swaps.fetch_add(1, std::memory_order_relaxed);
   uint64_t processed = xe::logging::GetFrameNumber();
   uint64_t lag = swaps > processed ? swaps - processed : 0;
@@ -784,6 +789,7 @@ bool InstallAc6Jobs(xe::Emulator* emulator) {
   gpu_hooks.before_execute.store(BeforeExecute, std::memory_order_release);
   gpu_hooks.on_guest_swap.store(OnGuestSwap, std::memory_order_release);
   gpu_hooks.on_glitch.store(OnGlitch, std::memory_order_release);
+  InstallIbSnapshotHooks();
   XELOGI(
       "XDroid360: AC6 job hooks installed ({} Submit call sites, {} hooked "
       "addresses, code {:08X}-{:08X})",

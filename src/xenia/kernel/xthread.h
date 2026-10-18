@@ -601,6 +601,7 @@ class XThread : public XObject, public cpu::Thread {
     kMultiAll,
     kDelay,
     kFence,
+    kGpuWriteback,  // XR-3: a guest spin-wait parked on GPU write-backs
   };
   // Records the wait shape for diagnostics. Extra handles beyond the array are
   // dropped; the count reported is the real one so truncation stays visible.
@@ -670,6 +671,9 @@ class XThread : public XObject, public cpu::Thread {
     // thread and no quantum is charged.
     bool repoll_preempt = false;
     bool has_run = false;  // diagnostic: dispatched at least once
+    // XDroid360 AUD-5 diagnostic: how the last YieldCurrentThread ended the
+    // slice: 1 preempted (kept its slice), 2 quantum end, 3 voluntary.
+    uint8_t xdroid_yield_kind = 0;
     // Raw host ticks when this thread was linked into a ready list, so a
     // dispatch can measure how long it waited behind higher priorities.
     uint64_t ready_since_tick = 0;
@@ -695,6 +699,8 @@ class XThread : public XObject, public cpu::Thread {
     bool wait_alertable = false;    // also re-poll on a pending user APC
     uint32_t wait_epoch = 0;        // object epoch sampled before the last poll
     uint64_t wait_deadline_ms = 0;  // absolute host uptime, 0 = none
+    // XR-3: gated on the GPU write-back generation instead of an object.
+    bool wait_gpu_writeback = false;
     // What this fiber parked in and the guest handles it named. Handles, not
     // XObject pointers: safe to print if the object is released mid-dump, and
     // they key the signal ring. Without it a multi-object wait dumps obj=0x0.

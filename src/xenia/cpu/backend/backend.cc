@@ -39,6 +39,7 @@ void* Backend::AllocThreadData() { return nullptr; }
 void Backend::FreeThreadData(void* thread_data) {}
 
 void (*preempt_yield_handler)(void* raw_context) = nullptr;
+bool (*spin_park_handler)(uint32_t seen_generation) = nullptr;
 
 uint64_t TrapDebugPrint(void* raw_context) {
   auto thread_state =

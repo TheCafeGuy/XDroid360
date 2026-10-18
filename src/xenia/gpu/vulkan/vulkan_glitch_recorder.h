@@ -8,14 +8,21 @@
  * agree with each other is a one-frame glitch candidate; the three frames
  * around it are copied out of the ring and written as PPM files to
  * <storage>/glitch/, with an XDROID-GLITCH log line carrying the frame number.
+ *
+ * MC-1 mark clip: every second frame also goes into a 6 s ring of smaller
+ * frames, and every frame's swap time into a timing ring. On a user mark
+ * (XdroidGpuHooks::clip_request_frame) both are written to
+ * <storage>/clips/clip-f<frame>/: one PPM per frame and frames.csv.
  */
 
 #ifndef XENIA_GPU_VULKAN_VULKAN_GLITCH_RECORDER_H_
 #define XENIA_GPU_VULKAN_VULKAN_GLITCH_RECORDER_H_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -64,6 +71,13 @@ class VulkanGlitchRecorder {
   static constexpr uint32_t kFrameBytes = kFrameWidth * kFrameHeight * 4;
   static constexpr uint32_t kDumpFrames = 4;  // n-2..n+1
   static constexpr uint32_t kMaxDumps = 200;
+  // Mark clip: 90 frames at every second swap = 6 s at 30 FPS.
+  static constexpr uint32_t kClipFrames = 90;
+  static constexpr uint32_t kClipWidth = 384;
+  static constexpr uint32_t kClipHeight = 216;
+  static constexpr uint32_t kClipBytes = kClipWidth * kClipHeight * 4;
+  static constexpr uint32_t kTimingSize = 512;
+  static constexpr uint32_t kMaxClips = 30;
 
   struct Slot {
     uint64_t frame = UINT64_MAX;
@@ -73,6 +87,9 @@ class VulkanGlitchRecorder {
 
   void TransferBarrier(DeferredCommandBuffer& command_buffer) const;
   void WriteDump();
+  void PollClip(DeferredCommandBuffer& command_buffer,
+                uint64_t completed_submission, uint64_t current_submission);
+  void WriteClip();
 
   const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
   bool initialized_ = false;
@@ -106,6 +123,27 @@ class VulkanGlitchRecorder {
   uint64_t candidates_ = 0;
   uint64_t hud1_candidates_ = 0;
   uint64_t hud1_frame_ = UINT64_MAX;
+
+  // Mark clip.
+  std::array<VkImage, kClipFrames> clip_images_{};
+  std::array<VkDeviceMemory, kClipFrames> clip_memory_{};
+  // Log frame held by each clip image, UINT64_MAX = empty.
+  std::array<uint64_t, kClipFrames> clip_frames_;
+  // Log frame and steady-clock microseconds of every capture.
+  std::array<std::pair<uint64_t, int64_t>, kTimingSize> timing_{};
+  uint64_t timing_count_ = 0;
+  VkBuffer clip_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory clip_buffer_memory_ = VK_NULL_HANDLE;
+  const uint8_t* clip_mapping_ = nullptr;
+  uint64_t clip_submission_ = UINT64_MAX;
+  uint64_t clip_request_done_ = 0;
+  uint64_t clip_request_ = 0;
+  std::array<uint64_t, kClipFrames> clip_copied_frames_;
+  std::vector<std::pair<uint64_t, int64_t>> clip_timing_;
+  uint32_t clips_ = 0;
+  // A writer thread still reads clip_mapping_.
+  std::shared_ptr<std::atomic<bool>> clip_writing_ =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 }  // namespace vulkan

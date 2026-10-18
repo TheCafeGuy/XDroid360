@@ -405,6 +405,10 @@ class Presenter {
     kFsrEasu,
     kFsrRcas,
     kFsrRcasDither,
+    // GSR-1: Snapdragon Game Super Resolution 1, upstream sharpness and a
+    // variant without extra sharpening (present_oem_postprocess = sharpen).
+    kSnapdragonGsr,
+    kSnapdragonGsrSoft,
 
     kCount,
   };
@@ -702,6 +706,8 @@ class Presenter {
   //
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  // GSR-1: whether the implementation has the Snapdragon GSR effects.
+  virtual bool IsSnapdragonGsrSupported() const { return false; }
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
@@ -836,6 +842,11 @@ class Presenter {
   // kPresentedSuboptimal rather than kNotPresentedConnectionOutdated, the image
   // has been successfully sent to the OS presentation at least.
   PaintResult PaintAndPresent(bool execute_ui_drawers);
+  // OEM-1 (present_oem_postprocess): the phone already sharpens the image.
+  static bool IsOemSharpeningActive();
+  // UPS-1: shrinks the window size to the swapchain size requested by
+  // present_resolution_scale_percent (Android only, no-op elsewhere).
+  void ApplyPresentResolutionScale(uint32_t& width, uint32_t& height);
 
   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
 
@@ -910,6 +921,12 @@ class Presenter {
   // painting.
   uint32_t surface_width_in_paint_connection_ = 0;
   uint32_t surface_height_in_paint_connection_ = 0;
+  // UPS-1 (present_resolution_scale_percent): the last window size seen and
+  // the scaled size given to the swapchain, to avoid compounding the scale.
+  uint32_t present_scale_last_in_width_ = 0;
+  uint32_t present_scale_last_in_height_ = 0;
+  uint32_t present_scale_last_out_width_ = 0;
+  uint32_t present_scale_last_out_height_ = 0;
 
   // Can be set by both the UI thread and the guest output thread before doing
   // window_->RequestPaint() - whether an extra painting (preceded by

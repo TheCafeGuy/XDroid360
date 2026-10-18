@@ -32,6 +32,8 @@ class TouchEditorActivity : ComponentActivity() {
 
       override fun guide() {}
 
+      override fun glitch() {}
+
       override fun setFastForward(on: Boolean) {
         pad.fastForwardOn = on
       }

@@ -22,6 +22,7 @@
 #include "xenia/base/platform.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/cpu/guest_sampler.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/guest_scheduler.h"
@@ -497,6 +498,9 @@ X_STATUS XThread::Create() {
       current_xthread_tls_ = this;
       current_thread_ = this;
       cpu::ThreadState::Bind(this->thread_state());
+      cpu::sampler::RegisterCurrentThread(kernel_state()->processor(),
+                                          thread_name_.c_str());
+      cpu::sampler::SetCurrentGuestThread(thread_id_, thread_state_->context());
       running_ = true;
 
 #if XE_PLATFORM_LINUX || XE_PLATFORM_ANDROID || XE_PLATFORM_MAC
@@ -865,9 +869,12 @@ void XThread::SetCurrentThread(XThread* thread) {
     // must be re-set on every switch, not once at host-thread start.
     xe::threading::set_current_thread_id(thread->handle());
     cpu::ThreadState::Bind(thread->thread_state());
+    cpu::sampler::SetCurrentGuestThread(thread->thread_id(),
+                                        thread->thread_state()->context());
   } else {
     // Back on the idle fiber, attribute logging to the host thread again.
     xe::threading::set_current_thread_id(UINT_MAX);
+    cpu::sampler::SetCurrentGuestThread(0, nullptr);
   }
 }
 

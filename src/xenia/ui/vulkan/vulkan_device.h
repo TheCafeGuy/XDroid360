@@ -137,6 +137,10 @@ class VulkanDevice {
 
     bool shaderFloat16 = false;
 
+    // VK_EXT_descriptor_indexing (#162, promoted to 1.2), one feature: lets
+    // shaders index the split shared-memory buffer array per invocation.
+    bool shaderStorageBufferArrayNonUniformIndexing = false;
+
     // VK_KHR_portability_subset (#164)
 
     bool constantAlphaColorBlendFactors = false;
@@ -240,6 +244,9 @@ class VulkanDevice {
     // VK_AMD_buffer_marker (#180). GPU breadcrumbs for locating a GPU hang
     // (vulkan_gpu_breadcrumbs).
     bool ext_AMD_buffer_marker = false;
+    // VK_KHR_pipeline_executable_properties (#270). Driver shader statistics
+    // (instruction and register counts) for SHD-1 (xdroid_shader_stats).
+    bool ext_KHR_pipeline_executable_properties = false;
     // VK_EXT_external_memory_host (#179). Imports guest RAM as device memory so
     // the shared-memory buffer can alias guest RAM directly (zero-copy).
     bool ext_EXT_external_memory_host = false;
@@ -372,6 +379,16 @@ class VulkanDevice {
     return vkCmdWriteBufferMarkerAMD_;
   }
 
+  // VK_KHR_pipeline_executable_properties commands, null if not enabled.
+  PFN_vkGetPipelineExecutablePropertiesKHR
+  get_pipeline_executable_properties_khr() const {
+    return vkGetPipelineExecutablePropertiesKHR_;
+  }
+  PFN_vkGetPipelineExecutableStatisticsKHR
+  get_pipeline_executable_statistics_khr() const {
+    return vkGetPipelineExecutableStatisticsKHR_;
+  }
+
   VkResult SubmitAndUpdateLost(const VkQueue queue, const uint32_t submit_count,
                                const VkSubmitInfo* const submits,
                                const VkFence fence) {
@@ -414,6 +431,10 @@ class VulkanDevice {
   // VK_AMD_buffer_marker function pointer, loaded only if the extension is
   // enabled. Null otherwise.
   PFN_vkCmdWriteBufferMarkerAMD vkCmdWriteBufferMarkerAMD_ = nullptr;
+  PFN_vkGetPipelineExecutablePropertiesKHR
+      vkGetPipelineExecutablePropertiesKHR_ = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR
+      vkGetPipelineExecutableStatisticsKHR_ = nullptr;
   // VK_EXT_external_memory_host function pointer, loaded only if the extension
   // is enabled. Null otherwise.
   PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =

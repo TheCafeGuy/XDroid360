@@ -4,13 +4,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "xenia/apu/apu_flags.h"
 #include "xenia/apu/audio_system.h"
 #include "xenia/apu/conversion.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 
 DEFINE_string(apu_aaudio_performance_mode, "power_saving",
@@ -19,6 +23,7 @@ DEFINE_string(apu_aaudio_performance_mode, "power_saving",
               "queue already holds tens of milliseconds).",
               "APU");
 DECLARE_uint32(apu_max_queued_frames);
+DECLARE_bool(xdroid_diagnostics);
 DEFINE_uint32(apu_queue_bursts, 3,
               "Device bursts the guest audio queue covers (at least 2). Two "
               "leave no margin for a slow guest callback while the pump refills "
@@ -31,6 +36,24 @@ DEFINE_bool(xdroid_audio_conceal, true,
             "~10 ms of output (crossfaded, released after 40 ms) instead of "
             "fading to silence, so a short producer delay is not an audible "
             "cut. Live.",
+            "APU");
+
+DEFINE_uint32(xdroid_audio_drc_ppm, 0,
+              "XDroid360 (AUD-5): dynamic rate control. When the guest queue "
+              "is short of full at a device callback, play up to this many "
+              "ppm slower (5000 = 0.5%, about 9 cents of pitch), scaled by "
+              "how far behind the producer is (full at one device burst "
+              "behind). The pump follows the output, so a producer that runs "
+              "just under real time (AC6 hot: 5.17 of 5.33 ms per frame) is "
+              "slowed a little instead of underrunning. 0 = off. Changes the "
+              "guest's audio clock by at most this much while engaged. Live.",
+              "APU");
+DEFINE_bool(xdroid_audio_route_watch, false,
+            "XDroid360 (AUD-5): every 500 ms, check the output device and "
+            "burst size; when a route change did not disconnect the stream "
+            "(Bluetooth headphones connecting), resize the guest queue for "
+            "the new burst, which otherwise underruns every callback until a "
+            "restart. Live.",
             "APU");
 
 namespace xdroid {
@@ -119,7 +142,93 @@ bool XDroidAAudioDriver::Initialize() {
   return true;
 }
 
+namespace {
+// The driver WriteAudioClip reads; the mutex keeps it alive meanwhile.
+std::mutex clip_driver_mutex;
+XDroidAAudioDriver* clip_driver = nullptr;
+}  // namespace
+
+bool WriteAudioClip(const std::filesystem::path& wav,
+                    const std::filesystem::path& events_csv) {
+  std::lock_guard<std::mutex> lock(clip_driver_mutex);
+  XDroidAAudioDriver* driver = clip_driver;
+  if (!driver || !driver->clip_ring_) {
+    return false;
+  }
+  const int32_t rate = driver->clip_rate_.load(std::memory_order_acquire);
+  const uint64_t end =
+      driver->clip_pairs_written_.load(std::memory_order_acquire);
+  if (rate <= 0 || !end) {
+    return false;
+  }
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  const uint64_t pairs =
+      std::min<uint64_t>({end, uint64_t(rate) * 7,
+                          uint64_t(XDroidAAudioDriver::kClipPairs)});
+  // The callback keeps writing: the oldest few ms may be newer audio.
+  std::vector<int16_t> pcm(size_t(pairs) * 2);
+  for (uint64_t i = 0; i < pairs; ++i) {
+    const size_t at =
+        size_t((end - pairs + i) % XDroidAAudioDriver::kClipPairs) * 2;
+    for (int c = 0; c < 2; ++c) {
+      const float v = std::clamp(driver->clip_ring_[at + c], -1.0f, 1.0f);
+      pcm[size_t(i) * 2 + c] = int16_t(std::lround(v * 32767.0f));
+    }
+  }
+  if (FILE* file = xe::filesystem::OpenFile(wav, "wb")) {
+    const uint32_t data_bytes = uint32_t(pcm.size() * sizeof(int16_t));
+    auto u32 = [file](uint32_t v) { std::fwrite(&v, 4, 1, file); };
+    auto u16 = [file](uint16_t v) { std::fwrite(&v, 2, 1, file); };
+    std::fwrite("RIFF", 1, 4, file);
+    u32(36 + data_bytes);
+    std::fwrite("WAVEfmt ", 1, 8, file);
+    u32(16);
+    u16(1);  // PCM
+    u16(2);
+    u32(uint32_t(rate));
+    u32(uint32_t(rate) * 4);
+    u16(4);
+    u16(16);
+    std::fwrite("data", 1, 4, file);
+    u32(data_bytes);
+    std::fwrite(pcm.data(), 1, data_bytes, file);
+    std::fclose(file);
+  }
+  if (FILE* file = xe::filesystem::OpenFile(events_csv, "w")) {
+    // t_ms on the steady clock of frames.csv (t_us / 1000); wav_s = the
+    // position in the WAV.
+    const int64_t wav_start_ms = now_ms - int64_t(pairs * 1000 / rate);
+    std::fprintf(file, "event,t_ms,wav_s\n");
+    const uint64_t count =
+        driver->clip_underruns_.load(std::memory_order_acquire);
+    for (uint64_t k = count > XDroidAAudioDriver::kClipUnderruns
+                          ? count - XDroidAAudioDriver::kClipUnderruns
+                          : 0;
+         k < count; ++k) {
+      const int64_t t =
+          driver->clip_underrun_ms_[k % XDroidAAudioDriver::kClipUnderruns]
+              .load(std::memory_order_relaxed);
+      if (t >= wav_start_ms) {
+        std::fprintf(file, "underrun,%lld,%.2f\n", static_cast<long long>(t),
+                     double(t - wav_start_ms) / 1000.0);
+      }
+    }
+    std::fprintf(file, "written,%lld,%.2f\n", static_cast<long long>(now_ms),
+                 double(now_ms - wav_start_ms) / 1000.0);
+    std::fclose(file);
+  }
+  return true;
+}
+
 void XDroidAAudioDriver::Shutdown() {
+  {
+    std::lock_guard<std::mutex> lock(clip_driver_mutex);
+    if (clip_driver == this) {
+      clip_driver = nullptr;
+    }
+  }
   if (service_thread_.joinable()) {
     {
       std::lock_guard<std::mutex> lock(service_mutex_);
@@ -169,6 +278,25 @@ AAudioStream* XDroidAAudioDriver::OpenStream() {
   }
   // Read before the stream starts; the callback uses it afterwards.
   device_rate_ = AAudioStream_getSampleRate(stream);
+  if (cvars::xdroid_diagnostics && !clip_ring_) {
+    clip_ring_ = std::make_unique<float[]>(size_t(kClipPairs) * 2);
+    std::lock_guard<std::mutex> lock(clip_driver_mutex);
+    clip_driver = this;
+  }
+  const uint32_t depth = SizeQueue(stream);
+  route_device_id_ = AAudioStream_getDeviceId(stream);
+  route_burst_ = AAudioStream_getFramesPerBurst(stream);
+  XELOGI("XDroid360: AAudio {} Hz, mode {}, burst {} frames, buffer {}/{}, "
+         "guest queue {} frames ({} ms), device {}",
+         device_rate_,
+         PerformanceModeName(AAudioStream_getPerformanceMode(stream)),
+         route_burst_, AAudioStream_getBufferSizeInFrames(stream),
+         AAudioStream_getBufferCapacityInFrames(stream), depth,
+         depth * 1000 * kChannelSamples / kGuestRate, route_device_id_);
+  return stream;
+}
+
+uint32_t XDroidAAudioDriver::SizeQueue(AAudioStream* stream) {
   // The queue has to cover at least two device bursts (apu_queue_bursts,
   // plus one of margin by default): each callback takes a whole
   // burst, and the pump refills only what the previous one released. The
@@ -188,14 +316,30 @@ AAudioStream* XDroidAAudioDriver::OpenStream() {
       std::max(semaphore_depth,
                std::max(cvars::apu_queue_bursts, 2u) * burst_frames));
   credit_target_.store(depth - semaphore_depth, std::memory_order_relaxed);
-  XELOGI("XDroid360: AAudio {} Hz, mode {}, burst {} frames, buffer {}/{}, "
-         "guest queue {} frames ({} ms)",
-         device_rate_,
-         PerformanceModeName(AAudioStream_getPerformanceMode(stream)),
-         burst, AAudioStream_getBufferSizeInFrames(stream),
-         AAudioStream_getBufferCapacityInFrames(stream), depth,
+  queue_depth_.store(depth, std::memory_order_relaxed);
+  burst_frames_.store(std::max(burst_frames, 1u), std::memory_order_relaxed);
+  return depth;
+}
+
+void XDroidAAudioDriver::CheckRoute() {
+  std::lock_guard<std::mutex> stream_lock(stream_mutex_);
+  if (!stream_ || disconnected_.load()) {
+    return;
+  }
+  const int32_t device_id = AAudioStream_getDeviceId(stream_);
+  const int32_t burst = AAudioStream_getFramesPerBurst(stream_);
+  if (device_id == route_device_id_ && burst == route_burst_) {
+    return;
+  }
+  const uint32_t depth = SizeQueue(stream_);
+  XELOGW("XDroid360: AAudio route changed without a disconnect: device {} -> "
+         "{}, burst {} -> {} frames; guest queue now {} frames ({} ms)",
+         route_device_id_, device_id, route_burst_, burst, depth,
          depth * 1000 * kChannelSamples / kGuestRate);
-  return stream;
+  route_device_id_ = device_id;
+  route_burst_ = burst;
+  // Look closely at the output for the next seconds.
+  watch_request_.store(true, std::memory_order_relaxed);
 }
 
 void XDroidAAudioDriver::CloseStream() {
@@ -344,14 +488,41 @@ void XDroidAAudioDriver::ConcealNext(float& left, float& right) {
 void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
   consumed_in_render_ = 0;
   int32_t written = 0;
-  if (device_rate_ == int32_t(kGuestRate)) {
+  // AUD-5 rate control: how far short of full the queue is right before this
+  // callback takes its burst. A producer keeping up refills it every period.
+  const uint32_t drc_ppm = std::min<uint32_t>(cvars::xdroid_audio_drc_ppm,
+                                              50000);  // 5% at most
+  if (drc_ppm) {
+    const uint32_t queued = ring_tail_.load(std::memory_order_acquire) -
+                            ring_head_.load(std::memory_order_relaxed);
+    const uint32_t depth = queue_depth_.load(std::memory_order_relaxed);
+    const double deficit = depth > queued ? double(depth - queued) : 0.0;
+    drc_deficit_ema_ += (deficit - drc_deficit_ema_) * 0.2;
+    // One frame short is the pump's normal phase against the burst.
+    const double behind = std::clamp(
+        (drc_deficit_ema_ - 1.0) /
+            double(burst_frames_.load(std::memory_order_relaxed)),
+        0.0, 1.0);
+    drc_slow_ppm_ = uint32_t(double(drc_ppm) * behind);
+    drc_sum_ppm_ += drc_slow_ppm_;
+    drc_max_ppm_ = std::max(drc_max_ppm_, drc_slow_ppm_);
+    drc_sum_deficit_ += deficit;
+    ++drc_calls_;
+  } else {
+    drc_slow_ppm_ = 0;
+    drc_deficit_ema_ = 0.0;
+  }
+  // Once primed, stay on the resampler until an underrun resets it, so
+  // turning rate control off live does not skip its pending sample.
+  if (device_rate_ == int32_t(kGuestRate) && !drc_ppm && !resampler_primed_) {
     for (; written < pairs; ++written) {
       if (!NextPair(out[written * 2], out[written * 2 + 1])) {
         break;
       }
     }
   } else {
-    const double step = double(kGuestRate) / double(device_rate_);
+    const double step = double(kGuestRate) / double(device_rate_) *
+                        (1.0 - double(drc_slow_ppm_) * 1e-6);
     for (; written < pairs; ++written) {
       bool starved = false;
       while (!resampler_primed_ || phase_ >= 1.0) {
@@ -405,6 +576,22 @@ void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
     hold_[1] = out[written * 2 - 1];
   }
   const int64_t now_ms = SteadyMs();
+  if (drc_calls_ && now_ms - drc_log_ms_ >= 10000) {
+    if (drc_log_ms_) {
+      XELOGI("XDroid360: audio drc: slow mean {} ppm, max {} ppm over {} "
+             "callbacks; queue deficit mean {:.1f} frames (depth {}, burst "
+             "{})",
+             drc_sum_ppm_ / drc_calls_, drc_max_ppm_, drc_calls_,
+             drc_sum_deficit_ / drc_calls_,
+             queue_depth_.load(std::memory_order_relaxed),
+             burst_frames_.load(std::memory_order_relaxed));
+    }
+    drc_log_ms_ = now_ms;
+    drc_sum_ppm_ = 0;
+    drc_max_ppm_ = 0;
+    drc_sum_deficit_ = 0.0;
+    drc_calls_ = 0;
+  }
   if (written < pairs) {
     const int32_t loop =
         std::clamp(device_rate_ / 100, 4 * kConcealFade, kHistoryPairs / 2);
@@ -448,6 +635,12 @@ void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
     resampler_primed_ = false;
     const uint64_t underruns = underruns_.fetch_add(1) + 1;
     ++level_underruns_;
+    if (clip_ring_) {
+      const uint64_t k = clip_underruns_.load(std::memory_order_relaxed);
+      clip_underrun_ms_[k % kClipUnderruns].store(now_ms,
+                                                  std::memory_order_relaxed);
+      clip_underruns_.store(k + 1, std::memory_order_release);
+    }
     // How long the producer (the guest audio callback) had not submitted:
     // tens of ms = the producer stalled; a few ms = output-side cadence.
     // Nothing to measure before its first frame.
@@ -482,6 +675,16 @@ void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
   }
   level_sum_sq_ += sum_sq;
   level_samples_ += uint64_t(pairs) * 2;
+  if (clip_ring_) {
+    uint64_t at = clip_pairs_written_.load(std::memory_order_relaxed);
+    for (int32_t i = 0; i < pairs; ++i, ++at) {
+      float* dst = &clip_ring_[size_t(at % kClipPairs) * 2];
+      dst[0] = out[i * 2];
+      dst[1] = out[i * 2 + 1];
+    }
+    clip_rate_.store(device_rate_, std::memory_order_relaxed);
+    clip_pairs_written_.store(at, std::memory_order_release);
+  }
   UpdateLevels(now_ms);
   ReleaseSlots(consumed_in_render_);
 }
@@ -570,8 +773,18 @@ void XDroidAAudioDriver::ErrorCallback(AAudioStream* /*stream*/,
 void XDroidAAudioDriver::ServiceThreadMain() {
   std::unique_lock<std::mutex> lock(service_mutex_);
   for (;;) {
-    service_cv_.wait(lock,
-                     [this] { return service_exit_ || disconnected_.load(); });
+    // Wake twice a second for the route watch (xdroid_audio_route_watch),
+    // read on every timeout so it can be turned on live.
+    if (!service_cv_.wait_for(lock, std::chrono::milliseconds(500), [this] {
+          return service_exit_ || disconnected_.load();
+        })) {
+      if (cvars::xdroid_audio_route_watch) {
+        lock.unlock();
+        CheckRoute();
+        lock.lock();
+      }
+      continue;
+    }
     if (service_exit_) {
       return;
     }

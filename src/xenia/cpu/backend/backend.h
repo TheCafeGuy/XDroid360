@@ -217,6 +217,11 @@ uint64_t TrapDebugPrint(void* raw_context);
 // context's preempt_requested flag.
 extern void (*preempt_yield_handler)(void* raw_context);
 
+// XR-3: registered with preempt_yield_handler. The db16cyc helper calls it to
+// park a guest spin-wait until the GPU write-back generation moves past the
+// given value; false when the caller must keep spinning.
+extern bool (*spin_park_handler)(uint32_t seen_generation);
+
 }  // namespace backend
 }  // namespace cpu
 }  // namespace xe

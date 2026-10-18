@@ -44,3 +44,4 @@ Boost.Context, Asio, UTF8-CPP	Fibers, sockets, UTF-8	BSL-1.0	third_party/asio/LI
 microprofile	Profiler hooks	Public domain (Unlicense)	docs/licenses/microprofile-NOTICE.txt
 miniaudio	Audio helpers	Public domain (Unlicense) or MIT-0	third_party/miniaudio/LICENSE
 Android Jetpack (AndroidX, Compose), Kotlin standard library, kotlinx.coroutines	App user interface	Apache-2.0	third_party/Vulkan-Headers/LICENSES/Apache-2.0.txt
+Snapdragon Game Super Resolution 1	Optional upscaling shader for the final image (present_snapdragon_gsr)	BSD-3-Clause	docs/licenses/snapdragon-gsr-LICENSE.txt

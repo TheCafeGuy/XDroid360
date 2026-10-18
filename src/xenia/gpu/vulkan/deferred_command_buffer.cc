@@ -28,17 +28,25 @@ DeferredCommandBuffer::DeferredCommandBuffer(
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
 }
 
-void DeferredCommandBuffer::Reset() { command_stream_.clear(); }
+void DeferredCommandBuffer::Reset() {
+  assert_false(is_recording_segment());
+  command_stream_.clear();
+  segment_stream_.clear();
+  segment_placeholder_ = SIZE_MAX;
+}
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  ExecuteRange(command_buffer, command_stream_.data(), command_stream_.size());
+}
 
+void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer,
+                                         const uintmax_t* stream,
+                                         size_t stream_remaining) {
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   while (stream_remaining) {
     const CommandHeader& header =
         *reinterpret_cast<const CommandHeader*>(stream);
@@ -46,6 +54,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
     stream_remaining -= kCommandHeaderSizeElements;
 
     switch (header.command) {
+      case Command::kExecuteSegment: {
+        auto& args = *reinterpret_cast<const ArgsExecuteSegment*>(stream);
+        if (args.count) {
+          ExecuteRange(command_buffer, segment_stream_.data() + args.first,
+                       args.count);
+        }
+      } break;
+
       case Command::kVkBeginRenderPass: {
         auto& args = *reinterpret_cast<const ArgsVkBeginRenderPass*>(stream);
         size_t offset_bytes = sizeof(ArgsVkBeginRenderPass);
@@ -137,6 +153,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool,
                                 args.first_query, args.query_count);
+      } break;
+      case Command::kVkWriteTimestamp: {
+        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
+        dfn.vkCmdWriteTimestamp(command_buffer, args.pipeline_stage,
+                                args.query_pool, args.query);
       } break;
 
       case Command::kVkClearAttachments: {
@@ -554,15 +575,54 @@ void* DeferredCommandBuffer::WriteCommand(Command command,
                                           size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements +
-                         arguments_size_elements);
+  const bool to_segment = is_recording_segment();
+  std::vector<uintmax_t>& stream =
+      to_segment ? segment_stream_ : command_stream_;
+  size_t offset = stream.size();
+  stream.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
   CommandHeader& header =
-      *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+      *reinterpret_cast<CommandHeader*>(stream.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
-  last_arguments_offset_ = offset + kCommandHeaderSizeElements;
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  if (!to_segment) {
+    // Offsets for patching refer to the main stream only.
+    last_arguments_offset_ = offset + kCommandHeaderSizeElements;
+  }
+  return stream.data() + (offset + kCommandHeaderSizeElements);
+}
+
+size_t DeferredCommandBuffer::CmdExecuteSegmentPlaceholder() {
+  assert_false(is_recording_segment());
+  auto& args = *reinterpret_cast<ArgsExecuteSegment*>(
+      WriteCommand(Command::kExecuteSegment, sizeof(ArgsExecuteSegment)));
+  args.first = segment_stream_.size();
+  args.count = 0;
+  return last_arguments_offset_;
+}
+
+void DeferredCommandBuffer::BeginSegment(size_t placeholder_arguments_offset) {
+  assert_false(is_recording_segment());
+  assert_true(placeholder_arguments_offset < command_stream_.size());
+  // The segment of an earlier placeholder must not grow after a later one
+  // started, or the ranges would interleave.
+  assert_true(reinterpret_cast<const ArgsExecuteSegment*>(
+                  command_stream_.data() + placeholder_arguments_offset)
+                      ->first +
+                  reinterpret_cast<const ArgsExecuteSegment*>(
+                      command_stream_.data() + placeholder_arguments_offset)
+                      ->count ==
+              segment_stream_.size());
+  segment_placeholder_ = placeholder_arguments_offset;
+}
+
+void DeferredCommandBuffer::EndSegment() {
+  if (!is_recording_segment()) {
+    return;
+  }
+  auto& args = *reinterpret_cast<ArgsExecuteSegment*>(command_stream_.data() +
+                                                      segment_placeholder_);
+  args.count = segment_stream_.size() - args.first;
+  segment_placeholder_ = SIZE_MAX;
 }
 
 void DeferredCommandBuffer::PatchRenderArea(size_t arguments_offset,

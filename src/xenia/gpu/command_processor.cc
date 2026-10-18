@@ -653,6 +653,11 @@ void CommandProcessor::UpdateWritePointer(uint32_t value) {
   XE_UNLIKELY_IF(cvars::log_ringbuffer_kickoff_initiator_bts) {
     LogKickoffInitator(value);
   }
+  if (auto before_publish =
+          GetXdroidGpuHooks().before_publish.load(std::memory_order_acquire)) {
+    before_publish(memory_, primary_buffer_ptr_, primary_buffer_size_ / 4,
+                   write_ptr_index_.load(std::memory_order_relaxed), value);
+  }
   write_ptr_index_ = value;
   if (auto on_kick =
           GetXdroidGpuHooks().on_kick.load(std::memory_order_acquire)) {

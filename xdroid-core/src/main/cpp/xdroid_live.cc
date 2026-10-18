@@ -4,8 +4,10 @@
 
 #include "xdroid_live.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -15,9 +17,22 @@
 #include <utility>
 #include <vector>
 
+#include "xdroid_audio_driver.h"
+#include "xdroid_events.h"
+#include "xdroid_latency.h"
 #include "xdroid_gamepad.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/gpu/graphics_system.h"
+#include "xenia/gpu/trace_writer.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
+
+DECLARE_bool(xdroid_diagnostics);
+DECLARE_path(trace_gpu_prefix);
+DEFINE_uint32(xdroid_gpu_trace_frames, 0,
+              "GPU-BENCH capture: set (live) to stream about this many frames "
+              "into <storage>/traces/; resets to 0 when done.",
+              "GPU");
 
 namespace xdroid {
 namespace {
@@ -33,6 +48,7 @@ constexpr std::string_view kLiveCvars[] = {
     "vulkan_allow_present_mode_fifo_relaxed",
     "timer_console_tick",
     "guest_spin_park",
+    "guest_spin_park_gpu_pct",
     "guest_spin_park_hints",
     "guest_spin_park_timeout_us",
     "xdroid_stall_inject_every_s",
@@ -40,6 +56,10 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_glitch_recorder",
     "vulkan_direct_resolve_transient_dest",
     "vulkan_direct_resolve_post_barrier",
+    "xdroid_direct_resolve_average",
+    "xdroid_direct_resolve_read_as_1x",
+    "xdroid_tex_link",
+    "vulkan_direct_resolve_pre_barrier",
     "vulkan_direct_resolve_transient_depth",
     "xdroid_depth_read_repeat",
     "xdroid_depth_read_skip_stencil",
@@ -53,19 +73,48 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_vdswap_wait_cp_us",
     "xdroid_cp_defer_to_swap",
     "xdroid_cp_defer_to_swap_us",
+    "xdroid_lat_trace",
+    "xdroid_lat_meter",
     "xdroid_vfetch_reupload_max_kb",
     "xdroid_draw_blackbox",
+    "xdroid_cp_ib_kick_hash",
+    "xdroid_cp_snapshot_ib",
     "ac6_hud_slot_join",
     "ac6_hud_slot_join_us",
     "xdroid_job_tracer",
     "xdroid_audio_conceal",
     "xdroid_audio_worker_nice",
+    "xdroid_audio_producer_nice",
+    "xdroid_audio_drc_ppm",
+    "xdroid_audio_route_watch",
     "xdroid_audio_producer_boost",
+    "xdroid_adpf",
+    "xdroid_adpf_target_pct",
+    "xdroid_adpf_power_efficiency",
+    "xdroid_adpf_audio",
+    "xdroid_adpf_audio_guest_tid",
+    "xdroid_adpf_audio_period_us",
+    "xdroid_adpf_audio_target_pct",
     "xdroid_time_coupling",
     "readback_resolve",
     "xdroid_time_coupling_slow_pct",
     "xdroid_time_coupling_due_pct",
     "xdroid_time_coupling_max_ms",
+    "ac6_unlock_probe",
+    "ac6_slowdown_guard",
+    "ac6_min_sim_fps",
+    "ac6_dt_snap",
+    "xdroid_pass_profiler",
+    "xdroid_pass_profiler_top",
+    "xdroid_clear_pass_mode",
+    "xdroid_pass_splice",
+    "vulkan_tight_render_area",
+    "gpu_force_msaa_1x",
+    "xdroid_tex_probe",
+    "xdroid_tex_unloaded_null",
+    "xdroid_async_textured_wait_ms",
+    "xdroid_async_textured_skip",
+    "xdroid_gpu_trace_frames",
 };
 
 bool IsLiveCvar(std::string_view name) {
@@ -206,12 +255,118 @@ void ApplyTable(const toml::table& table) {
   }
 }
 
+// MC-1 mark clip: the app writes clip.req next to live.toml on a user mark.
+// The glitch recorder saves the frames (clip_request_frame); this thread
+// saves the audio, both about 1 s after the mark so the clip also holds what
+// followed it.
+void PollClipRequest(const std::filesystem::path& storage_root,
+                     uint64_t& pending, std::chrono::steady_clock::time_point&
+                                            due) {
+  std::error_code error;
+  const std::filesystem::path request = storage_root / "clip.req";
+  // EVT-0: an automatic mark from a detector event, saved like a user mark
+  // plus event.txt naming the event.
+  static std::string event_text;
+  if (std::filesystem::exists(request, error)) {
+    std::filesystem::remove(request, error);
+    if (!pending && cvars::xdroid_diagnostics) {
+      pending = std::max<uint64_t>(xe::logging::GetFrameNumber(), 1);
+      event_text.clear();
+      xe::gpu::GetXdroidGpuHooks().clip_request_frame.store(
+          pending, std::memory_order_release);
+      due = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      XELOGI("XDROID-CLIP: mark at frame {}", pending);
+    }
+  }
+  uint64_t auto_frame;
+  std::string auto_text;
+  if (TakeAutoMark(auto_frame, auto_text)) {
+    if (pending) {
+      XELOGI("XDROID-CLIP: auto mark at frame {} merged into the pending one",
+             auto_frame);
+    } else {
+      pending = auto_frame;
+      event_text = std::move(auto_text);
+      xe::gpu::GetXdroidGpuHooks().clip_request_frame.store(
+          pending, std::memory_order_release);
+      due = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+      XELOGI("XDROID-CLIP: auto mark at frame {}: {}", pending, event_text);
+    }
+  }
+  if (!pending || std::chrono::steady_clock::now() < due) {
+    return;
+  }
+  const std::filesystem::path dir =
+      storage_root / "clips" / fmt::format("clip-f{:07}", pending);
+  std::filesystem::create_directories(dir, error);
+  if (!WriteAudioClip(dir / "audio.wav", dir / "audio.csv")) {
+    XELOGW("XDROID-CLIP: frame {}: no audio to save", pending);
+  }
+  if (!event_text.empty()) {
+    if (FILE* file = std::fopen((dir / "event.txt").string().c_str(), "w")) {
+      std::fprintf(file, "%s\n", event_text.c_str());
+      std::fclose(file);
+    }
+    event_text.clear();
+  }
+  pending = 0;
+}
+
+std::atomic<xe::gpu::GraphicsSystem*> g_graphics_system{nullptr};
+
+// GPU-BENCH capture state machine, polled every 200 ms (so the trace holds a
+// few frames more than asked).
+void PollTraceCapture(const std::filesystem::path& storage_root) {
+  static uint64_t end_frame = 0;
+  xe::gpu::GraphicsSystem* graphics_system =
+      g_graphics_system.load(std::memory_order_acquire);
+  if (!graphics_system) {
+    return;
+  }
+  const uint64_t frame = xe::logging::GetFrameNumber();
+  if (end_frame) {
+    if (frame >= end_frame) {
+      graphics_system->RequestEndTracing();
+      XELOGI("XDROID-BENCH: capture ends at frame {}", frame);
+      end_frame = 0;
+      cvars::xdroid_gpu_trace_frames = 0;
+    }
+    return;
+  }
+  if (!cvars::xdroid_gpu_trace_frames) {
+    return;
+  }
+#if XE_ENABLE_TRACE_WRITER_INSTRUMENTATION
+  std::error_code error;
+  const std::filesystem::path dir = storage_root / "traces";
+  std::filesystem::create_directories(dir, error);
+  cvars::trace_gpu_prefix = dir;
+  graphics_system->BeginTracing();
+  end_frame = frame + cvars::xdroid_gpu_trace_frames;
+  XELOGI("XDROID-BENCH: capturing frames {}-{} into {}", frame, end_frame,
+         dir.string());
+#else
+  XELOGW("XDROID-BENCH: this build has no trace writer "
+         "(XENIA_ENABLE_GPU_TRACE off); capture ignored");
+  cvars::xdroid_gpu_trace_frames = 0;
+#endif
+}
+
 void PollLoop(std::filesystem::path path) {
   std::filesystem::file_time_type last_write{};
   uintmax_t last_size = 0;
   bool seen = false;
+  uint64_t clip_pending = 0;
+  std::chrono::steady_clock::time_point clip_due;
+  auto summary_due = std::chrono::steady_clock::now() + std::chrono::minutes(1);
   while (true) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    PollClipRequest(path.parent_path(), clip_pending, clip_due);
+    PollTraceCapture(path.parent_path());
+    if (std::chrono::steady_clock::now() >= summary_due) {
+      summary_due += std::chrono::minutes(1);
+      LogEventSummary();
+    }
     std::error_code error;
     const auto write_time = std::filesystem::last_write_time(path, error);
     if (error) {
@@ -238,11 +393,17 @@ void PollLoop(std::filesystem::path path) {
 
 }  // namespace
 
+void SetLiveGraphicsSystem(xe::gpu::GraphicsSystem* graphics_system) {
+  g_graphics_system.store(graphics_system, std::memory_order_release);
+}
+
 void StartLiveConfig(const std::filesystem::path& path) {
   static std::once_flag started;
   std::call_once(started, [&path] {
     std::error_code error;
     std::filesystem::remove(path, error);
+    InstallEventBus();
+    InstallLatencyMeter();
     // Detached: it only sleeps and touches cvars, and lives as long as the
     // process.
     std::thread(PollLoop, path).detach();

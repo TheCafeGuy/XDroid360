@@ -5,6 +5,7 @@
 #include "xenia/gpu/vulkan/vulkan_glitch_recorder.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -59,6 +60,18 @@ bool VulkanGlitchRecorder::EnsureInitialized(
       return false;
     }
   }
+  image_create_info.extent = {kClipWidth, kClipHeight, 1};
+  for (uint32_t i = 0; i < kClipFrames; ++i) {
+    if (!ui::vulkan::util::CreateDedicatedAllocationImage(
+            vulkan_device, image_create_info,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, clip_images_[i],
+            clip_memory_[i])) {
+      XELOGE("XDroid360: glitch recorder: clip image creation failed");
+      Shutdown();
+      return false;
+    }
+  }
+  clip_frames_.fill(UINT64_MAX);
   image_create_info.extent = {kThumbWidth, kThumbHeight, 1};
   if (!ui::vulkan::util::CreateDedicatedAllocationImage(
           vulkan_device, image_create_info,
@@ -121,6 +134,19 @@ void VulkanGlitchRecorder::Shutdown() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device, thumb_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
                                          thumb_memory_);
+  if (!clip_writing_->load(std::memory_order_acquire)) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device,
+                                           clip_buffer_);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           clip_buffer_memory_);
+    clip_mapping_ = nullptr;
+  }
+  for (uint32_t i = 0; i < kClipFrames; ++i) {
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
+                                           clip_images_[i]);
+    ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                           clip_memory_[i]);
+  }
   for (uint32_t i = 0; i < kRingSize; ++i) {
     ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyImage, device,
                                            frames_[i]);
@@ -163,6 +189,7 @@ void VulkanGlitchRecorder::Poll(DeferredCommandBuffer& command_buffer,
     WriteDump();
     dump_submission_ = UINT64_MAX;
   }
+  PollClip(command_buffer, completed_submission, current_submission);
 
   // Finished thumbnails, oldest frame first.
   std::array<uint32_t, kRingSize> ready;
@@ -403,6 +430,131 @@ void VulkanGlitchRecorder::WriteDump() {
   }).detach();
 }
 
+void VulkanGlitchRecorder::PollClip(DeferredCommandBuffer& command_buffer,
+                                    uint64_t completed_submission,
+                                    uint64_t current_submission) {
+  if (clip_submission_ != UINT64_MAX) {
+    if (clip_submission_ <= completed_submission) {
+      WriteClip();
+      clip_submission_ = UINT64_MAX;
+    }
+    return;
+  }
+  const uint64_t request =
+      GetXdroidGpuHooks().clip_request_frame.load(std::memory_order_acquire);
+  // About 1 s after the mark, so the clip also shows what followed it.
+  if (!request || request == clip_request_done_ ||
+      logging::GetFrameNumber() < request + 30 ||
+      clip_writing_->load(std::memory_order_acquire)) {
+    return;
+  }
+  clip_request_done_ = request;
+  if (clips_ >= kMaxClips) {
+    XELOGW("XDROID-CLIP: frame {} not saved, {} clips this session", request,
+           clips_);
+    return;
+  }
+  if (!clip_buffer_) {
+    void* mapping;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device_, VkDeviceSize(kClipBytes) * kClipFrames,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, clip_buffer_,
+            clip_buffer_memory_) ||
+        vulkan_device_->functions().vkMapMemory(
+            vulkan_device_->device(), clip_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
+            &mapping) != VK_SUCCESS) {
+      XELOGE("XDROID-CLIP: readback buffer creation failed");
+      return;
+    }
+    clip_mapping_ = static_cast<const uint8_t*>(mapping);
+  }
+  TransferBarrier(command_buffer);
+  for (uint32_t i = 0; i < kClipFrames; ++i) {
+    clip_copied_frames_[i] = clip_frames_[i];
+    if (clip_frames_[i] == UINT64_MAX) {
+      continue;
+    }
+    VkBufferImageCopy copy = {};
+    copy.bufferOffset = VkDeviceSize(kClipBytes) * i;
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {kClipWidth, kClipHeight, 1};
+    command_buffer.CmdVkCopyImageToBuffer(
+        clip_images_[i], VK_IMAGE_LAYOUT_GENERAL, clip_buffer_, 1, &copy);
+  }
+  const uint64_t count = std::min<uint64_t>(timing_count_, kTimingSize);
+  clip_timing_.clear();
+  for (uint64_t k = timing_count_ - count; k < timing_count_; ++k) {
+    clip_timing_.push_back(timing_[k % kTimingSize]);
+  }
+  clip_request_ = request;
+  clip_submission_ = current_submission;
+  ++clips_;
+}
+
+void VulkanGlitchRecorder::WriteClip() {
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  VkMappedMemoryRange range;
+  range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+  range.pNext = nullptr;
+  range.memory = clip_buffer_memory_;
+  range.offset = 0;
+  range.size = VK_WHOLE_SIZE;
+  dfn.vkInvalidateMappedMemoryRanges(vulkan_device_->device(), 1, &range);
+  char name[32];
+  std::snprintf(name, sizeof(name), "clip-f%07llu",
+                static_cast<unsigned long long>(clip_request_));
+  const std::filesystem::path dir = output_dir_.parent_path() / "clips" / name;
+  XELOGI("XDROID-CLIP: mark at frame {}: {} frames saved to {}", clip_request_,
+         std::count_if(clip_copied_frames_.begin(), clip_copied_frames_.end(),
+                       [](uint64_t f) { return f != UINT64_MAX; }),
+         xe::path_to_utf8(dir));
+  // Written off the GPU thread; no new clip until it has read the buffer.
+  clip_writing_->store(true, std::memory_order_release);
+  std::thread([dir, mapping = clip_mapping_, frames = clip_copied_frames_,
+               timing = std::move(clip_timing_), mark = clip_request_,
+               writing = clip_writing_] {
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    std::vector<uint8_t> rgb(size_t(kClipWidth) * kClipHeight * 3);
+    for (uint32_t i = 0; i < kClipFrames; ++i) {
+      if (frames[i] == UINT64_MAX) {
+        continue;
+      }
+      const uint8_t* src = mapping + size_t(kClipBytes) * i;
+      for (size_t p = 0; p < size_t(kClipWidth) * kClipHeight; ++p) {
+        rgb[p * 3] = src[p * 4];
+        rgb[p * 3 + 1] = src[p * 4 + 1];
+        rgb[p * 3 + 2] = src[p * 4 + 2];
+      }
+      char file_name[32];
+      std::snprintf(file_name, sizeof(file_name), "f%07llu.ppm",
+                    static_cast<unsigned long long>(frames[i]));
+      if (FILE* file = xe::filesystem::OpenFile(dir / file_name, "wb")) {
+        std::fprintf(file, "P6\n%u %u\n255\n", kClipWidth, kClipHeight);
+        std::fwrite(rgb.data(), 1, rgb.size(), file);
+        std::fclose(file);
+      }
+    }
+    writing->store(false, std::memory_order_release);
+    // Every swap: a stutter is a long interval between two captures.
+    if (FILE* file = xe::filesystem::OpenFile(dir / "frames.csv", "w")) {
+      std::fprintf(file, "frame,t_us,dt_ms,mark\n");
+      int64_t previous = 0;
+      for (const auto& [frame, t_us] : timing) {
+        std::fprintf(file, "%llu,%lld,%.1f,%d\n",
+                     static_cast<unsigned long long>(frame),
+                     static_cast<long long>(t_us),
+                     previous ? double(t_us - previous) / 1000.0 : 0.0,
+                     frame == mark ? 1 : 0);
+        previous = t_us;
+      }
+      std::fclose(file);
+    }
+  }).detach();
+}
+
 void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
                                    VkImage guest_output, uint32_t width,
                                    uint32_t height, uint64_t current_submission,
@@ -411,8 +563,8 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
     return;
   }
   if (!images_initialized_) {
-    std::array<VkImageMemoryBarrier, kRingSize + 1> barriers;
-    for (uint32_t i = 0; i <= kRingSize; ++i) {
+    std::array<VkImageMemoryBarrier, kRingSize + 1 + kClipFrames> barriers;
+    for (uint32_t i = 0; i < barriers.size(); ++i) {
       VkImageMemoryBarrier& barrier = barriers[i];
       barrier = {};
       barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -422,7 +574,9 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
       barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
       barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
       barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-      barrier.image = i < kRingSize ? frames_[i] : thumb_;
+      barrier.image = i < kRingSize    ? frames_[i]
+                      : i == kRingSize ? thumb_
+                                       : clip_images_[i - kRingSize - 1];
       barrier.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
     }
     command_buffer.CmdVkPipelineBarrier(
@@ -453,6 +607,21 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
   copy.imageExtent = {kThumbWidth, kThumbHeight, 1};
   command_buffer.CmdVkCopyImageToBuffer(thumb_, VK_IMAGE_LAYOUT_GENERAL,
                                         thumb_buffer_, 1, &copy);
+  // Mark clip: every swap's time, every second frame's image. Log frames,
+  // the scale of the marks.
+  const uint64_t log_frame = logging::GetFrameNumber();
+  timing_[timing_count_++ % kTimingSize] = {
+      log_frame, std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()};
+  if (!(frame & 1)) {
+    const uint32_t clip_index = uint32_t((frame >> 1) % kClipFrames);
+    blit.dstOffsets[1] = {int32_t(kClipWidth), int32_t(kClipHeight), 1};
+    command_buffer.CmdVkBlitImage(
+        guest_output, VK_IMAGE_LAYOUT_GENERAL, clip_images_[clip_index],
+        VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    clip_frames_[clip_index] = log_frame;
+  }
   Slot& slot = slots_[slot_index];
   slot.frame = frame;
   slot.submission = current_submission;

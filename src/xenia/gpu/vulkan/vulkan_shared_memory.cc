@@ -662,9 +662,26 @@ bool VulkanSharedMemory::UploadRanges(
       std::make_pair(range_front.first << page_size_log2(),
                      (range_back.first + range_back.second - range_front.first)
                          << page_size_log2()));
+  // GE-4: copy before the open guest pass instead of ending it, unless a draw
+  // already recorded in that pass read one of these pages.
+  bool upload_spliced = command_processor_.IsSpliceCandidate(
+      VulkanCommandProcessor::kSpliceUploads);
+  for (uint32_t i = 0; upload_spliced && i < num_upload_ranges; ++i) {
+    upload_spliced =
+        !WasRangeReadByDraws(upload_page_ranges[i].first << page_size_log2(),
+                             upload_page_ranges[i].second << page_size_log2(),
+                             command_processor_.pass_first_draw_serial(),
+                             command_processor_.draw_serial());
+  }
+  upload_spliced =
+      upload_spliced &&
+      command_processor_.BeginSplice(VulkanCommandProcessor::kSpliceUploads);
   // Submit barriers (may end render pass) before pushing debug marker so
   // EndRenderPass is not inside the SharedMem Upload marker.
-  command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kUpload);
+  if (!upload_spliced) {
+    command_processor_.TagPassEnd(
+        VulkanCommandProcessor::PassEndReason::kUpload);
+  }
   command_processor_.SubmitBarriers(true);
 
   // Calculate total upload size for debug marker.
@@ -770,6 +787,9 @@ bool VulkanSharedMemory::UploadRanges(
     upload_regions_.clear();
   }
   command_processor_.PopDebugMarker();
+  if (upload_spliced) {
+    command_processor_.EndSplice();
+  }
   return successful;
 }
 

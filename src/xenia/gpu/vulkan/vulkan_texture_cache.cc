@@ -39,6 +39,13 @@ DEFINE_bool(
     "(Adreno), where the copy is faster.",
     "Vulkan");
 
+DEFINE_bool(xdroid_tex_link, false,
+            "TEX-1b: a direct resolve that writes a whole texture sampled in "
+            "the previous frame also stores its pixels linearly and copies "
+            "them into the texture, so the next sampling skips the load "
+            "(untile dispatch + copy) from guest memory. Live-switchable.",
+            "GPU");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
@@ -605,6 +612,8 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
     if (binding_texture != nullptr) {
       // Will be referenced by the command buffer, so mark as used.
       binding_texture->MarkAsUsed();
+      binding_texture->set_sample_draw_serial(command_processor_.draw_serial());
+      binding_texture->set_sample_frame(probe_frame());
       VulkanTexture::Usage old_usage =
           binding_texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
@@ -624,6 +633,9 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
         static_cast<VulkanTexture*>(binding->texture_signed);
     if (binding_texture_signed != nullptr) {
       binding_texture_signed->MarkAsUsed();
+      binding_texture_signed->set_sample_draw_serial(
+          command_processor_.draw_serial());
+      binding_texture_signed->set_sample_frame(probe_frame());
       VulkanTexture::Usage old_usage = binding_texture_signed->SetUsage(
           VulkanTexture::Usage::kGuestShaderSampled);
       if (old_usage != VulkanTexture::Usage::kGuestShaderSampled) {
@@ -664,7 +676,7 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(
       } else {
         texture = binding->texture;
       }
-      if (texture) {
+      if (texture && !IsTextureHiddenAsUnloaded(texture)) {
         image_view =
             static_cast<VulkanTexture*>(texture)->GetOrCreate3DAs2DImageView(
                 use_signed, binding->host_swizzle);
@@ -1227,6 +1239,142 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
       new VulkanTexture(*this, key, image, allocation));
 }
 
+bool VulkanTextureCache::BeginResolveLink(
+    const draw_util::ResolveInfo& resolve_info, bool spliced) {
+  resolve_link_texture_ = nullptr;
+  if (!cvars::xdroid_tex_link || IsDrawResolutionScaled()) {
+    return false;
+  }
+  uint32_t start = resolve_info.copy_dest_extent_start;
+  if (!resolve_info.copy_dest_extent_length || (start & 0xFFF) ||
+      resolve_info.copy_dest_base != start) {
+    return false;
+  }
+  Texture* candidate = GetResolveLinkCandidate(start >> 12);
+  if (!candidate) {
+    return false;
+  }
+  VulkanTexture& texture = static_cast<VulkanTexture&>(*candidate);
+  const TextureKey& key = texture.key();
+  const draw_util::ResolveCopyDestCoordinateInfo& dest_coordinate_info =
+      resolve_info.copy_dest_coordinate_info;
+  const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
+  // The resolve's texels are the texture's texels, all of them: same tiled
+  // addressing (base, pitch, height), same bits (format, endian), and a
+  // rectangle covering the texture. Only textures someone still samples.
+  if (dest_coordinate_info.offset_x_div_8 ||
+      dest_coordinate_info.offset_y_div_8 || dest_info.copy_dest_array ||
+      dest_coordinate_info.pitch_aligned_div_32 != key.pitch ||
+      dest_coordinate_info.height_aligned_div_32 !=
+          (key.GetHeight() + 31) / 32 ||
+      uint32_t(dest_info.copy_dest_format) != uint32_t(key.format) ||
+      uint32_t(dest_info.copy_dest_endian) != uint32_t(key.endianness) ||
+      resolve_info.copy_dest_extent_length < texture.GetGuestBaseSize() ||
+      resolve_info.coordinate_info.width_div_8 * 8 < key.GetWidth() ||
+      resolve_info.height_div_8 * 8 < key.GetHeight() ||
+      !texture.ever_loaded() || texture.sample_frame() + 1 < probe_frame()) {
+    return false;
+  }
+  // A load that only detiles and endian-swaps 32-bit blocks, so the bits
+  // before the resolve's endian swap are what the load would produce.
+  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+  bool host_format_is_signed;
+  if (IsSignedVersionSeparateForFormat(key)) {
+    host_format_is_signed = bool(key.signed_separate);
+  } else {
+    host_format_is_signed =
+        host_format_pair.format_unsigned.load_shader == kLoadShaderIndexUnknown;
+  }
+  const HostFormat& host_format = host_format_is_signed
+                                      ? host_format_pair.format_signed
+                                      : host_format_pair.format_unsigned;
+  if (host_format.load_shader != kLoadShaderIndex32bpb ||
+      host_format.block_compressed) {
+    return false;
+  }
+  // A copy recorded before the open pass would be seen by draws already in it.
+  if (spliced && command_processor_.IsDrawSerialEarlierInPass(
+                     texture.sample_draw_serial())) {
+    return false;
+  }
+  resolve_link_texture_ = &texture;
+  return true;
+}
+
+void VulkanTextureCache::RecordResolveLinkCopy(VkBuffer buffer,
+                                               uint32_t pitch_pixels,
+                                               uint32_t rows, bool spliced) {
+  VulkanTexture* texture = resolve_link_texture_;
+  if (!texture) {
+    return;
+  }
+  if (spliced) {
+    command_processor_.NoteSplicedImage(texture->image());
+  }
+  texture->MarkAsUsed();
+  VulkanTexture::Usage old_usage =
+      texture->SetUsage(VulkanTexture::Usage::kTransferDestination);
+  if (old_usage != VulkanTexture::Usage::kTransferDestination) {
+    VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+    VkAccessFlags src_access_mask, dst_access_mask;
+    VkImageLayout old_layout, new_layout;
+    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
+                         old_layout);
+    GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination,
+                         dst_stage_mask, dst_access_mask, new_layout);
+    command_processor_.PushImageMemoryBarrier(
+        texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
+        src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
+        old_layout, new_layout);
+  } else {
+    // Another copy may have written it earlier in this submission.
+    command_processor_.PushImageMemoryBarrier(
+        texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED, false);
+  }
+  command_processor_.SubmitBarriers(true);
+  const TextureKey& key = texture->key();
+  VkBufferImageCopy* copy_region =
+      command_processor_.deferred_command_buffer().CmdCopyBufferToImageEmplace(
+          buffer, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+  *copy_region = {};
+  copy_region->bufferRowLength = pitch_pixels;
+  copy_region->bufferImageHeight = rows;
+  copy_region->imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy_region->imageSubresource.layerCount = 1;
+  copy_region->imageExtent.width = key.GetWidth();
+  copy_region->imageExtent.height = key.GetHeight();
+  copy_region->imageExtent.depth = 1;
+}
+
+void VulkanTextureCache::EndResolveLink(bool copied) {
+  VulkanTexture* texture = resolve_link_texture_;
+  resolve_link_texture_ = nullptr;
+  if (!texture || !copied) {
+    return;
+  }
+  if (CompleteResolveLink(*texture)) {
+    ++resolve_links_;
+    resolve_link_bytes_ += texture->GetGuestBaseSize();
+  } else {
+    ++resolve_link_unwatched_;
+  }
+  uint64_t frame = probe_frame();
+  if (frame - resolve_link_summary_frame_ >= 600) {
+    XELOGI("XDROID-TEXLINK frames={} links={} kb={} unwatched={}",
+           frame - resolve_link_summary_frame_, resolve_links_,
+           resolve_link_bytes_ >> 10, resolve_link_unwatched_);
+    resolve_link_summary_frame_ = frame;
+    resolve_links_ = 0;
+    resolve_link_bytes_ = 0;
+    resolve_link_unwatched_ = 0;
+  }
+}
+
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                                                bool load_base,
                                                                bool load_mips) {
@@ -1248,6 +1396,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                       : host_format_pair.format_unsigned;
   LoadShaderIndex load_shader = host_format.load_shader;
   if (load_shader == kLoadShaderIndexUnknown) {
+    load_fail_reason_ = "no load shader for the format";
     return false;
   }
   LogTextureLoad(texture_key, load_shader, load_base, load_mips);
@@ -1255,6 +1404,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                             ? load_pipelines_scaled_[load_shader]
                             : load_pipelines_[load_shader];
   if (pipeline == VK_NULL_HANDLE) {
+    load_fail_reason_ = "load pipeline missing";
     return false;
   }
   const LoadShaderInfo& load_shader_info = GetLoadShaderInfo(load_shader);
@@ -1399,6 +1549,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VK_ACCESS_SHADER_WRITE_BIT));
   VkBuffer scratch_buffer = scratch_buffer_acquisition.buffer();
   if (scratch_buffer == VK_NULL_HANDLE) {
+    load_fail_reason_ = "scratch buffer acquisition failed";
     return false;
   }
 
@@ -1425,6 +1576,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VulkanCommandProcessor::SingleTransientDescriptorLayout ::
               kStorageBuffer);
   if (!descriptor_set_dest) {
+    load_fail_reason_ = "transient descriptor allocation failed";
     return false;
   }
   VkDescriptorBufferInfo write_descriptor_set_dest_buffer_info;
@@ -1461,6 +1613,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
               VulkanCommandProcessor::SingleTransientDescriptorLayout ::
                   kStorageBuffer);
       if (!descriptor_set_source_base) {
+        load_fail_reason_ = "transient descriptor allocation failed";
         return false;
       }
     }
@@ -1491,6 +1644,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             write_descriptor_set_source_base_buffer_info.range = xe::align(
                 guest_size * draw_resolution_scale_area, uint32_t(16));
           } else {
+            load_fail_reason_ = "scaled resolve buffer unavailable";
             XELOGE(
                 "Scaled resolve texture load: Failed to get current scaled "
                 "buffer for texture at 0x{:08X}",
@@ -1498,6 +1652,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             return false;
           }
         } else {
+          load_fail_reason_ = "scaled resolve buffer unavailable";
           XELOGE(
               "Scaled resolve texture load: Failed to make range current for "
               "texture at 0x{:08X}",
@@ -1505,6 +1660,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           return false;
         }
       } else {
+        load_fail_reason_ = "scaled resolve buffer unavailable";
         XELOGE(
             "Scaled resolve texture load: Failed to ensure scaled memory for "
             "texture at 0x{:08X}",
@@ -1550,6 +1706,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
               VulkanCommandProcessor::SingleTransientDescriptorLayout ::
                   kStorageBuffer);
       if (!descriptor_set_source_mips) {
+        load_fail_reason_ = "transient descriptor allocation failed";
         return false;
       }
       if (texture_key.scaled_resolve) {
@@ -1572,6 +1729,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             write_descriptor_set_source_mips_buffer_info.range = xe::align(
                 guest_size * draw_resolution_scale_area, uint32_t(16));
           } else {
+            load_fail_reason_ = "scaled resolve buffer unavailable";
             XELOGE(
                 "Scaled resolve texture load: Failed to get current scaled "
                 "buffer for mips at 0x{:08X}",
@@ -1579,6 +1737,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
             return false;
           }
         } else {
+          load_fail_reason_ = "scaled resolve buffer unavailable";
           XELOGE(
               "Scaled resolve texture load: Failed to make range current for "
               "mips at 0x{:08X}",
@@ -1618,6 +1777,20 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                write_descriptor_sets.data(), 0, nullptr);
   }
   vulkan_shared_memory.Use(VulkanSharedMemory::Usage::kRead);
+
+  // GE-4: record the whole load into the segment that runs before the open
+  // guest pass instead of ending it, unless a draw already recorded in that
+  // pass sampled this image (it would see the new contents).
+  const bool load_spliced = !texture_key.scaled_resolve &&
+                            command_processor_.IsSpliceCandidate(
+                                VulkanCommandProcessor::kSpliceTextureLoads) &&
+                            !command_processor_.IsDrawSerialEarlierInPass(
+                                vulkan_texture.sample_draw_serial()) &&
+                            command_processor_.BeginSplice(
+                                VulkanCommandProcessor::kSpliceTextureLoads);
+  if (load_spliced) {
+    command_processor_.NoteSplicedImage(vulkan_texture.image());
+  }
 
   // Submit the copy buffer population commands.
 
@@ -1954,6 +2127,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
           VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
           VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
       blit_staging_image = staging_image;
+      if (load_spliced) {
+        command_processor_.NoteSplicedImage(staging_image);
+      }
     }
   }
 
@@ -2190,6 +2366,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
   }
 
   command_processor_.PopDebugMarker();
+  if (load_spliced) {
+    command_processor_.EndSplice();
+  }
   return true;
 }
 
@@ -2206,7 +2385,8 @@ void VulkanTextureCache::UpdateTextureBindingsImpl(
         vulkan_texture_bindings_[binding_index];
     vulkan_binding.Reset();
     const TextureBinding* binding = GetValidTextureBinding(binding_index);
-    if (!binding) {
+    if (!binding || IsTextureHiddenAsUnloaded(binding->texture) ||
+        IsTextureHiddenAsUnloaded(binding->texture_signed)) {
       continue;
     }
     if (IsSignedVersionSeparateForFormat(binding->key)) {

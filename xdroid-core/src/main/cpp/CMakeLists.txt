@@ -5,6 +5,12 @@
 # NDK toolchain and the ABI. Not meant to be configured on its own.
 cmake_minimum_required(VERSION 3.22)
 
+# Tested = shipped: the Gradle debug variant (debuggable, for adb run-as)
+# builds the exact native code of the release, so no upstream Debug-only path
+# ($<CONFIG:Debug>: DEBUG) runs in tests that players never get. AGP always
+# passes its own CMAKE_BUILD_TYPE, so it is overridden here.
+set(CMAKE_BUILD_TYPE Release)
+
 project(xdroid360 LANGUAGES C CXX ASM)
 
 # cpp -> main -> src -> xdroid-core -> repository root.
@@ -80,18 +86,28 @@ add_library(xdroid360 SHARED
   xdroid_ac6_fixes.cc
   xdroid_ac6_jobs.cc
   xdroid_ac6_jobs_trace.cc
+  xdroid_ac6_timing.cc
+  xdroid_adpf.cc
   xdroid_app.cc
   xdroid_audio_driver.cc
   xdroid_content.cc
   xdroid_defaults.cc
   xdroid_driver.cc
+  xdroid_events.cc
   xdroid_gamepad.cc
+  xdroid_gpu_bench.cc
+  xdroid_ib_snapshot.cc
   xdroid_jni.cc
+  xdroid_latency.cc
   xdroid_live.cc
   xdroid_time_coupling.cc
 )
 add_dependencies(xdroid360 main_hook hook_impl)
 target_compile_features(xdroid360 PRIVATE cxx_std_20 c_std_17)
+# GPU-BENCH capture builds: our sources must see the trace writer too.
+if(XENIA_ENABLE_GPU_TRACE)
+  target_compile_definitions(xdroid360 PRIVATE XE_OPTION_GPU_TRACE=1)
+endif()
 # Logged at boot as "XDroid360: build <hash>" to match a binary to a commit.
 add_custom_target(xdroid_build_id
   COMMAND "${CMAKE_COMMAND}" "-DROOT=${XDROID_ROOT}"

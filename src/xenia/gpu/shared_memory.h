@@ -74,10 +74,30 @@ class SharedMemory {
   // ensures the host GPU memory backing the range are resident. Returns true if
   // the range has been fully updated and is usable.
   bool RequestRange(uint32_t start, uint32_t length);
+
+  // XDroid GE-4 pass splice: while nonzero, RequestRange records this draw
+  // serial on every page it covers, so later work can tell whether a page was
+  // read by a draw already recorded in the open render pass.
+  void SetDrawReadMarking(uint64_t draw_serial) {
+    draw_read_marking_serial_ = draw_serial;
+  }
+  uint64_t draw_read_marking() const { return draw_read_marking_serial_; }
+  // Whether any page of the range carries a mark in [first_serial, end_serial).
+  bool WasRangeReadByDraws(uint32_t start, uint32_t length,
+                           uint64_t first_serial, uint64_t end_serial) const;
   // Returns whether every page in the range is currently valid in the host GPU
   // memory copy. Hold the global critical region if relying on this for state
   // transitions such as watch installation.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
+  // Whether any page in the range holds GPU-written data (resolve, memexport)
+  // that guest RAM may lack. Lockless, for diagnostics (XDROID-TEXMISS).
+  bool IsRangeAnyGpuWritten(uint32_t start, uint32_t length) const;
+  // Whether 32 16-byte samples spread over the range of guest RAM are all
+  // zero (data likely not written yet). Diagnostics only (XDROID-TEXMISS).
+  bool IsRangeSampledZero(uint32_t start, uint32_t length) const;
+  // XXH3 of a range of guest RAM, 0 if out of bounds. Diagnostics only
+  // (XDROID-TEXCENSUS: did a reload bring the same bytes back?).
+  uint64_t HashRange(uint32_t start, uint32_t length) const;
 
   void TryFindUploadRange(const uint32_t& block_first,
                           const uint32_t& block_last,
@@ -187,6 +207,10 @@ class SharedMemory {
   // on it is not hard - the access callback takes a range as an argument, and
   // touched pages of the buffer of this size will be invalidated).
   uint32_t page_size_log2_;
+
+  uint64_t draw_read_marking_serial_ = 0;
+  std::vector<uint64_t> page_draw_read_serials_;
+  void MarkDrawRead(uint32_t start, uint32_t length);
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;

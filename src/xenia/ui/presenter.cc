@@ -9,6 +9,8 @@
 
 #include "xenia/ui/presenter.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -66,6 +68,57 @@ DEFINE_int32(
     present_safe_area_y, 100,
     "Percentage of the image height that can be kept when presenting to "
     "maintain aspect ratio without letterboxing or stretching.",
+    "Display");
+
+// UPS-1: present below the panel resolution and let the compositor scale up.
+// Android's swapchain always uses NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW,
+// so a smaller swapchain is stretched to the window by SurfaceFlinger / the
+// display hardware instead of by the emulator's paint passes. Only the
+// presentation (guest output stretch, FSR/CAS, UI, pre-rotation copy) gets
+// cheaper; the guest rendering resolution is unchanged.
+DEFINE_int32(
+    present_resolution_scale_percent, 50,
+    "Android: percentage of the window size used for the swapchain (25-100). "
+    "Lower values make the final stretch, the post-processing effects "
+    "(postprocess_scaling_and_sharpening) and the UI cheaper on the GPU; the "
+    "display scales the image to the panel. 50 on a 1440p-tall panel gives a "
+    "720p-tall swapchain, 1:1 with a 720p game. Does not change the game's "
+    "rendering resolution. Can be changed live.",
+    "Display");
+DEFINE_int32(
+    present_max_height, 0,
+    "Android: cap on the shorter side of the swapchain in pixels (0 = no cap), "
+    "applied after present_resolution_scale_percent. With "
+    "postprocess_scaling_and_sharpening = fsr, 1080 upscales a 720p game to "
+    "1080p with FSR and lets the display do the rest, without detecting the "
+    "panel by name. Does not change the game's rendering resolution. Can be "
+    "changed live.",
+    "Display");
+
+// GSR-1: Snapdragon Game Super Resolution 1 for the final upscale.
+DEFINE_bool(
+    present_snapdragon_gsr, false,
+    "Upscale the game image to the output with Snapdragon Game Super "
+    "Resolution 1 (one pass, tuned for Adreno) instead of the effect chosen in "
+    "postprocess_scaling_and_sharpening. Used only when the output is larger "
+    "than the game image (see present_max_height) and the graphics backend "
+    "supports it (Vulkan). Can be changed live.",
+    "Display");
+// OEM-1: the phone's own game post-processing (OnePlus Game Manager and
+// similar) can't be detected without new JNI, so the user states it.
+DEFINE_string(
+    present_oem_postprocess, "none",
+    "Post-processing the phone itself applies to this app, so the emulator "
+    "doesn't stack its own on top: [none, sharpen, interpolate, both].\n"
+    " sharpen: the phone sharpens or upscales the image (OnePlus Game Manager "
+    "super resolution and similar). The emulator adds no sharpening of its "
+    "own: CAS is skipped, FSR runs without RCAS, GSR uses its soft variant.\n"
+    " interpolate: the phone interpolates frames (OnePlus Game Manager frame "
+    "insertion and similar). Keep a steady 30 FPS cadence: frame rate "
+    "unlocks (ac6_unlock_probe) and emulator-side frame generation are "
+    "refused while it is set.\n"
+    " both: sharpen + interpolate.\n"
+    "Can be changed live.",
     "Display");
 
 namespace xe {
@@ -857,8 +910,24 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
 
-  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
+  // OEM-1: no sharpening of our own on top of the phone's.
+  const bool oem_sharpen = IsOemSharpeningActive();
+  // GSR-1: one Snapdragon GSR pass for the whole upscale, replacing the AMD
+  // effects (the bilinear stretch below handles any clamp to max_rt).
+  const bool use_gsr = cvars::present_snapdragon_gsr &&
+                       IsSnapdragonGsrSupported() &&
+                       (properties.frontbuffer_width < output_width_clamped ||
+                        properties.frontbuffer_height < output_height_clamped);
+  if (use_gsr) {
+    assert_true(flow.effect_count < flow.effects.size());
+    flow.effect_output_sizes[flow.effect_count] =
+        std::make_pair(output_width_clamped, output_height_clamped);
+    flow.effects[flow.effect_count++] =
+        oem_sharpen ? GuestOutputPaintEffect::kSnapdragonGsrSoft
+                    : GuestOutputPaintEffect::kSnapdragonGsr;
+  } else if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kCas &&
+              !oem_sharpen) ||
+             config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr) {
     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
     // good for up to 2x2 upscaling due to the way they fetch texels.
     // CAS is primarily a sharpening filter, not an upscaling one (its upscaling
@@ -903,7 +972,12 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
       }
       assert_true(flow.effect_count < flow.effects.size());
       flow.effect_output_sizes[flow.effect_count] = ffx_last_size;
-      flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kFsrRcas;
+      // OEM-1: EASU can't be final, so a 1:1 bilinear copy replaces RCAS.
+      flow.effects[flow.effect_count++] =
+          oem_sharpen ? GuestOutputPaintEffect::kBilinear
+                      : GuestOutputPaintEffect::kFsrRcas;
+    } else if (oem_sharpen) {
+      // OEM-1: FSR with nothing to upsample would only sharpen (CAS).
     } else {
       // AMD FidelityFX Contrast Adaptive Sharpening - sharpen or downsample, or
       // upsample up to 2x2 if CAS is specified to be used for upscaling too.
@@ -1158,6 +1232,9 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(
     uint32_t surface_width = 0, surface_height = 0;
     bool surface_area_available =
         surface_->GetSize(surface_width, surface_height);
+    if (surface_area_available) {
+      ApplyPresentResolutionScale(surface_width, surface_height);
+    }
     if (!surface_area_available) {
       // The surface is currently zero-area (or has become zero-area), try again
       // when it's resized.
@@ -1302,6 +1379,57 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #else
   return true;
 #endif  // XE_PLATFORM
+}
+
+void Presenter::ApplyPresentResolutionScale(uint32_t& width, uint32_t& height) {
+#if XE_PLATFORM_ANDROID
+  // The window may report the buffer size of the previous swapchain rather than
+  // its own size: never scale an already scaled size again.
+  if (present_scale_last_out_width_ &&
+      (present_scale_last_out_width_ != present_scale_last_in_width_ ||
+       present_scale_last_out_height_ != present_scale_last_in_height_) &&
+      width == present_scale_last_out_width_ &&
+      height == present_scale_last_out_height_) {
+    width = present_scale_last_in_width_;
+    height = present_scale_last_in_height_;
+  }
+  const uint32_t in_width = width, in_height = height;
+  const uint32_t percent = uint32_t(
+      std::min(std::max(cvars::present_resolution_scale_percent, 25), 100));
+  if (percent < 100) {
+    width = std::max(uint32_t(1), (width * percent + 50) / 100);
+    height = std::max(uint32_t(1), (height * percent + 50) / 100);
+  }
+  const uint32_t max_height =
+      uint32_t(std::min(std::max(cvars::present_max_height, 0), 4095));
+  const uint32_t short_side = std::min(width, height);
+  if (max_height && short_side > max_height) {
+    width = std::max(
+        uint32_t(1),
+        uint32_t((uint64_t(width) * max_height + short_side / 2) / short_side));
+    height = std::max(
+        uint32_t(1), uint32_t((uint64_t(height) * max_height + short_side / 2) /
+                              short_side));
+  }
+  if (in_width != present_scale_last_in_width_ ||
+      in_height != present_scale_last_in_height_ ||
+      width != present_scale_last_out_width_ ||
+      height != present_scale_last_out_height_) {
+    XELOGI(
+        "Presenter: present resolution scale {}% max height {}: window {}x{} "
+        "-> {}x{}",
+        percent, max_height, in_width, in_height, width, height);
+  }
+  present_scale_last_in_width_ = in_width;
+  present_scale_last_in_height_ = in_height;
+  present_scale_last_out_width_ = width;
+  present_scale_last_out_height_ = height;
+#endif  // XE_PLATFORM_ANDROID
+}
+
+bool Presenter::IsOemSharpeningActive() {
+  return cvars::present_oem_postprocess == "sharpen" ||
+         cvars::present_oem_postprocess == "both";
 }
 
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {

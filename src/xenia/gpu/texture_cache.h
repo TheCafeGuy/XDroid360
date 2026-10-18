@@ -146,6 +146,33 @@ class TextureCache {
   // pre-check to skip the full RequestTextures call when nothing changed.
   bool AnyUsedTextureRequestWorkPending(uint32_t used_texture_mask) const;
 
+  // XDROID-TEXMISS (xdroid_tex_probe): async pipeline stand-ins the draw path
+  // used for a textured draw, counted into the probe's summary line.
+  enum class ProbeStandIn { kPlaceholder, kSkipped, kWaited, kWaitTimedOut };
+  // TEX-1b Phase 0 (xdroid_tex_census): what each resolve wrote, so a later
+  // GPU-invalidated load can tell whether that resolve could have written the
+  // texture directly (an exact key match) or why not.
+  struct CensusResolve {
+    uint32_t extent_start = 0;
+    uint32_t extent_length = 0;
+    uint32_t pitch_div_32 = 0;
+    uint32_t height_div_32 = 0;
+    uint32_t offset_x_div_8 = 0;
+    uint32_t offset_y_div_8 = 0;
+    uint32_t format = 0;  // xenos::ColorFormat of the copy destination.
+    uint32_t endian = 0;  // xenos::Endian128 of the copy destination.
+    uint32_t msaa_samples = 0;
+    bool fast = false;      // A kFast* copy shader (a pure bit move).
+    bool direct = false;    // Read the host render targets directly.
+    uint32_t resolves = 0;  // Resolves to this page since the last load.
+  };
+  void CensusNoteResolve(const CensusResolve& resolve);
+  void ProbeNoteStandIn(ProbeStandIn kind);
+
+  uint64_t probe_frame() const {
+    return probe_frame_.load(std::memory_order_relaxed);
+  }
+
   // "ActiveTexture" means as of the latest RequestTextures call.
 
   uint32_t GetActiveTextureHostSwizzle(uint32_t fetch_constant_index) const {
@@ -153,6 +180,16 @@ class TextureCache {
         GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->host_swizzle : xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
   }
+  // SHD-1c: the post-swizzle signs a binding of this fetch constant gets
+  // (exactly what GetActiveTextureSwizzledSigns returns after RequestTextures).
+  static uint8_t SwizzledSignsFromFetchConstant(
+      const xenos::xe_gpu_texture_fetch_t& fetch) {
+    TextureKey key;
+    uint8_t swizzled_signs;
+    BindingInfoFromFetchConstant(fetch, key, &swizzled_signs);
+    return swizzled_signs;
+  }
+
   uint8_t GetActiveTextureSwizzledSigns(uint32_t fetch_constant_index) const {
     const TextureBinding* binding =
         GetValidTextureBinding(fetch_constant_index);
@@ -325,6 +362,30 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // XDROID-TEXMISS probe state. ever_loaded is kept even with the probe off
+    // (xdroid_tex_unloaded_null reads it): an image that was never loaded has
+    // undefined contents, which on a recycled allocation is another texture.
+    bool ever_loaded() const { return ever_loaded_; }
+    struct ProbeState {
+      uint64_t first_load_frame = 0;
+      // Written under the global critical region by the watch callback, read
+      // at the next load: bit 0 = CPU write, bit 1 = GPU write (resolve or
+      // memexport) soon after the first load.
+      uint8_t early_invalidation = 0;
+      bool reported_unloaded = false;
+    };
+    ProbeState probe_;
+    // XDROID-TEXCENSUS and TEX-1a state: hashes of the guest bytes in the
+    // host texture (0 = unknown). inval is written by the
+    // watch callback under the global critical region and consumed by the
+    // next load: bit 0 base CPU, 1 base GPU, 2 mips CPU, 3 mips GPU write.
+    struct CensusState {
+      uint64_t base_hash = 0;
+      uint64_t mips_hash = 0;
+      uint8_t inval = 0;
+    };
+    CensusState census_;
+
    protected:
     // track_usage: if false, the texture won't be added to the LRU tracking
     // list. Use this for wrapper textures that shouldn't participate in cache
@@ -359,6 +420,9 @@ class TextureCache {
     // texture is 2D.
     bool force_load_3d_tiling_ = false;
 
+    bool ever_loaded_ = false;
+    friend class TextureCache;
+
     // These are to be accessed within the global critical region to synchronize
     // with shared memory.
     // Whether the recent base level data needs reloading from the memory.
@@ -369,6 +433,19 @@ class TextureCache {
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
+
+  // TEX-1b (xdroid_tex_link): a resolve that writes a whole texture can copy
+  // its pixels straight into the host image instead of the next sampling
+  // loading them back out of guest memory. The candidate at a base page is
+  // the last texture of a linkable shape loaded there.
+  Texture* GetResolveLinkCandidate(uint32_t base_page) const {
+    auto it = link_candidates_.find(base_page);
+    return it != link_candidates_.end() ? it->second : nullptr;
+  }
+  // After the resolve's MarkRangeAsResolved: the host image already holds
+  // the new data, so stop treating it as outdated. False if guest memory
+  // isn't valid there (the next use loads it as usual).
+  bool CompleteResolveLink(Texture& texture);
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):
@@ -665,6 +742,86 @@ class TextureCache {
   // implementation to update the internal dependencies of the binding.
   virtual void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) {}
 
+  // Set by LoadTextureDataFromResidentMemoryImpl before returning false, for
+  // the XDROID-TEXMISS load_fail line.
+  const char* load_fail_reason_ = nullptr;
+
+  // Whether a binding's image view should be the null one because its texture
+  // was never loaded (xdroid_tex_unloaded_null).
+  static bool IsTextureHiddenAsUnloaded(const Texture* texture);
+
+ private:
+  // XDROID-TEXMISS probe (xdroid_tex_probe). Counters cover one summary window.
+  void ProbeLog(const char* event, const TextureKey& key, const char* detail);
+  void ProbeFirstLoad(Texture& texture);
+  // After a load attempt: fail_reason is null when the data was loaded.
+  void ProbeLoadResult(Texture& texture, const char* fail_reason);
+  void ProbeMaybeSummary();
+  struct ProbeCounters {
+    uint32_t created = 0;
+    uint32_t loads = 0;
+    uint32_t create_fail = 0;
+    uint32_t load_fail = 0;
+    uint32_t unwatched = 0;
+    uint32_t bound_unloaded = 0;
+    uint32_t zero_first = 0;
+    uint32_t early_reload = 0;
+    uint32_t evicted = 0;
+    uint32_t evict_recreate = 0;
+    uint32_t stand_in[4] = {};
+  };
+  ProbeCounters probe_counters_;
+  // XDROID-TEXCENSUS (xdroid_tex_census): per texture key, which loads happen,
+  // what invalidated them and whether the reloaded bytes were the same.
+  struct CensusEntry {
+    TextureKey key;
+    uint32_t loads = 0;
+    uint32_t first = 0;
+    uint32_t base = 0;
+    uint32_t mips = 0;
+    uint32_t inval_cpu = 0;
+    uint32_t inval_gpu = 0;
+    uint32_t same = 0;
+    uint32_t skipped = 0;
+    uint32_t link = UINT32_MAX;  // Last CensusLink of a GPU-invalidated load.
+    uint64_t bytes = 0;
+    uint64_t ns = 0;
+  };
+  void CensusRecord(Texture& texture, uint8_t inval, bool base, bool mips,
+                    bool same, bool skipped, uint64_t bytes, uint64_t ns);
+  // TEX-1b Phase 0 classes of a GPU-invalidated load.
+  enum CensusLink : uint32_t {
+    kCensusLinkDirect,
+    kCensusLinkEdram,
+    kCensusLinkNoRecord,
+    kCensusLinkNotFast,
+    kCensusLinkOffset,
+    kCensusLinkPitch,
+    kCensusLinkHeight,
+    kCensusLinkFormat,
+    kCensusLinkEndian,
+    kCensusLinkCoverage,
+    kCensusLinkMips,
+    kCensusLinkShape,
+    kCensusLinkCount,
+  };
+  CensusLink CensusClassifyLink(const Texture& texture, bool& multi);
+  std::unordered_map<uint32_t, CensusResolve> census_resolves_;
+  uint32_t census_link_[kCensusLinkCount] = {};
+  uint64_t census_link_bytes_[kCensusLinkCount] = {};
+  uint32_t census_link_multi_ = 0;
+  void CensusMaybeSummary();
+  std::unordered_map<TextureKey, CensusEntry, TextureKey::Hasher> census_;
+  uint64_t census_summary_frame_ = 0;
+  std::atomic<uint64_t> probe_frame_{0};
+  uint64_t probe_summary_frame_ = 0;
+  // Budget-evicted keys and the probe frame of their eviction, to catch a
+  // texture destroyed and needed again soon after (budget thrash).
+  std::unordered_map<TextureKey, uint64_t, TextureKey::Hasher> probe_evicted_;
+  // Slots bound to the null image by xdroid_tex_unloaded_null, rebound once
+  // their texture loads.
+  uint32_t unloaded_null_slots_ = 0;
+
  private:
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
@@ -732,6 +889,8 @@ class TextureCache {
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher>
       textures_;
+  // TEX-1b: base page -> the last linkable-shape texture loaded there.
+  std::unordered_map<uint32_t, Texture*> link_candidates_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

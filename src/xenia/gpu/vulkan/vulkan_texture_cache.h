@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "xenia/base/hash.h"
+#include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
@@ -104,6 +105,22 @@ class VulkanTextureCache final : public TextureCache {
   VkDescriptorSet shared_memory_persistent_descriptor_set() const {
     return shared_memory_persistent_descriptor_set_;
   }
+
+  // TEX-1b (xdroid_tex_link). Whether this direct resolve writes the whole of
+  // a texture that was sampled last frame and whose load is a pure bit copy,
+  // so the resolve can also store its pixels linearly for a copy into the
+  // image; remembers it as the pending link. spliced: the resolve is recorded
+  // before the open guest pass (GE-4).
+  bool BeginResolveLink(const draw_util::ResolveInfo& resolve_info,
+                        bool spliced);
+  // Copies the resolve's linear pixels (pitch_pixels wide, rows tall, after
+  // the caller's compute write -> transfer read barrier) into the pending
+  // link's image.
+  void RecordResolveLinkCopy(VkBuffer buffer, uint32_t pitch_pixels,
+                             uint32_t rows, bool spliced);
+  // After MarkRangeAsResolved: marks the pending link's texture current if
+  // the copy was recorded, and drops the pending link either way.
+  void EndResolveLink(bool copied);
 
   // Fetch constants whose host image views have changed since the bits were
   // last reset, for reusing texture descriptor sets across draws when bindings
@@ -292,6 +309,15 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image() const { return image_; }
 
+    // GE-4: the draw serial of the last guest draw that sampled this texture.
+    uint64_t sample_draw_serial() const { return sample_draw_serial_; }
+    void set_sample_draw_serial(uint64_t serial) {
+      sample_draw_serial_ = serial;
+    }
+    // TEX-1b: TextureCache::probe_frame of the last guest sampling.
+    uint64_t sample_frame() const { return sample_frame_; }
+    void set_sample_frame(uint64_t frame) { sample_frame_ = frame; }
+
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
       Usage old_usage = usage_;
@@ -307,6 +333,9 @@ class VulkanTextureCache final : public TextureCache {
                                            uint32_t host_swizzle);
 
    private:
+    uint64_t sample_draw_serial_ = 0;
+    uint64_t sample_frame_ = 0;
+
     union ViewKey {
       uint32_t key;
       struct {
@@ -424,6 +453,14 @@ class VulkanTextureCache final : public TextureCache {
   void GetTextureUsageMasks(VulkanTexture::Usage usage,
                             VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
+
+  // TEX-1b: the texture between BeginResolveLink and EndResolveLink, and the
+  // XDROID-TEXLINK counters.
+  VulkanTexture* resolve_link_texture_ = nullptr;
+  uint64_t resolve_link_summary_frame_ = 0;
+  uint64_t resolve_links_ = 0;
+  uint64_t resolve_link_bytes_ = 0;
+  uint64_t resolve_link_unwatched_ = 0;
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 

@@ -24,6 +24,17 @@
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
 
+DEFINE_bool(xdroid_direct_resolve_average, false,
+            "RES-3: resolve 8_8_8_8 MSAA color copies that average samples "
+            "straight from the render target, like the bitwise ones, instead "
+            "of the EDRAM dump + full copy round trip. Live-switchable.",
+            "GPU");
+DEFINE_bool(xdroid_direct_resolve_read_as_1x, false,
+            "RES-4: resolve 1x 32bpp color copies over tiles a multisampled "
+            "32bpp color render target owns straight from it, permuting the "
+            "samples like the EDRAM layout does, instead of the EDRAM dump + "
+            "copy round trip. Live-switchable.",
+            "GPU");
 DEFINE_bool(log_transfers, false,
             "Log every EDRAM ownership transfer with its source and "
             "destination render target and tile range.",
@@ -1409,6 +1420,36 @@ bool RenderTargetCache::IsResolveSourceNativeOnly(uint32_t base,
   return true;
 }
 
+uint32_t RenderTargetCache::GetDirectResolveAverageSamples(
+    const draw_util::ResolveInfo& resolve_info) {
+  // The full copy of an 8_8_8_8 UNORM source into a bitwise-equivalent UNORM
+  // destination with no exp bias and no gamma only averages the samples, which
+  // the direct shader reproduces (edram_dump_shader.cc, average_samples).
+  if (!cvars::xdroid_direct_resolve_average || resolve_info.IsCopyingDepth() ||
+      resolve_info.color_edram_info.format_is_64bpp ||
+      xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format) !=
+          xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+      resolve_info.copy_dest_info.copy_dest_exp_bias ||
+      resolve_info.copy_dest_info.copy_dest_number !=
+          xenos::SurfaceNumberFormat::kUnsignedRepeatingFraction ||
+      !xenos::IsColorResolveFormatBitwiseEquivalent(
+          xenos::ColorRenderTargetFormat::k_8_8_8_8,
+          xenos::ColorFormat(resolve_info.copy_dest_info.copy_dest_format))) {
+    return 0;
+  }
+  xenos::MsaaSamples msaa_samples = resolve_info.color_edram_info.msaa_samples;
+  switch (resolve_info.copy_dest_coordinate_info.copy_sample_select) {
+    case xenos::CopySampleSelect::k01:
+      return msaa_samples != xenos::MsaaSamples::k1X ? 1 : 0;
+    case xenos::CopySampleSelect::k23:
+      return msaa_samples >= xenos::MsaaSamples::k4X ? 1 : 0;
+    case xenos::CopySampleSelect::k0123:
+      return msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 0;
+    default:
+      return 0;
+  }
+}
+
 RenderTargetCache::DirectResolveEligibility
 RenderTargetCache::GetDirectResolveEligibility(
     const draw_util::ResolveInfo& resolve_info,
@@ -1422,6 +1463,12 @@ RenderTargetCache::GetDirectResolveEligibility(
     case draw_util::ResolveCopyShaderIndex::kFast64bpp1x2xMSAA:
     case draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA:
       break;
+    case draw_util::ResolveCopyShaderIndex::kFull32bpp:
+      if (IsDirectResolveAverageSupported() &&
+          GetDirectResolveAverageSamples(resolve_info)) {
+        break;
+      }
+      return DirectResolveEligibility::kConvertingCopyShader;
     default:
       return DirectResolveEligibility::kConvertingCopyShader;
   }
@@ -1448,7 +1495,17 @@ RenderTargetCache::GetDirectResolveEligibility(
     if (rt_key.is_depth != uint32_t(is_depth) ||
         rt_key.msaa_samples != edram_info.msaa_samples ||
         uint32_t(rt_key.Is64bpp()) != edram_info.format_is_64bpp) {
-      return DirectResolveEligibility::kSourceLayoutMismatch;
+      // RES-4: a 1x 32bpp color read of a multisampled 32bpp color target's
+      // tiles - the samples are just permuted within the tile.
+      if (!(cvars::xdroid_direct_resolve_read_as_1x &&
+            IsDirectResolveReadAs1xSupported() && !is_depth &&
+            !rt_key.is_depth && !rt_key.Is64bpp() &&
+            !edram_info.format_is_64bpp &&
+            edram_info.msaa_samples == xenos::MsaaSamples::k1X &&
+            copy_shader ==
+                draw_util::ResolveCopyShaderIndex::kFast32bpp1x2xMSAA)) {
+        return DirectResolveEligibility::kSourceLayoutMismatch;
+      }
     }
     owned_tiles += rectangle.GetTileCount(row_length_used);
   }

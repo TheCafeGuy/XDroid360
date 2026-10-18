@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <ctime>
+#include <map>
 #include <string>
 #include <thread>
 
@@ -40,6 +41,7 @@
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
 #include "xenia/gpu/vulkan/vulkan_zpd_query_pool.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
@@ -70,6 +72,35 @@ DEFINE_bool(
     "stores and replays its draws over.",
     "Vulkan");
 
+DECLARE_bool(xdroid_shader_stats);
+DEFINE_uint32(xdroid_pass_profiler, 0,
+              "XR-3: time every render pass of one frame in N with GPU "
+              "timestamps and log the split (per pass, per end reason, between "
+              "passes). 0 = off. The timestamps add small GPU waits on the "
+              "profiled frame only.",
+              "Vulkan");
+DEFINE_uint32(xdroid_pass_splice, 0,
+              "GE-4: run work that would end the open guest render pass right "
+              "before that pass instead, when the pass's earlier draws don't "
+              "use what it touches. Bits: 1 = texture loads, 2 = shared-memory "
+              "uploads, 4 = resolves whose source render targets aren't bound "
+              "in the pass. 0 = off (every such operation ends the pass).",
+              "Vulkan");
+DEFINE_bool(xdroid_tile_merge, true,
+            "TILE-1: draw the tiles of a predicated-tiling frame once, into "
+            "render targets as wide as all the tiles, and copy each tile's "
+            "half into the guest render targets before its resolves. Boot "
+            "only (render targets need transfer usage).",
+            "Vulkan");
+DEFINE_uint32(xdroid_tile_bound, 0,
+              "TILE-1 bound experiment (wrong output): in predicated tiling, "
+              "1 = skip every draw of the second and later tiles, 2 = draw "
+              "them with an empty scissor (vertex work only). 0 = off.",
+              "Vulkan");
+DEFINE_uint32(xdroid_pass_profiler_top, 8,
+              "XR-3: how many of the costliest passes each profile lists.",
+              "Vulkan");
+
 DEFINE_uint32(vulkan_gpu_stall_report_ms, 100,
               "XDroid360: when the oldest pending submission is still running "
               "this long after the command processor starts waiting for it, "
@@ -87,6 +118,22 @@ DEFINE_uint32(xdroid_stall_inject_every_s, 0,
 DEFINE_uint32(xdroid_stall_inject_ms, 8000,
               "Temp forensic: length of each injected GPU stall.", "Vulkan");
 
+DEFINE_uint32(
+    xdroid_async_textured_wait_ms, 16,
+    "TEX-1 candidate fix: wait up to this many ms for the real pipeline of a "
+    "draw whose pixel shader samples textures, instead of the async stand-in "
+    "(the placeholder writes depth only, the skip draws nothing, both read as "
+    "missing textures on first use). Stalls the command processor for up to "
+    "this long per new pipeline. 0 = off. Live.",
+    "XDroid360");
+DEFINE_bool(xdroid_async_textured_skip, false,
+            "TEX-1 candidate fix: skip a textured draw whose real pipeline "
+            "isn't ready (after xdroid_async_textured_wait_ms) instead of "
+            "drawing the depth-only placeholder, so it leaves no hole in what "
+            "is behind it and pops in once compiled. Live.",
+            "XDroid360");
+DECLARE_bool(xdroid_tex_probe);
+
 DEFINE_bool(xdroid_draw_blackbox, false,
             "XDroid360 HUD-1 forensic (temp): record per draw the vertex and "
             "index ranges the command processor read, their guest bytes at "
@@ -99,6 +146,17 @@ DEFINE_int32(xdroid_vfetch_reupload_max_kb, 0,
              "ranges up to this many KB are copied again from guest memory "
              "even when shared memory marks them valid (0 = off). Live.",
              "XDroid360");
+DEFINE_bool(xdroid_shader_stall_log, false,
+            "XDroid360 SHADER-1: log every frame in which the GPU thread "
+            "stalled on shader translation or pipeline creation (count and "
+            "ms per kind, skipped draws, creation queue depth), plus a "
+            "summary every 600 frames. Counting is always on and only on "
+            "the paths that compile, so this only gates the log. Live.",
+            "XDroid360");
+DEFINE_uint32(xdroid_shader_stall_hitch_ms, 4,
+              "XDroid360 SHADER-1: a frame whose compile stalls add up to at "
+              "least this many ms counts as a hitch in the summary.",
+              "XDroid360");
 DEFINE_bool(xdroid_glitch_recorder, false,
             "XDroid360 forensic tool: find one-frame glitches in the guest "
             "output (a frame unlike both neighbours that agree) and save "
@@ -133,6 +191,18 @@ DEFINE_bool(vulkan_gpu_completion_hint, true,
             "value reports it done. Avoids fence status queries that sleep in "
             "the kernel (Turnip on kgsl) without a waiter thread.",
             "Vulkan");
+
+// MSAA-1X: the guest's 2x/4x MSAA surfaces are drawn and resolved as 1x.
+// Applied to RB_SURFACE_INFO before every draw and resolve, so the render
+// target cache, resolves, shader keys and system constants all see the same
+// 1x surface (no sample-count mismatch between writing and reading EDRAM).
+DEFINE_bool(gpu_force_msaa_1x, false,
+            "Draw and resolve the game's 2x/4x MSAA render targets with one "
+            "sample. Less GPU memory traffic per pass (the 4x targets hold 4x "
+            "the data), at the cost of edge anti-aliasing; alpha-to-coverage "
+            "turns into a dither. Can be changed live (existing targets are "
+            "converted by the normal EDRAM ownership transfers).",
+            "GPU");
 
 namespace {
 // AMOLED highlight compression on a normalized [0, 1] display value. Values
@@ -1596,6 +1666,7 @@ void VulkanCommandProcessor::ShutdownContext() {
            gpu_time_untimed_submissions_);
   }
   DestroyGpuTimeQueryPool();
+  DestroyPassProfPool();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2131,6 +2202,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   gpu_thread_heartbeat_ms_.store(SteadyMs(), std::memory_order_relaxed);
+  if (auto on_cp_swap =
+          GetXdroidGpuHooks().on_cp_swap.load(std::memory_order_acquire)) {
+    on_cp_swap();
+  }
   EndZPDFrame();
 
   // Before the presenter check, so the paths that return early end the frame
@@ -2138,6 +2213,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
   NoteResolveFrame();
 
   CollectCompletedGpuTimeQueries();
+  PassProfCollect();
   // Host time between swaps, for the stats line below.
   {
     const auto now = std::chrono::steady_clock::now();
@@ -2226,6 +2302,24 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
         gpu_busy_us / frames, render_passes / frames, command_buffers / frames,
         wall_us ? vblanks * 1e6 / double(wall_us) : 0.0, wall_local.tm_hour,
         wall_local.tm_min, wall_local.tm_sec, wall_ms);
+    // SHD-1: the busiest pipelines by draws over the last window.
+    if (cvars::xdroid_shader_stats && !shader_draw_stats_.empty()) {
+      std::vector<std::pair<std::pair<uint64_t, uint64_t>, ShaderDrawStat>> top(
+          shader_draw_stats_.begin(), shader_draw_stats_.end());
+      std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+        return a.second.draws > b.second.draws;
+      });
+      std::string line;
+      for (size_t i = 0; i < std::min(top.size(), size_t(24)); ++i) {
+        line += fmt::format(" {:016X}/{:016X}:{:.1f}/{:.0f}",
+                            top[i].first.first, top[i].first.second,
+                            double(top[i].second.draws) / frames,
+                            double(top[i].second.indices) / frames);
+      }
+      XELOGI("XDROID-SHDRAW pipelines={} per frame (VS/PS:draws/indices):{}",
+             shader_draw_stats_.size(), line);
+      shader_draw_stats_.clear();
+    }
     // GE-0: why passes ended, per frame, to choose between the pass-merging
     // items (texture-load/upload splice, barrier hoist, resolve folding).
     static constexpr const char* kPassEndReasonNames[] = {
@@ -2243,6 +2337,48 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
       }
     }
     XELOGI("Pass ends/frame:{}", pass_ends_line);
+    // XR-4 Phase 0: runs of mergeable resolves between draws, per frame.
+    {
+      std::string runs_line;
+      for (size_t i = 0; i < resolve_runs_total_.size(); ++i) {
+        const uint64_t runs =
+            resolve_runs_total_[i] - resolve_runs_window_start_[i];
+        resolve_runs_window_start_[i] = resolve_runs_total_[i];
+        if (runs) {
+          runs_line += fmt::format(" {}={:.1f}",
+                                   i == 0 ? std::string("other")
+                                          : (i + 1 == resolve_runs_total_.size()
+                                                 ? fmt::format("{}+", i)
+                                                 : fmt::format("{}", i)),
+                                   double(runs) / frames);
+        }
+      }
+      XELOGI("Resolve runs/frame (XR-4):{}", runs_line);
+    }
+    if (cvars::xdroid_pass_splice) {
+      static constexpr const char* kSpliceNames[] = {"texload", "upload",
+                                                     "resolve", "barrier"};
+      std::string splice_line;
+      for (size_t i = 0; i < splice_ops_total_.size(); ++i) {
+        const uint64_t ops = splice_ops_total_[i] - splice_ops_window_start_[i];
+        splice_ops_window_start_[i] = splice_ops_total_[i];
+        splice_line +=
+            fmt::format(" {}={:.1f}", kSpliceNames[i], double(ops) / frames);
+      }
+      XELOGI("Spliced/frame (GE-4):{}", splice_line);
+    }
+    // MSAA-1X: how much of the frame draws into MSAA targets, and how many
+    // draws and resolves the switch turned into 1x.
+    uint64_t msaa_draws[4];
+    for (size_t i = 0; i < 4; ++i) {
+      msaa_draws[i] = msaa_draws_total_[i] - msaa_draws_window_start_[i];
+      msaa_draws_window_start_[i] = msaa_draws_total_[i];
+    }
+    const uint64_t msaa_forced = msaa_forced_total_ - msaa_forced_window_start_;
+    msaa_forced_window_start_ = msaa_forced_total_;
+    XELOGI("MSAA draws/frame: 1x={:.1f} 2x={:.1f} 4x={:.1f} forced_1x={:.1f}",
+           double(msaa_draws[0]) / frames, double(msaa_draws[1]) / frames,
+           double(msaa_draws[2]) / frames, double(msaa_forced) / frames);
     stats_frame_count_ = 0;
 
     render_pass_window_frames_ = 0;
@@ -2910,8 +3046,12 @@ void VulkanCommandProcessor::OnPrimaryBufferEnd() {
   PumpPendingRetire();
 
   if (cvars::submit_on_primary_buffer_end && submission_open_ &&
-      !scratch_buffer_used_ && CanEndSubmissionImmediately()) {
-    EndSubmission(false);
+      !scratch_buffer_used_) {
+    if (CanEndSubmissionImmediately()) {
+      EndSubmission(false);
+    } else {
+      ++shader_stall_frame_.submit_deferred;
+    }
   }
 }
 
@@ -2920,12 +3060,13 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
     VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask,
     uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
-    bool skip_if_equal) {
+    bool skip_if_equal, uint32_t site_line, const char* site_file) {
   if (skip_if_equal && src_stage_mask == dst_stage_mask &&
       src_access_mask == dst_access_mask &&
       src_queue_family_index == dst_queue_family_index) {
     return false;
   }
+  PassProfNoteBarrierSite(site_line, site_file);
 
   // Separate different barriers for overlapping buffer ranges into different
   // pipeline barrier commands.
@@ -2979,12 +3120,13 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
     VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask,
     VkImageLayout old_layout, VkImageLayout new_layout,
     uint32_t src_queue_family_index, uint32_t dst_queue_family_index,
-    bool skip_if_equal) {
+    bool skip_if_equal, uint32_t site_line, const char* site_file) {
   if (skip_if_equal && src_stage_mask == dst_stage_mask &&
       src_access_mask == dst_access_mask && old_layout == new_layout &&
       src_queue_family_index == dst_queue_family_index) {
     return false;
   }
+  PassProfNoteBarrierSite(site_line, site_file);
 
   // Separate different barriers for overlapping image subresource ranges into
   // different pipeline barrier commands.
@@ -3058,6 +3200,15 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
 bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   assert_true(submission_open_);
   SplitPendingBarrier();
+  if (is_splice_recording()) {
+    // Spliced work's own barriers: into the segment, the pass stays open.
+    pass_end_reason_ = PassEndReason::kOther;
+    if (pending_barriers_.empty()) {
+      return false;
+    }
+    RecordPendingBarriers();
+    return true;
+  }
   if (pending_barriers_.empty()) {
     if (force_end_render_pass) {
       EndRenderPass();
@@ -3068,8 +3219,17 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   // An untagged end here is a barrier queued earlier by another site.
   if (pass_end_reason_ == PassEndReason::kOther) {
     pass_end_reason_ = PassEndReason::kBarrier;
+    pass_prof_end_site_ = pass_prof_pending_site_;
   }
   EndRenderPass();
+  pass_prof_end_site_ = 0;
+  RecordPendingBarriers();
+  return true;
+}
+
+void VulkanCommandProcessor::RecordPendingBarriers() {
+  // GE-0: the barriers this site queued are recorded now.
+  pass_prof_pending_site_ = 0;
   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend();
        ++it) {
     auto it_next = std::next(it);
@@ -3099,6 +3259,140 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
   pending_barriers_image_memory_barriers_.clear();
   current_pending_barrier_.buffer_memory_barriers_offset = 0;
   current_pending_barrier_.image_memory_barriers_offset = 0;
+}
+
+bool VulkanCommandProcessor::IsSpliceCandidate(SpliceKind kind) const {
+  return (cvars::xdroid_pass_splice & uint32_t(kind)) && splice_segment_open_ &&
+         in_render_pass_ && !is_splice_recording();
+}
+
+bool VulkanCommandProcessor::IsRenderTargetBoundInSplicePass(
+    const void* render_target) const {
+  if (!render_target) {
+    return false;
+  }
+  for (const void* bound : splice_pass_rts_) {
+    if (bound == render_target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool VulkanCommandProcessor::ArePendingBarriersSpliceable() const {
+  const VkBuffer shared_memory_buffer = shared_memory_->buffer();
+  const VkBuffer shared_memory_host_buffer = shared_memory_->host_buffer();
+  for (const VkBufferMemoryBarrier& barrier :
+       pending_barriers_buffer_memory_barriers_) {
+    if (barrier.buffer != shared_memory_buffer &&
+        barrier.buffer != shared_memory_host_buffer &&
+        barrier.buffer != scratch_buffer_) {
+      return false;
+    }
+  }
+  for (const VkImageMemoryBarrier& barrier :
+       pending_barriers_image_memory_barriers_) {
+    if (std::find(splice_images_.cbegin(), splice_images_.cend(),
+                  barrier.image) == splice_images_.cend()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool VulkanCommandProcessor::BeginSplice(SpliceKind kind) {
+  if (is_splice_recording()) {
+    // Nested (an upload inside spliced work): already in the segment.
+    ++splice_depth_;
+    return true;
+  }
+  if (!IsSpliceCandidate(kind)) {
+    return false;
+  }
+  SplitPendingBarrier();
+  // Barriers queued before this work by someone else could involve the pass's
+  // attachments - then the work can't move ahead of the pass.
+  if (!ArePendingBarriersSpliceable()) {
+    return false;
+  }
+  deferred_command_buffer_.BeginSegment(splice_segment_placeholder_);
+  splice_depth_ = 1;
+  switch (kind) {
+    case kSpliceTextureLoads:
+      ++splice_ops_total_[0];
+      break;
+    case kSpliceUploads:
+      ++splice_ops_total_[1];
+      break;
+    case kSpliceResolves:
+      ++splice_ops_total_[2];
+      break;
+  }
+  if (!pending_barriers_.empty()) {
+    RecordPendingBarriers();
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::EndSplice() {
+  if (!splice_depth_ || --splice_depth_) {
+    return;
+  }
+  deferred_command_buffer_.EndSegment();
+}
+
+void VulkanCommandProcessor::NoteSplicedImage(VkImage image) {
+  if (image != VK_NULL_HANDLE &&
+      std::find(splice_images_.cbegin(), splice_images_.cend(), image) ==
+          splice_images_.cend()) {
+    splice_images_.push_back(image);
+  }
+}
+
+void VulkanCommandProcessor::OpenSpliceSegment(
+    const VulkanRenderTargetCache::Framebuffer* framebuffer) {
+  // Called with no pass open, right before a guest pass's begin.
+  assert_false(is_splice_recording());
+  splice_images_.clear();
+  pass_first_draw_serial_ = draw_serial_;
+  splice_segment_open_ = false;
+  // The bound render targets are known only for the framebuffer of the last
+  // render target update (not, say, a pass re-entered after a query with an
+  // update for a skipped draw in between).
+  if (!cvars::xdroid_pass_splice ||
+      render_target_cache_->GetPath() !=
+          RenderTargetCache::Path::kHostRenderTargets ||
+      framebuffer != render_target_cache_->last_update_framebuffer()) {
+    return;
+  }
+  render_target_cache_->GetLastUpdateBoundRenderTargets(splice_pass_rts_);
+  splice_segment_placeholder_ =
+      deferred_command_buffer_.CmdExecuteSegmentPlaceholder();
+  splice_segment_open_ = true;
+}
+
+void VulkanCommandProcessor::CloseSpliceSegment() {
+  // Anything still recording ends here: what it records next goes after the
+  // pass, which keeps its order relative to the segment part.
+  if (splice_depth_) {
+    splice_depth_ = 0;
+    deferred_command_buffer_.EndSegment();
+  }
+  splice_segment_open_ = false;
+}
+
+bool VulkanCommandProcessor::TrySubmitPendingBarriersIntoSegment() {
+  if (!splice_segment_open_ || is_splice_recording()) {
+    return false;
+  }
+  SplitPendingBarrier();
+  if (pending_barriers_.empty() || !ArePendingBarriersSpliceable()) {
+    return false;
+  }
+  deferred_command_buffer_.BeginSegment(splice_segment_placeholder_);
+  RecordPendingBarriers();
+  deferred_command_buffer_.EndSegment();
+  ++splice_ops_total_[3];
   return true;
 }
 
@@ -3106,22 +3400,39 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass,
     const VulkanRenderTargetCache::Framebuffer* framebuffer) {
   SCOPE_profile_cpu_f("gpu");
-  SubmitBarriers(false);
-
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   bool use_dynamic_rendering = cvars::vulkan_dynamic_rendering &&
                                vulkan_device->properties().dynamicRendering;
+
+  CloseSpliceRecordingIfAny();
+  // GE-4: staying in the same pass, barriers left by spliced work (texture
+  // layout after a load, shared memory after an upload) join the segment
+  // instead of ending the pass.
+  const bool same_pass =
+      in_render_pass_ && current_framebuffer_ == framebuffer &&
+      !pass_area_restricted_ &&
+      current_render_pass_ ==
+          (use_dynamic_rendering ? VK_NULL_HANDLE : render_pass);
+  if (same_pass && TrySubmitPendingBarriersIntoSegment()) {
+    return;
+  }
+  // GE-0: a pass that ends anyway for the new framebuffer is an RT change,
+  // even when queued barriers close it first.
+  if (in_render_pass_ && !same_pass) {
+    TagPassEnd(PassEndReason::kRtChange);
+  }
+  SubmitBarriers(false);
 
   // Check if we can stay in the current render pass.
   if (use_dynamic_rendering) {
     // For dynamic rendering, compare framebuffer directly.
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
-        current_render_pass_ == VK_NULL_HANDLE) {
+        current_render_pass_ == VK_NULL_HANDLE && !pass_area_restricted_) {
       return;
     }
   } else {
     if (current_render_pass_ == render_pass &&
-        current_framebuffer_ == framebuffer) {
+        current_framebuffer_ == framebuffer && !pass_area_restricted_) {
       return;
     }
   }
@@ -3140,6 +3451,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+  pass_area_restricted_ = false;
+  OpenSpliceSegment(framebuffer);
+  PassProfBeginPass(PassProfKind::kGuest, framebuffer->host_extent);
 
   if (use_dynamic_rendering) {
     // Use dynamic rendering - construct VkRenderingInfo from render targets.
@@ -3213,11 +3527,17 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   OpenQuerySegment(false);
 }
 
-void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+bool VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
     VkRenderPass render_pass,
     const VulkanRenderTargetCache::Framebuffer* framebuffer,
-    VkImageView transfer_dest_view, bool transfer_dest_is_depth) {
+    VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+    const VkRect2D* render_area, const VkClearValue* load_op_clear_value,
+    bool* load_op_clear_applied) {
   SCOPE_profile_cpu_f("gpu");
+  if (load_op_clear_applied) {
+    *load_op_clear_applied = false;
+  }
+  CloseSpliceRecordingIfAny();
   SubmitBarriers(false);
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
@@ -3228,13 +3548,13 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   if (use_dynamic_rendering) {
     // For dynamic rendering, compare framebuffer directly.
     if (in_render_pass_ && current_framebuffer_ == framebuffer &&
-        current_render_pass_ == VK_NULL_HANDLE) {
-      return;
+        current_render_pass_ == VK_NULL_HANDLE && !pass_area_restricted_) {
+      return false;
     }
   } else {
     if (current_render_pass_ == render_pass &&
-        current_framebuffer_ == framebuffer) {
-      return;
+        current_framebuffer_ == framebuffer && !pass_area_restricted_) {
+      return false;
     }
   }
 
@@ -3246,6 +3566,27 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
 
   current_render_pass_ = use_dynamic_rendering ? VK_NULL_HANDLE : render_pass;
   current_framebuffer_ = framebuffer;
+
+  // GE-2: the area of a clear-only pass. Anything else reusing this pass could
+  // write outside it, so it's marked as not reusable.
+  VkRect2D pass_area;
+  pass_area.offset.x = 0;
+  pass_area.offset.y = 0;
+  pass_area.extent = framebuffer->host_extent;
+  if (render_area) {
+    pass_area = *render_area;
+  }
+  pass_area_restricted_ =
+      pass_area.offset.x || pass_area.offset.y ||
+      pass_area.extent.width < framebuffer->host_extent.width ||
+      pass_area.extent.height < framebuffer->host_extent.height;
+  const bool use_load_op_clear =
+      use_dynamic_rendering && load_op_clear_value != nullptr;
+  // Transfer and clear passes take no spliced work.
+  CloseSpliceSegment();
+  PassProfBeginPass(
+      render_area ? PassProfKind::kClear : PassProfKind::kTransfer,
+      pass_area.extent);
 
   if (use_dynamic_rendering) {
     // Use dynamic rendering for transfers - construct VkRenderingInfo from
@@ -3263,9 +3604,11 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       depth_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
       depth_attachment.resolveImageView = VK_NULL_HANDLE;
       depth_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-      depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      depth_attachment.loadOp = use_load_op_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                  : VK_ATTACHMENT_LOAD_OP_LOAD;
       depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      depth_attachment.clearValue = {};
+      depth_attachment.clearValue =
+          use_load_op_clear ? *load_op_clear_value : VkClearValue{};
       // Stencil uses the same attachment.
       stencil_attachment = depth_attachment;
     } else {
@@ -3276,16 +3619,16 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       color_attachment.resolveMode = VK_RESOLVE_MODE_NONE;
       color_attachment.resolveImageView = VK_NULL_HANDLE;
       color_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-      color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      color_attachment.loadOp = use_load_op_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                  : VK_ATTACHMENT_LOAD_OP_LOAD;
       color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      color_attachment.clearValue = {};
+      color_attachment.clearValue =
+          use_load_op_clear ? *load_op_clear_value : VkClearValue{};
     }
 
     VkRenderingInfo rendering_info = {};
     rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    rendering_info.renderArea.offset.x = 0;
-    rendering_info.renderArea.offset.y = 0;
-    rendering_info.renderArea.extent = framebuffer->host_extent;
+    rendering_info.renderArea = pass_area;
     rendering_info.layerCount = 1;
     rendering_info.colorAttachmentCount = transfer_dest_is_depth ? 0 : 1;
     rendering_info.pColorAttachments =
@@ -3296,16 +3639,18 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
         transfer_dest_is_depth ? &stencil_attachment : nullptr;
 
     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
+    if (load_op_clear_applied) {
+      *load_op_clear_applied = use_load_op_clear;
+    }
   } else {
-    // Use traditional render pass.
+    // Use traditional render pass. Its load op is baked in (LOAD), so a
+    // GE-2 load-op clear isn't applied here, only the area.
     VkRenderPassBeginInfo render_pass_begin_info;
     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     render_pass_begin_info.pNext = nullptr;
     render_pass_begin_info.renderPass = render_pass;
     render_pass_begin_info.framebuffer = framebuffer->framebuffer;
-    render_pass_begin_info.renderArea.offset.x = 0;
-    render_pass_begin_info.renderArea.offset.y = 0;
-    render_pass_begin_info.renderArea.extent = framebuffer->host_extent;
+    render_pass_begin_info.renderArea = pass_area;
     render_pass_begin_info.clearValueCount = 0;
     render_pass_begin_info.pClearValues = nullptr;
     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
@@ -3319,6 +3664,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
   }
 
   OpenQuerySegment(false);
+  return true;
 }
 
 void VulkanCommandProcessor::EndRenderPass() {
@@ -3326,6 +3672,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   assert_true(submission_open_);
   const PassEndReason pass_end_reason = pass_end_reason_;
   pass_end_reason_ = PassEndReason::kOther;
+  // The end command (and anything after) belongs to the main stream.
+  CloseSpliceSegment();
   if (!in_render_pass_) {
     return;
   }
@@ -3336,6 +3684,8 @@ void VulkanCommandProcessor::EndRenderPass() {
   if (zpd_active_segment_.segment_active && !zpd_active_query_is_fsi_) {
     CloseQuerySegment();
   }
+  VkRect2D tight_area_patched;
+  bool tight_area_was_patched = false;
   if (tight_area_pending_) {
     tight_area_pending_ = false;
     if (tight_area_valid_) {
@@ -3360,6 +3710,8 @@ void VulkanCommandProcessor::EndRenderPass() {
         area.extent.height = uint32_t(y1 - y0);
         deferred_command_buffer_.PatchRenderArea(tight_area_args_offset_,
                                                  tight_area_dynamic_, area);
+        tight_area_patched = area;
+        tight_area_was_patched = true;
       }
     }
   }
@@ -3370,6 +3722,11 @@ void VulkanCommandProcessor::EndRenderPass() {
   } else {
     deferred_command_buffer_.CmdVkEndRenderPass();
   }
+  if (pass_prof_in_pass_) {
+    PassProfEndPass(pass_end_reason,
+                    tight_area_was_patched ? &tight_area_patched : nullptr);
+  }
+  pass_area_restricted_ = false;
   if (gpu_breadcrumbs_.enabled()) {
     gpu_breadcrumbs_.OnRenderPassEnd(deferred_command_buffer_);
   }
@@ -3755,6 +4112,169 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type,
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+void VulkanCommandProcessor::XdroidNoteResolve(bool mergeable) {
+  if (!mergeable) {
+    XdroidEndResolveRun();
+    ++resolve_runs_total_[0];
+    return;
+  }
+  ++resolve_run_;
+}
+
+void VulkanCommandProcessor::XdroidEndResolveRun() {
+  if (resolve_run_) {
+    ++resolve_runs_total_[std::min<size_t>(resolve_run_,
+                                           resolve_runs_total_.size() - 1)];
+    resolve_run_ = 0;
+  }
+}
+
+VulkanGpuSanity::DrawId VulkanCommandProcessor::XdroidSanDrawId(
+    const VulkanShader* vertex_shader, const VulkanShader* pixel_shader) const {
+  VulkanGpuSanity::DrawId id;
+  id.vs_hash = vertex_shader ? vertex_shader->ucode_data_hash() : 0;
+  id.ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+  id.submission = GetCurrentSubmission();
+  id.draw_index = submission_in_progress_.draw_count;
+  return id;
+}
+
+void VulkanCommandProcessor::XdroidSanDrop(
+    const char* reason, int severity, const VulkanShader* vertex_shader,
+    const VulkanShader* pixel_shader) const {
+  if (VulkanGpuSanity::enabled()) {
+    VulkanGpuSanity::Drop(reason, severity,
+                          XdroidSanDrawId(vertex_shader, pixel_shader));
+  }
+}
+
+void VulkanCommandProcessor::XdroidTileChanged(int32_t from, int32_t to) {
+  VulkanRenderTargetCache& rtc = *render_target_cache_;
+  if (from == 0) {
+    // Whether the next frame may merge: this first tile (observed or merged)
+    // used one set of render targets and resolved only at its end.
+    bool clean = xdroid_tile0_resolved_ && !xdroid_tile0_draw_after_resolve_ &&
+                 to == 1 &&
+                 (rtc.TileMergeObservedClean() || rtc.tile_merge_resolving()) &&
+                 rtc.tile_merge_aborts() == xdroid_tile_aborts_seen_;
+    xdroid_tile_clean_streak_ = clean ? xdroid_tile_clean_streak_ + 1 : 0;
+    if (cvars::xdroid_tile_merge) {
+      ++xdroid_tile_stat_frames_;
+      if (rtc.tile_merge_resolving()) {
+        ++xdroid_tile_stat_merged_;
+      } else if (!clean) {
+        if (!rtc.TileMergeObservedClean() && !rtc.tile_merge_drawing()) {
+          ++xdroid_tile_stat_rt_change_;
+        } else {
+          ++xdroid_tile_stat_other_;
+        }
+      }
+      if (xdroid_tile_stat_frames_ >= 300) {
+        XELOGI(
+            "XDROID-TILE stats: tiled={} merged={} rt_change={} "
+            "offset_mismatch={} other={} aborts={}",
+            xdroid_tile_stat_frames_, xdroid_tile_stat_merged_,
+            xdroid_tile_stat_rt_change_, xdroid_tile_stat_offset_,
+            xdroid_tile_stat_other_, rtc.tile_merge_aborts());
+        xdroid_tile_stat_frames_ = 0;
+        xdroid_tile_stat_merged_ = 0;
+        xdroid_tile_stat_rt_change_ = 0;
+        xdroid_tile_stat_offset_ = 0;
+        xdroid_tile_stat_other_ = 0;
+      }
+    }
+    if (rtc.TileMergeObservedClean() || !clean) {
+      if (!rtc.tile_merge_drawing() && !rtc.tile_merge_resolving()) {
+        rtc.TileMergeEnd();
+      }
+    }
+  }
+  if (from == 1 && to >= 2) {
+    // Only two tiles side by side are merged.
+    xdroid_tile_clean_streak_ = 0;
+  }
+  xdroid_tile_aborts_seen_ = rtc.tile_merge_aborts();
+  if (from == 0 && to == 1 && rtc.tile_merge_resolving()) {
+    // The second tile's draws were in the merged pass; its resolves read the
+    // right half.
+    rtc.TileMergeResolveTile(1);
+  } else if (rtc.tile_merge_resolving() && rtc.tile_merge_resolve_tile()) {
+    if (to >= 2) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        XELOGE("XDROID-TILE: more than two tiles, the merge covers two");
+      }
+    }
+    rtc.TileMergeEnd();
+  } else if (rtc.tile_merge_drawing() || rtc.tile_merge_resolving()) {
+    // Tiles that don't go first-with-resolves then second: the guest render
+    // targets take the first tile's half and the rest draws normally.
+    rtc.TileMergeAbort("unexpected tile order");
+  }
+  xdroid_tile_second_checked_ = false;
+  if (to == 0) {
+    xdroid_tile0_resolved_ = false;
+    xdroid_tile0_draw_after_resolve_ = false;
+  }
+  if (to < 0) {
+    xdroid_skipped_window_offset_valid_ = false;
+  }
+  if (to == 0 && cvars::xdroid_tile_merge) {
+    const RegisterFile& regs = *register_file_;
+    auto surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+    // Two tiles side by side need the pitch of one tile in whole EDRAM tiles.
+    uint32_t pitch = surface_info.surface_pitch;
+    uint32_t tile_width_pixels =
+        xenos::kEdramTileWidthSamples >>
+        uint32_t(surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+    if (pitch && !(pitch % tile_width_pixels)) {
+      // The second tile's window offset, from its skipped SET_CONSTANT, must
+      // put it right of the first.
+      reg::PA_SC_WINDOW_OFFSET other_offset;
+      other_offset.value = xdroid_skipped_window_offset_;
+      bool other_right = xdroid_skipped_window_offset_valid_ &&
+                         other_offset.window_x_offset == -int32_t(pitch) &&
+                         other_offset.window_y_offset == 0;
+      if (!other_right) {
+        xdroid_tile_clean_streak_ = 0;
+        ++xdroid_tile_stat_offset_;
+      }
+      if (xdroid_tile_clean_streak_ >= 2) {
+        render_target_cache_->TileMergeBegin(pitch);
+      } else {
+        render_target_cache_->TileMergeObserveBegin(pitch);
+      }
+    }
+  }
+}
+
+void VulkanCommandProcessor::XdroidTileCheckSecond() {
+  if (xdroid_tile_second_checked_) {
+    return;
+  }
+  xdroid_tile_second_checked_ = true;
+  // The merged pass puts the second tile right of the first: its window
+  // offset must be minus one tile width.
+  int32_t x_offset =
+      register_file_->Get<reg::PA_SC_WINDOW_OFFSET>().window_x_offset;
+  if (x_offset != -int32_t(render_target_cache_->tile_merge_width())) {
+    xdroid_tile_clean_streak_ = 0;
+    static uint32_t logged = 0;
+    if (logged < 12) {
+      ++logged;
+      XELOGE(
+          "XDROID-TILE: second tile window offset x {} y {} (expected -{}), "
+          "skipped offset {:08X} valid {}",
+          x_offset,
+          int32_t(
+              register_file_->Get<reg::PA_SC_WINDOW_OFFSET>().window_y_offset),
+          render_target_cache_->tile_merge_width(),
+          xdroid_skipped_window_offset_, xdroid_skipped_window_offset_valid_);
+    }
+  }
+}
+
 bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                                        uint32_t index_count,
                                        IndexBufferInfo* index_buffer_info,
@@ -3766,10 +4286,59 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   const RegisterFile& regs = *register_file_;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+
+  // TILE-1: the game replays the same command stream once per EDRAM tile,
+  // selecting the tile with SET_BIN_SELECT; all ones means untiled.
+  int32_t tile_index = xdroid_tile_index_;
+  if ((bin_select_ & 0xFFFFFFFFull) == 0xFFFFFFFFull) {
+    tile_index = -1;
+  } else if (bin_select_ != xdroid_tile_last_select_) {
+    ++tile_index;
+  }
+  xdroid_tile_last_select_ = bin_select_;
+  if (tile_index != xdroid_tile_index_) {
+    XdroidTileChanged(xdroid_tile_index_, tile_index);
+    xdroid_tile_index_ = tile_index;
+  }
+
   if (edram_mode == xenos::EdramMode::kCopy) {
+    // TILE-1: a tile's resolves read its half of the merged frame.
+    if (tile_index == 0) {
+      xdroid_tile0_resolved_ = true;
+    }
+    if (tile_index == 0 && render_target_cache_->tile_merge_drawing()) {
+      render_target_cache_->TileMergeResolveTile(0);
+    } else if (tile_index == 1 &&
+               render_target_cache_->tile_merge_resolving()) {
+      XdroidTileCheckSecond();
+    }
     // Special copy handling.
     return IssueCopy();
   }
+
+  if (tile_index == 1 && cvars::xdroid_tile_merge) {
+    XdroidTileCheckSecond();
+  }
+  if (tile_index == 0 && xdroid_tile0_resolved_) {
+    xdroid_tile0_draw_after_resolve_ = true;
+  }
+  if (render_target_cache_->tile_merge_resolving()) {
+    if (tile_index >= 1) {
+      // Already drawn in the first tile's merged pass.
+      XdroidTileCheckSecond();
+      return true;
+    }
+    // A draw after the first tile's resolves: the guest render targets take
+    // over and the other tiles draw normally.
+    render_target_cache_->TileMergeAbort(
+        "draw after the first tile's resolves");
+  }
+  if (cvars::xdroid_tile_bound == 1 && xdroid_tile_index_ >= 1) {
+    return true;
+  }
+
+  ++msaa_draws_total_[uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples)];
+  ApplyForceMsaa1x();
 
   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
     // Doesn't actually draw. Matches the Direct3D 12 backend.
@@ -3864,6 +4433,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // Per shader (vertex, pixel), whether its samplers were gathered.
   bool samplers_gathered[2] = {};
 
+  // GE-4: pages this draw reads from shared memory get its serial, so an
+  // upload or resolve later in the same pass can tell whether it may run
+  // before the pass. Texture loads read pages too, but not inside the pass.
+  struct DrawReadMarkingScope {
+    SharedMemory& shared_memory;
+    uint64_t previous;
+    DrawReadMarkingScope(SharedMemory& shared_memory_in, uint64_t serial)
+        : shared_memory(shared_memory_in),
+          previous(shared_memory_in.draw_read_marking()) {
+      shared_memory.SetDrawReadMarking(serial);
+    }
+    ~DrawReadMarkingScope() { shared_memory.SetDrawReadMarking(previous); }
+  };
+  DrawReadMarkingScope draw_read_marking(
+      *shared_memory_,
+      (cvars::xdroid_pass_splice & (kSpliceUploads | kSpliceResolves))
+          ? draw_serial_
+          : 0);
+
   // Two iterations because a submission (even the current one - in which case
   // it needs to be ended, and a new one must be started) may need to be awaited
   // in case of a sampler count overflow, and if that happens, all subsystem
@@ -3877,6 +4465,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
 
     // Process primitives.
     if (!primitive_processor_->Process(primitive_processing_result)) {
+      XdroidSanDrop("primitive processing failed", 2, vertex_shader,
+                    pixel_shader);
       return false;
     }
     if (!primitive_processing_result.host_draw_vertex_count) {
@@ -3898,6 +4488,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             Shader::HostVertexShaderType::kRectangleListAsTriangleStrip &&
         !Shader::IsHostVertexShaderTypeDomain(
             primitive_processing_result.host_vertex_shader_type)) {
+      XdroidSanDrop("unsupported host vertex shader type", 2, vertex_shader,
+                    pixel_shader);
       return false;
     }
 
@@ -3996,9 +4588,21 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     bool translate_here =
         !async_available || (no_placeholder && !cvars::async_shader_skip_draws);
     if (translate_here) {
+      bool translation_needed = !vertex_shader_translation->is_translated() ||
+                                (pixel_shader_translation &&
+                                 !pixel_shader_translation->is_translated());
+      uint64_t translate_start =
+          translation_needed ? xe::Clock::QueryHostTickCount() : 0;
       if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
                                                     pixel_shader_translation)) {
+        XdroidSanDrop("shader translation failed", 2, vertex_shader,
+                      pixel_shader);
         return false;
+      }
+      if (translation_needed) {
+        ++shader_stall_frame_.translate_count;
+        shader_stall_frame_.translate_ticks +=
+            xe::Clock::QueryHostTickCount() - translate_start;
       }
     }
 
@@ -4060,6 +4664,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             // anymore (would enter an infinite loop otherwise if the number of
             // attempts was not limited to 2). Possibly too many unique samplers
             // in one draw, or failed to await submission completion.
+            XdroidSanDrop("sampler overflow", 2, vertex_shader, pixel_shader);
             return false;
           }
           ++samplers_overflowed_count;
@@ -4087,6 +4692,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (!render_target_cache_->Update(is_rasterization_done,
                                     normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
+    XdroidSanDrop("render target update failed", 2, vertex_shader,
+                  pixel_shader);
     return false;
   }
   // An async pipeline stand-in (a placeholder, or skipping the draw) is only
@@ -4112,6 +4719,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     XELOGE("IssueDraw: ConfigurePipeline failed for VS={:016X} PS={:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    XdroidSanDrop("pipeline configuration failed", 2, vertex_shader,
+                  pixel_shader);
     return false;
   }
 
@@ -4122,7 +4731,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   if (!stand_in_allowed &&
       pipeline->creation_pending.load(std::memory_order_acquire)) {
     uint64_t await_start = xe::Clock::QueryHostTickCount();
-    pipeline_cache_->AwaitPipelineCompletion();
+    pipeline_cache_->AwaitPipeline(*pipeline);
+    ++shader_stall_frame_.await_count;
+    shader_stall_frame_.await_ticks +=
+        xe::Clock::QueryHostTickCount() - await_start;
     XELOGI(
         "Awaited real pipeline for a draw into {} ({}): VS {:016X}, PS "
         "{:016X}, {:.2f} ms",
@@ -4144,12 +4756,81 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                        major_mode_explicit);
     }
   }
+  // TEX-1: a stand-in for a draw whose pixel shader samples textures draws
+  // depth only (the placeholder masks color off) or nothing, which reads as
+  // missing textures the first time the object appears. The ucode analysis
+  // bindings are complete before translation, unlike the translated ones.
+  if (pixel_shader && !pixel_shader->texture_bindings().empty() &&
+      pipeline->creation_pending.load(std::memory_order_acquire) &&
+      (current_pipeline == VK_NULL_HANDLE ||
+       current_pipeline ==
+           pipeline->placeholder_pipeline.load(std::memory_order_acquire))) {
+    uint32_t wait_ms = cvars::xdroid_async_textured_wait_ms;
+    if (wait_ms) {
+      uint64_t tick_frequency = xe::Clock::QueryHostTickFrequency();
+      uint64_t await_start = xe::Clock::QueryHostTickCount();
+      uint64_t await_end = await_start + tick_frequency * wait_ms / 1000;
+      while (pipeline->creation_pending.load(std::memory_order_acquire) &&
+             xe::Clock::QueryHostTickCount() < await_end) {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+      VkPipeline real_pipeline =
+          pipeline->pipeline.load(std::memory_order_acquire);
+      bool got_real = real_pipeline != VK_NULL_HANDLE &&
+                      real_pipeline != pipeline->placeholder_pipeline.load(
+                                           std::memory_order_acquire);
+      texture_cache_->ProbeNoteStandIn(
+          got_real ? VulkanTextureCache::ProbeStandIn::kWaited
+                   : VulkanTextureCache::ProbeStandIn::kWaitTimedOut);
+      if (cvars::xdroid_tex_probe) {
+        XELOGW(
+            "XDROID-TEXMISS standin_wait frame={} VS {:016X} PS {:016X} "
+            "rt={} {} after {:.2f} ms",
+            texture_cache_->probe_frame(), vertex_shader->ucode_data_hash(),
+            pixel_shader->ucode_data_hash(),
+            render_target_cache_->GetLastUpdateDrawTargetName(),
+            got_real ? "real pipeline ready" : "timed out",
+            double(xe::Clock::QueryHostTickCount() - await_start) * 1000.0 /
+                double(tick_frequency));
+      }
+      if (got_real) {
+        // The samplers were gathered while the bindings weren't ready - redo
+        // the draw with the real pipeline.
+        return IssueDraw(prim_type, index_count, index_buffer_info,
+                         major_mode_explicit);
+      }
+      current_pipeline = pipeline->pipeline.load(std::memory_order_acquire);
+    }
+    bool skip =
+        current_pipeline == VK_NULL_HANDLE || cvars::xdroid_async_textured_skip;
+    texture_cache_->ProbeNoteStandIn(
+        skip ? VulkanTextureCache::ProbeStandIn::kSkipped
+             : VulkanTextureCache::ProbeStandIn::kPlaceholder);
+    if (cvars::xdroid_tex_probe) {
+      XELOGW(
+          "XDROID-TEXMISS standin frame={} VS {:016X} PS {:016X} rt={} "
+          "textures={} {}",
+          texture_cache_->probe_frame(), vertex_shader->ucode_data_hash(),
+          pixel_shader->ucode_data_hash(),
+          render_target_cache_->GetLastUpdateDrawTargetName(),
+          pixel_shader->texture_bindings().size(),
+          skip ? "skipped (pipeline compiling)"
+               : "depth-only placeholder (pipeline compiling)");
+    }
+    if (skip && current_pipeline != VK_NULL_HANDLE) {
+      XdroidSanDrop("pipeline compiling, stand-in skips", 1, vertex_shader,
+                    pixel_shader);
+      return true;
+    }
+  }
   if (current_pipeline == VK_NULL_HANDLE) {
     // Nothing to draw with yet - no placeholder, real pipeline still building.
     // Skip rather than stall, a later frame renders it.
+    ++shader_stall_frame_.skipped_draws;
     XELOGI("Draw skipped (pipeline not ready yet): VS {:016X}, PS {:016X}",
            vertex_shader->ucode_data_hash(),
            pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+    XdroidSanDrop("pipeline not ready", 1, vertex_shader, pixel_shader);
     return true;
   }
   // Whether the placeholder pipeline is bound rather than the real one. Derived
@@ -4158,6 +4839,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   bool bound_is_placeholder =
       current_pipeline ==
       pipeline->placeholder_pipeline.load(std::memory_order_acquire);
+  // SHD-1: draws and indices per real pipeline, logged with the frame stats.
+  if (cvars::xdroid_shader_stats && !bound_is_placeholder) {
+    ShaderDrawStat& stat = shader_draw_stats_[std::make_pair(
+        vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : 0)];
+    ++stat.draws;
+    stat.indices += index_count;
+  }
   // The interpreter placeholder (interpreter VS + no-op PS) also needs its
   // ucode location + full float constants fed to it.
   bool interpreter_placeholder =
@@ -4167,11 +4856,25 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // samples. Its pixel textures and samplers must not be bound as the
   // placeholder pipeline's layout has none.
   bool placeholder_pixel_shader = bound_is_placeholder;
+  // XDroid360 GPU-SAN: placeholder draws bind a minimal layout; name them so
+  // a fault in one can be told apart (PF-0 hit a depth pass).
+  if (bound_is_placeholder && VulkanGpuSanity::enabled()) {
+    const VulkanGpuSanity::DrawId id =
+        XdroidSanDrawId(vertex_shader, pixel_shader);
+    XdroidEvent(
+        "san-placeholder", 1,
+        id.vs_hash ^ (id.ps_hash << 1) ^ uint64_t(interpreter_placeholder),
+        "{} placeholder VS {:016X} PS {:016X} submission {} draw {}",
+        interpreter_placeholder ? "interpreter" : "depth-only", id.vs_hash,
+        id.ps_hash, id.submission, id.draw_index);
+  }
   // The interpreter reads the guest ucode from shared memory by its program
   // address. A cached interpreter placeholder reused for an inline
   // (IM_LOAD_IMMEDIATE, address 0) shader can't be fed, so skip until the real
   // pipeline is ready rather than interpret from address 0.
   if (active_vertex_shader_ucode_address_ == 0 && interpreter_placeholder) {
+    XdroidSanDrop("interpreter placeholder for an inline shader", 1,
+                  vertex_shader, pixel_shader);
     return true;
   }
   // A creation thread may have finished a shader the bound pipeline runs after
@@ -4205,7 +4908,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
       (pixel_shader != nullptr && pixel_shader->bindings_ready()
            ? pixel_shader->GetUsedTextureMaskAfterTranslation()
            : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  {
+    DrawReadMarkingScope texture_loads_unmarked(*shared_memory_, 0);
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
 
   // Update the graphics pipeline, and if the new graphics pipeline has a
   // different layout, invalidate incompatible descriptor sets before updating
@@ -4398,6 +5104,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // the new layout.
   if (!UpdateBindings(vertex_shader, pixel_shader, interpreter_placeholder,
                       placeholder_pixel_shader)) {
+    XdroidSanDrop("bindings update failed", 2, vertex_shader, pixel_shader);
     return false;
   }
 
@@ -4437,6 +5144,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                 "launching Xenia with "
                 "--gpu_allow_invalid_fetch_constants=true.",
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+            XdroidSanDrop("invalid vertex fetch type", 2, vertex_shader,
+                          pixel_shader);
             return false;
           default:
             // Type is kTexture (2) or kInvalidTexture (3) - completely wrong
@@ -4460,6 +5169,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
                 "constant index, or the game has a bug.",
                 vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1,
                 static_cast<uint32_t>(vfetch_constant.type));
+            XdroidSanDrop("texture fetch in a vertex fetch slot", 2,
+                          vertex_shader, pixel_shader);
             return false;
         }
         // Mask to physical like the shader - the guest may use a mirror window.
@@ -4467,6 +5178,20 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
             xenos::CpuToGpu(vfetch_constant.address << 2) >> 2;
         vfetch_sizes[vfetch_current_queued++] = vfetch_constant.size;
       }
+    }
+
+    // XDroid360 GPU-SAN: the guest addresses this draw will read and write.
+    if (VulkanGpuSanity::enabled()) {
+      VulkanGpuSanity::IndexBuffer san_index;
+      if (index_buffer_info) {
+        san_index.guest_base = index_buffer_info->guest_base;
+        san_index.length = index_buffer_info->length;
+        san_index.count = index_buffer_info->count;
+      }
+      VulkanGpuSanity::CheckDraw(regs, *vertex_shader, pixel_shader,
+                                 index_buffer_info ? &san_index : nullptr,
+                                 memexport_ranges_,
+                                 XdroidSanDrawId(vertex_shader, pixel_shader));
     }
 
     // XDroid360 HUD-1 forensics (temp, revert-planned): the draw black box
@@ -4510,6 +5235,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         range.hash_parse = VulkanDrawBlackbox::HashGuest(
             *memory_, range.address, range.length, range.head);
       }
+      record.ib_depth = xdroid_ib_depth_;
+      for (uint32_t i = 0; i < std::min<uint32_t>(xdroid_ib_depth_, 3); ++i) {
+        record.ib_chain[i] = {xdroid_ib_stack_[i].ptr,
+                              xdroid_ib_stack_[i].dwords,
+                              xdroid_ib_stack_[i].flags};
+      }
       uint32_t textures_remaining = used_texture_mask;
       uint32_t texture_slot;
       while (record.texture_count < VulkanDrawBlackbox::kMaxTextures &&
@@ -4550,6 +5281,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
               "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
               "shared memory",
               vfetch_addresses[i] << 2, vfetch_sizes[i] << 2);
+          XdroidSanDrop("vertex buffer request failed", 2, vertex_shader,
+                        pixel_shader);
           return false;
         }
       }
@@ -4572,6 +5305,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
           "Failed to request memexport stream at 0x{:08X} (size {}) in the "
           "shared memory",
           memexport_range_base_bytes, memexport_range.size_bytes);
+      XdroidSanDrop("memexport request failed", 2, vertex_shader, pixel_shader);
       return false;
     }
     memexport_extent_start =
@@ -4597,6 +5331,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   // After all commands that may dispatch, copy or insert barriers, submit the
   // barriers (may end the render pass), and (re)enter the render pass before
   // drawing.
+  // GE-4: a memexport draw's shared memory barrier orders it against the
+  // pass's earlier draws, so it must end the pass as before, not join the
+  // segment.
+  if (memexport_used_vertex || memexport_used_pixel) {
+    CloseSpliceSegment();
+  }
   uint32_t zpd_hybrid_index_before_render_pass =
       zpd_active_segment_.hybrid ? zpd_active_query_index_ : UINT32_MAX;
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -4617,12 +5357,24 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
     // page faults at garbage addresses, kgsl hangs).
     if (!UpdateBindings(vertex_shader, pixel_shader, interpreter_placeholder,
                         placeholder_pixel_shader)) {
+      XdroidSanDrop("bindings update failed after pass", 2, vertex_shader,
+                    pixel_shader);
       return false;
     }
   }
 
+  XdroidEndResolveRun();
   // Track for device-lost diagnostics.
   ++submission_in_progress_.draw_count;
+  // GE-4: this draw is now recorded in the pass. A memexport draw writes
+  // shared memory inside the pass, which nothing may move ahead of.
+  ++draw_serial_;
+  if (memexport_used_vertex || memexport_used_pixel) {
+    CloseSpliceSegment();
+  }
+  if (pass_prof_in_pass_) {
+    ++pass_prof_records_.back().draws;
+  }
   submission_in_progress_.last_vs_hash = vertex_shader->ucode_data_hash();
   submission_in_progress_.last_ps_hash =
       pixel_shader ? pixel_shader->ucode_data_hash() : 0;
@@ -4683,6 +5435,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
         break;
       default:
         assert_unhandled_case(primitive_processing_result.index_buffer_type);
+        XdroidSanDrop("unhandled index buffer type", 2, vertex_shader,
+                      pixel_shader);
         return false;
     }
     deferred_command_buffer_.CmdVkBindIndexBuffer(
@@ -4709,6 +5463,32 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
   }
 
   if (!memexport_ranges_.empty()) {
+    {
+      // XDROID-MEMEXP: whether the title exports from shaders at all, and by
+      // which path. Upstream fixed fences passing before vertex-shader export
+      // output lands (xenia-edge 31a696a9a, 409ca81a3); this says whether
+      // porting them can matter for AC6. One line per 10 s with activity.
+      static uint64_t memexp_draws = 0, memexp_host = 0, memexp_kib = 0;
+      static auto memexp_window = std::chrono::steady_clock::now();
+      ++memexp_draws;
+      if (route_to_host) {
+        ++memexp_host;
+      }
+      for (const draw_util::MemExportRange& memexport_range :
+           memexport_ranges_) {
+        memexp_kib += memexport_range.size_bytes >> 10;
+      }
+      const auto memexp_now = std::chrono::steady_clock::now();
+      if (memexp_now - memexp_window >= std::chrono::seconds(10)) {
+        XELOGI(
+            "XDROID-MEMEXP 10 s: draws={} host_route={} staged={} kib={} "
+            "zero_copy={}",
+            memexp_draws, memexp_host, memexp_draws - memexp_host, memexp_kib,
+            shared_memory_->is_zero_copy());
+        memexp_draws = memexp_host = memexp_kib = 0;
+        memexp_window = memexp_now;
+      }
+    }
     if (route_to_host) {
       // Producer draw: output landed in host_buffer_ (guest RAM), already CPU
       // coherent, so no readback. Just record the written pages. Consumers then
@@ -5184,10 +5964,28 @@ bool VulkanCommandProcessor::MirrorScaledResolveToSharedMemory(
   return true;
 }
 
+void VulkanCommandProcessor::ApplyForceMsaa1x() {
+  if (!cvars::gpu_force_msaa_1x) {
+    return;
+  }
+  uint32_t& rb_surface_info_value =
+      register_file_->values[XE_GPU_REG_RB_SURFACE_INFO];
+  reg::RB_SURFACE_INFO rb_surface_info;
+  rb_surface_info.value = rb_surface_info_value;
+  if (rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) {
+    return;
+  }
+  rb_surface_info.msaa_samples = xenos::MsaaSamples::k1X;
+  rb_surface_info_value = rb_surface_info.value;
+  ++msaa_forced_total_;
+}
+
 bool VulkanCommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+
+  ApplyForceMsaa1x();
 
   if (!BeginSubmission(true)) {
     return false;
@@ -5210,6 +6008,11 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
   ++submission_in_progress_.resolve_count;
+  // XR-4 Phase 0: a direct resolve that neither clears nor needs the scaled
+  // mirror is one the lazy drain could merge with its neighbours.
+  XdroidNoteResolve(render_target_cache_->last_resolve_direct() &&
+                    !render_target_cache_->last_resolve_cleared() &&
+                    !is_scaled);
 
   // The resolve wrote the device buffer. Drop any stale memexport marks so the
   // output isn't overwritten with guest RAM by a later texture load.
@@ -5580,7 +6383,11 @@ bool VulkanCommandProcessor::AwaitQueryResolve(ReportHandle report_handle,
             "ZPD/Async: Draining Vulkan async pipeline creation for strict "
             "retirement");
       }
+      uint64_t drain_start = xe::Clock::QueryHostTickCount();
       pipeline_cache_->AwaitPipelineCompletion();
+      ++shader_stall_frame_.query_drain_count;
+      shader_stall_frame_.query_drain_ticks +=
+          xe::Clock::QueryHostTickCount() - drain_start;
     }
     TagPassEnd(PassEndReason::kQuery);
     EndRenderPass();
@@ -6077,6 +6884,71 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   return true;
 }
 
+void VulkanCommandProcessor::EndFrameShaderStalls() {
+  VulkanPipelineCache::DrawThreadCompileStats compile_stats =
+      pipeline_cache_ ? pipeline_cache_->TakeDrawThreadCompileStats()
+                      : VulkanPipelineCache::DrawThreadCompileStats();
+  ShaderStallFrame stalls = shader_stall_frame_;
+  shader_stall_frame_ = {};
+  if (!cvars::xdroid_shader_stall_log) {
+    return;
+  }
+  uint64_t tick_frequency = xe::Clock::QueryHostTickFrequency();
+  auto ms = [tick_frequency](uint64_t ticks) {
+    return double(ticks) * 1000.0 / double(tick_frequency);
+  };
+  uint64_t total_ticks =
+      stalls.translate_ticks + stalls.await_ticks + stalls.query_drain_ticks +
+      compile_stats.sync_pipeline_ticks + compile_stats.placeholder_ticks;
+  bool stalled = stalls.translate_count || stalls.await_count ||
+                 stalls.query_drain_count ||
+                 compile_stats.sync_pipeline_count ||
+                 compile_stats.placeholder_count;
+  ++shader_stall_summary_frames_;
+  shader_stall_summary_ticks_ += total_ticks;
+  shader_stall_summary_skipped_draws_ += stalls.skipped_draws;
+  shader_stall_summary_worst_ticks_ =
+      std::max(shader_stall_summary_worst_ticks_, total_ticks);
+  if (stalled) {
+    ++shader_stall_summary_stalled_frames_;
+    if (ms(total_ticks) >= double(cvars::xdroid_shader_stall_hitch_ms)) {
+      ++shader_stall_summary_hitch_frames_;
+    }
+  }
+  if (stalled || stalls.skipped_draws || stalls.submit_deferred) {
+    size_t queue_live = 0, queue_total = 0;
+    if (pipeline_cache_) {
+      pipeline_cache_->GetCreationQueueCounts(queue_live, queue_total);
+    }
+    XELOGI(
+        "ShaderStall f{}: {:.2f} ms | translate {}/{:.2f} | sync_pso {}/{:.2f} "
+        "| placeholder {}/{:.2f} | await {}/{:.2f} | query_drain {}/{:.2f} | "
+        "skipped_draws {} | submit_deferred {} | queue live {} total {}",
+        frame_current_, ms(total_ticks), stalls.translate_count,
+        ms(stalls.translate_ticks), compile_stats.sync_pipeline_count,
+        ms(compile_stats.sync_pipeline_ticks), compile_stats.placeholder_count,
+        ms(compile_stats.placeholder_ticks), stalls.await_count,
+        ms(stalls.await_ticks), stalls.query_drain_count,
+        ms(stalls.query_drain_ticks), stalls.skipped_draws,
+        stalls.submit_deferred, queue_live, queue_total);
+  }
+  if (shader_stall_summary_frames_ >= 600) {
+    XELOGI(
+        "ShaderStall summary: {} frames, {} with stalls, {} hitches (>= {} "
+        "ms), {:.1f} ms total, worst frame {:.2f} ms, {} skipped draws",
+        shader_stall_summary_frames_, shader_stall_summary_stalled_frames_,
+        shader_stall_summary_hitch_frames_, cvars::xdroid_shader_stall_hitch_ms,
+        ms(shader_stall_summary_ticks_), ms(shader_stall_summary_worst_ticks_),
+        shader_stall_summary_skipped_draws_);
+    shader_stall_summary_frames_ = 0;
+    shader_stall_summary_stalled_frames_ = 0;
+    shader_stall_summary_hitch_frames_ = 0;
+    shader_stall_summary_ticks_ = 0;
+    shader_stall_summary_worst_ticks_ = 0;
+    shader_stall_summary_skipped_draws_ = 0;
+  }
+}
+
 bool VulkanCommandProcessor::CanEndSubmissionImmediately() const {
   return !submission_open_ || !pipeline_cache_ ||
          !pipeline_cache_->IsCreatingPipelines();
@@ -6132,6 +7004,279 @@ void VulkanCommandProcessor::CollectCompletedGpuTimeQueries() {
     }
     gpu_time_query_submissions_[slot] = 0;
   }
+}
+
+void VulkanCommandProcessor::PassProfBeginPass(PassProfKind kind,
+                                               const VkExtent2D& extent) {
+  // Called with no pass open, right before the begin command.
+  pass_prof_in_pass_ = false;
+  const uint32_t every = cvars::xdroid_pass_profiler;
+  if (pass_prof_state_ == PassProfState::kRecording &&
+      frame_current_ != pass_prof_frame_) {
+    pass_prof_state_ = PassProfState::kWaiting;
+  }
+  if (pass_prof_state_ == PassProfState::kIdle) {
+    if (!every || frame_current_ % every ||
+        frame_current_ == pass_prof_frame_) {
+      return;
+    }
+    ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+    if (pass_prof_pool_ == VK_NULL_HANDLE) {
+      if (pass_prof_pool_failed_ ||
+          !vulkan_device->properties().timestampPeriod) {
+        pass_prof_pool_failed_ = true;
+        return;
+      }
+      VkQueryPoolCreateInfo pool_info = {
+          VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      // Two extra stamps: the probe pair (XR-4 Phase 0).
+      pool_info.queryCount = kPassProfMaxPasses * 2 + 2;
+      if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                                &pass_prof_pool_) != VK_SUCCESS) {
+        XELOGE("PassProf: failed to create the timestamp query pool");
+        pass_prof_pool_ = VK_NULL_HANDLE;
+        pass_prof_pool_failed_ = true;
+        return;
+      }
+    }
+    // Outside any pass, and before the first timestamp in queue order.
+    deferred_command_buffer_.CmdVkResetQueryPool(pass_prof_pool_, 0,
+                                                 kPassProfMaxPasses * 2 + 2);
+    // XR-4 Phase 0 probe: two stamps with nothing between them, the cost of
+    // one empty between-pass gap as the profiler measures it.
+    deferred_command_buffer_.CmdVkWriteTimestamp(
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_prof_pool_,
+        kPassProfMaxPasses * 2);
+    deferred_command_buffer_.CmdVkWriteTimestamp(
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_prof_pool_,
+        kPassProfMaxPasses * 2 + 1);
+    pass_prof_records_.clear();
+    pass_prof_frame_ = frame_current_;
+    pass_prof_state_ = PassProfState::kRecording;
+  }
+  if (pass_prof_state_ != PassProfState::kRecording ||
+      pass_prof_records_.size() >= kPassProfMaxPasses) {
+    return;
+  }
+  PassProfRecord& record = pass_prof_records_.emplace_back();
+  record.submission = GetCurrentSubmission();
+  record.query = uint32_t(pass_prof_records_.size() - 1) * 2;
+  record.draws = 0;
+  record.width = extent.width;
+  record.height = extent.height;
+  record.kind = kind;
+  record.end_reason = PassEndReason::kOther;
+  record.barrier_site = 0;
+  // Bottom of pipe on both sides: the begin stamp is when the work before the
+  // pass finished, so pass time and between-pass time don't overlap.
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_prof_pool_, record.query);
+  pass_prof_last_submission_ = record.submission;
+  pass_prof_in_pass_ = true;
+}
+
+void VulkanCommandProcessor::PassProfNoteBarrierSite(uint32_t line,
+                                                     const char* file) {
+  if (pass_prof_state_ != PassProfState::kRecording ||
+      pass_prof_pending_site_ || !file) {
+    return;
+  }
+  // File letter from the base name after "vulkan_": c(ommand processor),
+  // r(ender target cache), t(exture cache), s(hared memory), p(rimitive).
+  const char* base = std::strrchr(file, '/');
+  const char* base_win = std::strrchr(file, '\\');
+  base = std::max(base ? base + 1 : file, base_win ? base_win + 1 : file);
+  if (std::strncmp(base, "vulkan_", 7) == 0) {
+    base += 7;
+  }
+  pass_prof_pending_site_ =
+      (uint32_t(uint8_t(*base)) << 24) | (line & 0xFFFFFF);
+}
+
+void VulkanCommandProcessor::PassProfEndPass(PassEndReason end_reason,
+                                             const VkRect2D* patched_area) {
+  // Called right after the end command.
+  pass_prof_in_pass_ = false;
+  PassProfRecord& record = pass_prof_records_.back();
+  record.end_reason = end_reason;
+  record.barrier_site =
+      end_reason == PassEndReason::kBarrier ? pass_prof_end_site_ : 0;
+  if (patched_area) {
+    record.width = patched_area->extent.width;
+    record.height = patched_area->extent.height;
+  }
+  deferred_command_buffer_.CmdVkWriteTimestamp(
+      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pass_prof_pool_, record.query + 1);
+}
+
+void VulkanCommandProcessor::PassProfCollect() {
+  if (pass_prof_state_ == PassProfState::kRecording &&
+      frame_current_ != pass_prof_frame_) {
+    pass_prof_state_ = PassProfState::kWaiting;
+  }
+  if (pass_prof_state_ != PassProfState::kWaiting ||
+      GetCompletedSubmission() < pass_prof_last_submission_) {
+    return;
+  }
+  pass_prof_state_ = PassProfState::kIdle;
+  const size_t pass_count = pass_prof_records_.size();
+  if (!pass_count || pass_prof_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  std::vector<uint64_t> timestamps(pass_count * 2);
+  if (dfn.vkGetQueryPoolResults(
+          vulkan_device->device(), pass_prof_pool_, 0, uint32_t(pass_count * 2),
+          sizeof(uint64_t) * timestamps.size(), timestamps.data(),
+          sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+    XELOGW("PassProf: frame {} results not available", pass_prof_frame_);
+    return;
+  }
+  uint64_t probe[2] = {};
+  const bool probe_valid =
+      dfn.vkGetQueryPoolResults(vulkan_device->device(), pass_prof_pool_,
+                                kPassProfMaxPasses * 2, 2, sizeof(probe), probe,
+                                sizeof(uint64_t),
+                                VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+      probe[1] >= probe[0];
+  const double ns_per_tick = vulkan_device->properties().timestampPeriod;
+  auto ms = [ns_per_tick](uint64_t ticks) {
+    return double(ticks) * ns_per_tick * 1e-6;
+  };
+  static constexpr const char* kReasonNames[] = {
+      "other",    "rt",       "barrier", "texload", "upload", "resolve",
+      "transfer", "readback", "query",   "swap",    "submit"};
+  static_assert(std::size(kReasonNames) == size_t(PassEndReason::kCount));
+  static constexpr const char* kKindNames[] = {"guest", "transfer", "clear"};
+  static_assert(std::size(kKindNames) == size_t(PassProfKind::kCount));
+  uint64_t reason_ticks[size_t(PassEndReason::kCount)] = {};
+  uint32_t reason_passes[size_t(PassEndReason::kCount)] = {};
+  uint64_t kind_ticks[size_t(PassProfKind::kCount)] = {};
+  uint32_t kind_passes[size_t(PassProfKind::kCount)] = {};
+  uint64_t in_pass_ticks = 0, between_ticks = 0;
+  // XR-4 Phase 0: between-pass time by the end reason of the pass before the
+  // gap (the work recorded after it), and the number of such gaps.
+  uint64_t between_reason_ticks[size_t(PassEndReason::kCount)] = {};
+  uint32_t between_reason_gaps[size_t(PassEndReason::kCount)] = {};
+  // Per-pass time in ticks, 0 where the stamps are unusable.
+  std::vector<uint64_t> pass_ticks(pass_count);
+  for (size_t i = 0; i < pass_count; ++i) {
+    const PassProfRecord& record = pass_prof_records_[i];
+    const uint64_t begin = timestamps[i * 2], end = timestamps[i * 2 + 1];
+    if (end > begin) {
+      pass_ticks[i] = end - begin;
+    }
+    in_pass_ticks += pass_ticks[i];
+    reason_ticks[size_t(record.end_reason)] += pass_ticks[i];
+    ++reason_passes[size_t(record.end_reason)];
+    kind_ticks[size_t(record.kind)] += pass_ticks[i];
+    ++kind_passes[size_t(record.kind)];
+    // Between passes only within one submission: across submissions the gap
+    // includes the GPU waiting for the next one.
+    if (i && pass_prof_records_[i - 1].submission == record.submission &&
+        begin > timestamps[i * 2 - 1]) {
+      between_ticks += begin - timestamps[i * 2 - 1];
+      const size_t previous_reason =
+          size_t(pass_prof_records_[i - 1].end_reason);
+      between_reason_ticks[previous_reason] += begin - timestamps[i * 2 - 1];
+      ++between_reason_gaps[previous_reason];
+    }
+  }
+  std::string line = fmt::format(
+      "PassProf frame {}: passes={} in_pass={:.2f}ms between={:.2f}ms |",
+      pass_prof_frame_, pass_count, ms(in_pass_ticks), ms(between_ticks));
+  for (size_t i = 0; i < size_t(PassProfKind::kCount); ++i) {
+    if (kind_passes[i]) {
+      line += fmt::format(" {}={}/{:.2f}ms", kKindNames[i], kind_passes[i],
+                          ms(kind_ticks[i]));
+    }
+  }
+  line += " | by end:";
+  for (size_t i = 0; i < size_t(PassEndReason::kCount); ++i) {
+    if (reason_passes[i]) {
+      line += fmt::format(" {}={}/{:.2f}ms", kReasonNames[i], reason_passes[i],
+                          ms(reason_ticks[i]));
+    }
+  }
+  XELOGI("{}", line);
+  std::string gap_line;
+  for (size_t i = 0; i < size_t(PassEndReason::kCount); ++i) {
+    if (between_reason_gaps[i]) {
+      gap_line +=
+          fmt::format(" {}={}/{:.2f}ms", kReasonNames[i],
+                      between_reason_gaps[i], ms(between_reason_ticks[i]));
+    }
+  }
+  XELOGI("PassProf frame {} gaps after:{} | probe={:.1f}us", pass_prof_frame_,
+         gap_line, probe_valid ? ms(probe[1] - probe[0]) * 1000.0 : -1.0);
+  // GE-0: barrier-ended passes by the site of their first pending barrier:
+  // count, time of the pass it ended, and the gap after it.
+  struct SiteTime {
+    uint32_t passes = 0;
+    uint64_t pass_ticks = 0, gap_ticks = 0;
+  };
+  std::map<uint32_t, SiteTime> site_times;
+  for (size_t i = 0; i < pass_count; ++i) {
+    const PassProfRecord& record = pass_prof_records_[i];
+    if (record.end_reason != PassEndReason::kBarrier) {
+      continue;
+    }
+    SiteTime& site_time = site_times[record.barrier_site];
+    ++site_time.passes;
+    site_time.pass_ticks += pass_ticks[i];
+    if (i + 1 < pass_count &&
+        pass_prof_records_[i + 1].submission == record.submission &&
+        timestamps[(i + 1) * 2] > timestamps[i * 2 + 1]) {
+      site_time.gap_ticks += timestamps[(i + 1) * 2] - timestamps[i * 2 + 1];
+    }
+  }
+  if (!site_times.empty()) {
+    std::string site_line;
+    for (const auto& [site, site_time] : site_times) {
+      site_line +=
+          fmt::format(" {}{}={}/{:.2f}+{:.2f}ms", site ? char(site >> 24) : '?',
+                      site & 0xFFFFFF, site_time.passes,
+                      ms(site_time.pass_ticks), ms(site_time.gap_ticks));
+    }
+    XELOGI("PassProf frame {} barrier sites:{}", pass_prof_frame_, site_line);
+  }
+  std::vector<uint32_t> order(pass_count);
+  for (uint32_t i = 0; i < uint32_t(pass_count); ++i) {
+    order[i] = i;
+  }
+  const size_t top =
+      std::min<size_t>(cvars::xdroid_pass_profiler_top, pass_count);
+  std::partial_sort(order.begin(), order.begin() + top, order.end(),
+                    [&pass_ticks](uint32_t a, uint32_t b) {
+                      return pass_ticks[a] > pass_ticks[b];
+                    });
+  std::string top_line;
+  for (size_t i = 0; i < top; ++i) {
+    const PassProfRecord& record = pass_prof_records_[order[i]];
+    top_line += fmt::format(" #{} {} {}x{} d={} end={} {:.3f}ms;", order[i],
+                            kKindNames[size_t(record.kind)], record.width,
+                            record.height, record.draws,
+                            kReasonNames[size_t(record.end_reason)],
+                            ms(pass_ticks[order[i]]));
+  }
+  if (!top_line.empty()) {
+    XELOGI("PassProf frame {} top:{}", pass_prof_frame_, top_line);
+  }
+}
+
+void VulkanCommandProcessor::DestroyPassProfPool() {
+  if (pass_prof_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(),
+                                                pass_prof_pool_, nullptr);
+  pass_prof_pool_ = VK_NULL_HANDLE;
+  pass_prof_state_ = PassProfState::kIdle;
+  pass_prof_in_pass_ = false;
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
@@ -6239,12 +7384,47 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       bind_sparse_info.signalSemaphoreCount = 1;
       bind_sparse_info.pSignalSemaphores = &bind_sparse_semaphore;
       VkResult bind_sparse_result;
+      const auto bind_sparse_start = std::chrono::steady_clock::now();
       {
         ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
             vulkan_device->AcquireQueue(
                 vulkan_device->queue_family_sparse_binding(), 0);
         bind_sparse_result = dfn.vkQueueBindSparse(
             queue_acquisition.queue(), 1, &bind_sparse_info, VK_NULL_HANDLE);
+      }
+      {
+        // XDROID-SPARSE: drivers without VK_EXT_external_memory_host (S24
+        // Turnip builds) back shared memory with a sparse buffer, and every
+        // submission touching new pages waits on these binds. One summary
+        // line per second with activity, plus a warning for slow calls.
+        static uint64_t sparse_calls = 0, sparse_binds = 0, sparse_bytes = 0;
+        static double sparse_ms = 0.0, sparse_max_ms = 0.0;
+        static auto sparse_window = bind_sparse_start;
+        const auto bind_sparse_end = std::chrono::steady_clock::now();
+        const double call_ms = std::chrono::duration<double, std::milli>(
+                                   bind_sparse_end - bind_sparse_start)
+                                   .count();
+        ++sparse_calls;
+        sparse_binds += sparse_memory_binds_.size();
+        for (const VkSparseMemoryBind& bind : sparse_memory_binds_) {
+          sparse_bytes += bind.size;
+        }
+        sparse_ms += call_ms;
+        sparse_max_ms = std::max(sparse_max_ms, call_ms);
+        if (call_ms > 20.0) {
+          XELOGW("XDROID-SPARSE slow bind: {:.1f} ms, {} binds", call_ms,
+                 sparse_memory_binds_.size());
+        }
+        if (bind_sparse_end - sparse_window >= std::chrono::seconds(1)) {
+          XELOGI(
+              "XDROID-SPARSE calls={} binds={} kib={} cpu_ms={:.2f} "
+              "max_ms={:.2f}",
+              sparse_calls, sparse_binds, sparse_bytes >> 10, sparse_ms,
+              sparse_max_ms);
+          sparse_calls = sparse_binds = sparse_bytes = 0;
+          sparse_ms = sparse_max_ms = 0.0;
+          sparse_window = bind_sparse_end;
+        }
       }
       if (bind_sparse_result != VK_SUCCESS) {
         XELOGE("Failed to submit Vulkan sparse binds");
@@ -6415,6 +7595,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (cvars::xdroid_draw_blackbox) {
       draw_blackbox_.OnFrameEnd(*memory_, frame_current_);
     }
+    EndFrameShaderStalls();
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] =
         GetCurrentSubmission() - 1;
@@ -6560,6 +7741,22 @@ void VulkanCommandProcessor::UpdateDynamicState(
   scissor_rect.offset.y = int32_t(scissor.offset[1]);
   scissor_rect.extent.width = scissor.extent[0];
   scissor_rect.extent.height = scissor.extent[1];
+  if (cvars::xdroid_tile_bound == 2 && xdroid_tile_index_ >= 1) {
+    scissor_rect.extent.width = 0;
+    scissor_rect.extent.height = 0;
+  }
+  if (render_target_cache_->tile_merge_drawing()) {
+    // TILE-1: the merged pass covers the tiles side by side; a scissor cut by
+    // the first tile's edge extends to the screen scissor.
+    int32_t tile_width = int32_t(render_target_cache_->tile_merge_width());
+    int32_t right = scissor_rect.offset.x + int32_t(scissor_rect.extent.width);
+    if (right >= tile_width) {
+      int32_t screen_right = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>().br_x;
+      right = std::min(2 * tile_width, screen_right);
+      scissor_rect.extent.width =
+          uint32_t(std::max(right - scissor_rect.offset.x, int32_t(0)));
+    }
+  }
   SetScissor(scissor_rect);
 
   if (render_target_cache_->GetPath() ==
@@ -7508,6 +8705,34 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       VkDescriptorImageInfo& descriptor_image_info =
           descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
+    }
+  }
+
+  // XDroid360 GPU-SAN: a null view or sampler makes the GPU read address 0.
+  if (VulkanGpuSanity::enabled()) {
+    for (size_t i = 0; i < descriptor_write_image_info_.size(); ++i) {
+      const VkDescriptorImageInfo& info = descriptor_write_image_info_[i];
+      const bool pixel = i >= pixel_texture_image_info_offset;
+      const bool sampler = pixel ? i >= pixel_sampler_image_info_offset
+                                 : i >= vertex_sampler_image_info_offset;
+      if (sampler ? info.sampler != VK_NULL_HANDLE
+                  : info.imageView != VK_NULL_HANDLE) {
+        continue;
+      }
+      const size_t first = pixel ? (sampler ? pixel_sampler_image_info_offset
+                                            : pixel_texture_image_info_offset)
+                                 : (sampler ? vertex_sampler_image_info_offset
+                                            : vertex_texture_image_info_offset);
+      const uint32_t binding = uint32_t(i - first);
+      uint32_t fetch_constant = UINT32_MAX;
+      const std::vector<VulkanShader::TextureBinding>* textures =
+          pixel ? textures_pixel : &textures_vertex;
+      if (!sampler && textures && binding < textures->size()) {
+        fetch_constant = (*textures)[binding].fetch_constant;
+      }
+      VulkanGpuSanity::NullDescriptor(
+          sampler ? "sampler" : "image view", pixel, binding, fetch_constant,
+          XdroidSanDrawId(vertex_shader, pixel_shader));
     }
   }
 

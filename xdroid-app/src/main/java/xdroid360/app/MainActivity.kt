@@ -88,6 +88,7 @@ class MainActivity : ComponentActivity() {
   private var tab by mutableStateOf(Tab.Games)
   private val games = mutableStateListOf<GameEntry>()
   private val store by lazy { ConfigStore(File(filesDir, "xdroid").apply { mkdirs() }) }
+  private var diagnostics by mutableStateOf(true)
   private val covers by lazy { CoverStore(File(filesDir, "xdroid/covers")) }
   private var coverRevision by mutableStateOf(0)
   @Volatile private var coverScanRunning = false
@@ -104,6 +105,7 @@ class MainActivity : ComponentActivity() {
     SessionReports.recoverDeadSession(this)?.let { status = it }
     ensureStorageAccess()
     firstRunDefaults()
+    diagnostics = Diagnostics.enabled(store.globalFile.parentFile!!)
     // An install the app was killed during leaves its staging copy (and maybe
     // a replaced one) behind; queued behind any install still running.
     installExecutor.execute {
@@ -264,6 +266,15 @@ class MainActivity : ComponentActivity() {
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
       FilterChip(selected = sortRecent, onClick = { sortRecent = true }, label = { Text("Recent") })
       FilterChip(selected = !sortRecent, onClick = { sortRecent = false }, label = { Text("A-Z") })
+      Spacer(Modifier.weight(1f))
+      FilterChip(
+        selected = diagnostics,
+        onClick = {
+          diagnostics = !diagnostics
+          Diagnostics.set(store.globalFile.parentFile!!, diagnostics)
+        },
+        label = { Text(if (diagnostics) "Diagnostics on" else "Diagnostics off") },
+      )
     }
     val shown =
       games
@@ -1018,6 +1029,7 @@ class MainActivity : ComponentActivity() {
     val dirs = prefs().getStringSet("game_dirs", null)?.toMutableSet() ?: mutableSetOf()
     if (dirs.isEmpty()) {
       prefs().getString("last_game_dir", null)?.let { dirs.add(it) }
+      File("/sdcard/Juegos/X360").takeIf { it.isDirectory }?.let { dirs.add(it.absolutePath) }
     }
     return dirs
   }

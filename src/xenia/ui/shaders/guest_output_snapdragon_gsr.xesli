@@ -1,0 +1,136 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2026 XDroid360 contributors.                                     *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ */
+
+// Snapdragon Game Super Resolution 1 (single-pass spatial upscaler tuned for
+// Adreno), RGBA mode (green as the luma proxy). Ported from
+// sgsr/v1/include/glsl/sgsr1_shader_mobile.frag of
+// https://github.com/SnapdragonGameStudios/snapdragon-gsr (commit at the time
+// of the port: d926f074bcb9d714e179f1ce0fcb9ee2eeb5074e), which is:
+//   Copyright (c) 2025, Qualcomm Innovation Center, Inc. All rights reserved.
+//   SPDX-License-Identifier: BSD-3-Clause
+// Reuses the bilinear push constants (output offset and inverse output size);
+// the input size comes from the texture.
+// XE_GSR_EDGE_SHARPNESS: 2.0 is upstream's default; 1.0 adds no sharpening
+// beyond the reconstruction (for when the phone's own sharpening is on).
+
+#include "xesl.xesli"
+
+#ifndef XE_GSR_EDGE_SHARPNESS
+  #define XE_GSR_EDGE_SHARPNESS 2.0f
+#endif
+
+push_const_begin_xe(b0, space0)
+  // 16 used by the vertex shader (GLSL push constant offsets are across
+  // stages).
+  block_offset_member_xe(16, c0.x, int2_xe, xe_gsr_output_offset)
+  block_offset_member_xe(24, c0.z, float2_xe, xe_gsr_output_size_inv)
+push_const_end_xe
+
+float XeGsrFastLanczos2(float x) {
+  float wA = x - 4.0f;
+  float wB = x * wA - wA;
+  wA *= wA;
+  return wB * wA;
+}
+
+float2_xe XeGsrWeightY(float dx, float dy, float c, float std_inv) {
+  float x = (dx * dx + dy * dy) * 0.55f + clamp(abs(c) * std_inv, 0.0f, 1.0f);
+  float w = XeGsrFastLanczos2(x);
+  return float2_xe(w, w * c);
+}
+
+entry_outputs_begin_xe
+  entry_out_target_xe(float4_xe, xe_gsr_color, 0)
+entry_outputs_end_stage_inputs_begin_xe
+entry_stage_inputs_end_bindings_begin_pixel_xe
+  push_const_binding_xe(buffer(0))
+  entry_binding_next_xe
+  texture_xe(texture_2d_xe, xe_gsr_source, 0, 0, t0, space0, texture(0))
+  entry_binding_next_xe
+  sampler_state_xe(xe_gsr_sampler, 0, 1, s0, space0, sampler(0))
+entry_bindings_end_inputs_begin_xe
+  entry_in_pixel_coord_xe
+entry_inputs_end_code_begin_xe
+{
+  uint2_xe pixel_coord = uint2_xe(int2_xe(in_pixel_coord_xe.xy) -
+                                  push_const_xe(xe_gsr_output_offset));
+  float2_xe uv = (float2_xe(pixel_coord) + 0.5f) *
+                 push_const_xe(xe_gsr_output_size_inv);
+  #if SHADING_LANGUAGE_HLSL_XE
+    uint input_width, input_height;
+    xe_gsr_source.GetDimensions(input_width, input_height);
+    float2_xe input_size = float2_xe(float(input_width), float(input_height));
+  #else
+    float2_xe input_size = float2_xe(textureSize(xe_gsr_source, 0));
+  #endif
+  float2_xe texel_size = 1.0f / input_size;
+
+  float4_xe color;
+  color.rgb =
+      sample_sep_lod_2d_xe(xe_gsr_source, xe_gsr_sampler, uv, 0.0f).rgb;
+  color.a = 1.0f;
+
+  float2_xe img_coord = uv * input_size + float2_xe(-0.5f, 0.5f);
+  float2_xe img_coord_pixel = floor(img_coord);
+  float2_xe coord = img_coord_pixel * texel_size;
+  float2_xe pl = img_coord - img_coord_pixel;
+  float4_xe left = gather_sep_2d_g_xe(xe_gsr_source, xe_gsr_sampler, coord);
+
+  float edge_vote = abs(left.z - left.y) + abs(color.g - left.y) +
+                    abs(color.g - left.z);
+  if (edge_vote > 8.0f / 255.0f) {
+    coord.x += texel_size.x;
+
+    float4_xe right = gather_sep_2d_g_xe(
+        xe_gsr_source, xe_gsr_sampler, coord + float2_xe(texel_size.x, 0.0f));
+    float4_xe up_down;
+    up_down.xy = gather_sep_2d_g_xe(xe_gsr_source, xe_gsr_sampler,
+                                    coord + float2_xe(0.0f, -texel_size.y))
+                     .wz;
+    up_down.zw = gather_sep_2d_g_xe(xe_gsr_source, xe_gsr_sampler,
+                                    coord + float2_xe(0.0f, texel_size.y))
+                     .yx;
+
+    float mean = (left.y + left.z + right.x + right.w) * 0.25f;
+    left -= mean;
+    right -= mean;
+    up_down -= mean;
+    float center = color.g - mean;
+
+    float sum = abs(left.x) + abs(left.y) + abs(left.z) + abs(left.w) +
+                abs(right.x) + abs(right.y) + abs(right.z) + abs(right.w) +
+                abs(up_down.x) + abs(up_down.y) + abs(up_down.z) +
+                abs(up_down.w);
+    float std_inv = 2.181818f / sum;
+
+    float2_xe a_wy = XeGsrWeightY(pl.x, pl.y + 1.0f, up_down.x, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 1.0f, pl.y + 1.0f, up_down.y, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 1.0f, pl.y - 2.0f, up_down.z, std_inv);
+    a_wy += XeGsrWeightY(pl.x, pl.y - 2.0f, up_down.w, std_inv);
+    a_wy += XeGsrWeightY(pl.x + 1.0f, pl.y - 1.0f, left.x, std_inv);
+    a_wy += XeGsrWeightY(pl.x, pl.y - 1.0f, left.y, std_inv);
+    a_wy += XeGsrWeightY(pl.x, pl.y, left.z, std_inv);
+    a_wy += XeGsrWeightY(pl.x + 1.0f, pl.y, left.w, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 1.0f, pl.y - 1.0f, right.x, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 2.0f, pl.y - 1.0f, right.y, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 2.0f, pl.y, right.z, std_inv);
+    a_wy += XeGsrWeightY(pl.x - 1.0f, pl.y, right.w, std_inv);
+
+    float final_y = a_wy.y / a_wy.x;
+    float max_y = max(max(left.y, left.z), max(right.x, right.w));
+    float min_y = min(min(left.y, left.z), min(right.x, right.w));
+    final_y = clamp(XE_GSR_EDGE_SHARPNESS * final_y, min_y, max_y);
+    // Smooth high-contrast input.
+    float delta_y = clamp(final_y - center, -23.0f / 255.0f, 23.0f / 255.0f);
+    color.rgb = saturate_xe(color.rgb + delta_y);
+  }
+
+  out_xe(xe_gsr_color) = color;
+}
+entry_code_end_xe

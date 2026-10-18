@@ -80,6 +80,25 @@ struct XdroidAudioWatch {
   std::atomic<uint64_t> dispatch_delay_us{0};
   std::atomic<uint64_t> dispatches{0};
   std::atomic<uint64_t> dispatch_delay_max_us{0};
+  // AUD-5: the producer's own slices on its dispatch host thread, from
+  // switch-in to switch-out: wall time, host CPU time, host run-queue delay
+  // (schedstat), and why each slice ended (wait, preempted, quantum end,
+  // voluntary yield such as a contended spinlock). Thread 18 (AC6's XAudio2
+  // render thread) never waits on another guest object while it renders, so its
+  // render time is CPU, host scheduling or yields; this splits them.
+  std::atomic<uint64_t> slices{0};
+  std::atomic<uint64_t> slice_wall_us{0};
+  std::atomic<uint64_t> slice_cpu_us{0};
+  std::atomic<uint64_t> slice_runq_us{0};
+  std::atomic<uint64_t> slice_end_wait{0};
+  std::atomic<uint64_t> slice_end_preempt{0};
+  std::atomic<uint64_t> slice_end_quantum{0};
+  std::atomic<uint64_t> slice_end_yield{0};
+  // Producer CPU time per host core it was dispatched on (core index < 16).
+  static constexpr int kHostCpus = 16;
+  std::atomic<uint64_t> host_cpu_us[kHostCpus] = {};
+  // Nice of the dispatch thread at the last switch-in (before any boost).
+  std::atomic<int32_t> dispatch_nice{0};
 };
 inline XdroidAudioWatch xdroid_audio_watch;
 inline uint64_t XdroidNowUs() {

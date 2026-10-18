@@ -18,14 +18,22 @@
 //   Bluetooth change) it closes the dead stream, reopens on the new route
 //   with a 1 s retry, and meanwhile plays the queue into silence at the
 //   real-time rate so audio-paced titles keep running.
+//   It also wakes every 500 ms for the route watch (xdroid_audio_route_watch):
+//   a route change that keeps the stream alive but changes its burst resizes
+//   the guest queue.
+// - Rate control (xdroid_audio_drc_ppm, AUD-5): the consumer resamples up to
+//   that many ppm slower while the queue runs short, so a producer just under
+//   real time slows the guest's audio clock slightly instead of underrunning.
 #ifndef XDROID_AUDIO_DRIVER_H_
 #define XDROID_AUDIO_DRIVER_H_
 
 #include <aaudio/AAudio.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -34,6 +42,11 @@
 #include "xenia/base/threading.h"
 
 namespace xdroid {
+
+// MC-1 mark clip: writes the last 7 s of output audio (WAV) and the
+// steady-clock times of the underruns in it (CSV). False without a stream.
+bool WriteAudioClip(const std::filesystem::path& wav,
+                    const std::filesystem::path& events_csv);
 
 class XDroidAAudioDriver : public xe::apu::AudioDriver {
  public:
@@ -50,6 +63,18 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   }
 
  private:
+  friend bool WriteAudioClip(const std::filesystem::path& wav,
+                             const std::filesystem::path& events_csv);
+  // Mark clip: the output as played, 7 s at up to 96 kHz, and the last
+  // underrun times. Written by the render callback only.
+  static constexpr uint32_t kClipPairs = 96000 * 7;
+  static constexpr uint32_t kClipUnderruns = 256;
+  std::unique_ptr<float[]> clip_ring_;
+  std::atomic<uint64_t> clip_pairs_written_{0};
+  std::atomic<int32_t> clip_rate_{0};
+  std::array<std::atomic<int64_t>, kClipUnderruns> clip_underrun_ms_{};
+  std::atomic<uint64_t> clip_underruns_{0};
+
   // Power of two, >= the apu_max_queued_frames upper bound (64).
   static constexpr uint32_t kRingSlots = 64;
   static constexpr uint32_t kChannels = kFrameChannelsDefault;
@@ -65,6 +90,12 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
                             aaudio_result_t error);
 
   AAudioStream* OpenStream();
+  // Sizes the guest queue for |stream|'s burst (credit_target_, queue_depth_,
+  // burst_frames_) and returns the depth in frames.
+  uint32_t SizeQueue(AAudioStream* stream);
+  // AUD-5 route watch: a route change that does not disconnect the stream
+  // (e.g. Bluetooth headphones connecting) can change the burst under us.
+  void CheckRoute();
   void CloseStream();
   void ServiceThreadMain();
 
@@ -101,13 +132,31 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   // and per slot whether its frame already gave its semaphore slot back.
   std::atomic<uint32_t> credit_target_{0};
   std::atomic<uint32_t> credit_queued_{0};
+  // Queue depth (frames) and device burst (in guest frames) of the current
+  // stream, for the rate control; and the route last seen by CheckRoute.
+  std::atomic<uint32_t> queue_depth_{0};
+  std::atomic<uint32_t> burst_frames_{1};
+  int32_t route_device_id_ = 0;
+  int32_t route_burst_ = 0;
   bool ring_credit_[kRingSlots] = {};
 
   // Consumer state: one converted stereo frame and the read position in it.
   float stage_[kChannelSamples * 2] = {};
   uint32_t stage_pos_ = kChannelSamples;
   uint32_t consumed_in_render_ = 0;
-  // Linear resampler (only when the device is not at the guest rate).
+  // AUD-5 dynamic rate control (xdroid_audio_drc_ppm): when the queue runs
+  // below full at callback start, play up to that many ppm slower, so the
+  // consumer-paced guest producer gets the headroom it lacks instead of an
+  // underrun. Smoothed deficit, and 10 s log window.
+  double drc_deficit_ema_ = 0.0;
+  uint32_t drc_slow_ppm_ = 0;
+  uint64_t drc_sum_ppm_ = 0;
+  uint32_t drc_max_ppm_ = 0;
+  double drc_sum_deficit_ = 0.0;
+  uint32_t drc_calls_ = 0;
+  int64_t drc_log_ms_ = 0;
+  // Linear resampler (when the device is not at the guest rate, or rate
+  // control is on).
   double phase_ = 0.0;
   float prev_[2] = {};
   float next_[2] = {};

@@ -163,6 +163,14 @@ class VulkanPresenter final : public Presenter {
       bool& is_8bpc_out_ref) override;
 
   PaintResult PaintAndPresentImpl(bool execute_ui_drawers) override;
+  bool IsSnapdragonGsrSupported() const override {
+    return guest_output_paint_fs_[size_t(
+               GuestOutputPaintEffect::kSnapdragonGsr)] != VK_NULL_HANDLE &&
+           guest_output_paint_fs_[size_t(
+               GuestOutputPaintEffect::kSnapdragonGsrSoft)] != VK_NULL_HANDLE;
+  }
+  // UPS-1: reads the paint GPU time of a completed slot, logs per window.
+  void CollectPaintGpuTime(uint32_t slot);
 
  private:
   // Usable for both the guest output image itself and for intermediate images.
@@ -261,6 +269,9 @@ class VulkanPresenter final : public Presenter {
     switch (effect) {
       case GuestOutputPaintEffect::kBilinear:
       case GuestOutputPaintEffect::kBilinearDither:
+      // GSR-1: same push constants as bilinear (output offset and size).
+      case GuestOutputPaintEffect::kSnapdragonGsr:
+      case GuestOutputPaintEffect::kSnapdragonGsrSoft:
         return kGuestOutputPaintPipelineLayoutIndexBilinear;
       case GuestOutputPaintEffect::kCasSharpen:
       case GuestOutputPaintEffect::kCasSharpenDither:
@@ -417,6 +428,13 @@ class VulkanPresenter final : public Presenter {
         guest_output_image_paint_refs;
     // The latest submission index at which any guest output image was drawn.
     uint64_t guest_output_image_paint_last_submission = 0;
+
+    // UPS-1: GPU time of each paint submission (2 timestamps per slot of
+    // `submissions`), summed over a window and logged as "Present stats".
+    VkQueryPool paint_time_query_pool = VK_NULL_HANDLE;
+    std::array<bool, kSubmissionCount> paint_time_slot_pending = {};
+    uint64_t paint_time_window_ns = 0;
+    uint32_t paint_time_window_paints = 0;
 
     // Current intermediate images for guest output painting, refreshed when
     // painting guest output.

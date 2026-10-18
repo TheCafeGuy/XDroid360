@@ -5,6 +5,8 @@
 #include <atomic>
 #include <cmath>
 
+#include "xdroid_latency.h"
+
 namespace xdroid {
 
 using xe::X_RESULT;
@@ -65,6 +67,7 @@ X_RESULT XDroidGamepadDriver::GetState(uint32_t user_index,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   out_state->packet_number = g_pad.packet.load(std::memory_order_acquire);
+  LatNoteInputRead(out_state->packet_number);
   auto& pad = out_state->gamepad;
   pad.buttons = g_pad.buttons.load(std::memory_order_relaxed);
   pad.left_trigger = g_pad.triggers[0].load(std::memory_order_relaxed);
@@ -105,6 +108,7 @@ void XDroidGamepadDriver::SetButton(uint16_t mask, bool down) {
            : g_pad.buttons.fetch_and(uint16_t(~mask), std::memory_order_relaxed);
   const uint16_t after = down ? (before | mask) : (before & uint16_t(~mask));
   if (after != before) {
+    LatNoteInputChange();
     g_pad.packet.fetch_add(1, std::memory_order_release);
   }
 }
@@ -133,6 +137,7 @@ void XDroidGamepadDriver::SetAxis(GamepadAxis axis, float value) {
     }
   }
   if (changed) {
+    LatNoteInputChange();
     g_pad.packet.fetch_add(1, std::memory_order_release);
   }
 }

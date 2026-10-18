@@ -9,6 +9,10 @@
 
 #include "xenia/gpu/texture_cache.h"
 
+#include <algorithm>
+#include <chrono>
+#include <vector>
+
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -75,6 +79,31 @@ DEFINE_bool(tiled_shared_memory, true,
             "Enable tiled/sparse resources for efficient large address space "
             "support. Disable for graphics debugger compatibility.",
             "GPU.Debug");
+DEFINE_bool(xdroid_tex_probe, false,
+            "TEX-1 forensics: log every texture first-use miss as an "
+            "XDROID-TEXMISS line (create/load failure, texture bound before "
+            "any load, first load from zeroed memory, data rewritten right "
+            "after the first load, budget eviction thrash, async pipeline "
+            "stand-ins for textured draws), plus a summary every 300 frames. "
+            "Live.",
+            "GPU");
+DEFINE_bool(xdroid_tex_census, false,
+            "TEX-1 census: per texture key, count the loads (first, base, "
+            "mips), what invalidated them (CPU or GPU write), whether the "
+            "reloaded guest bytes were identical, bytes and CPU time; every "
+            "300 frames log XDROID-TEXCENSUS totals and the top 12 keys. Live.",
+            "GPU");
+DEFINE_bool(xdroid_tex_skip_same, false,
+            "TEX-1a: when a CPU write invalidated a texture but its guest "
+            "bytes hash the same as at its last load, keep the host texture "
+            "instead of loading it again (the shared memory upload still "
+            "happens). Live.",
+            "GPU");
+DEFINE_bool(xdroid_tex_unloaded_null, false,
+            "TEX-1 candidate fix: bind the null (zero) image instead of a "
+            "texture whose data has never loaded, whose contents are "
+            "undefined (on a recycled allocation, another texture). Live.",
+            "GPU");
 
 namespace xe {
 namespace gpu {
@@ -280,6 +309,13 @@ void TextureCache::CompletedSubmissionUpdated(
       // any texture has been destroyed.
       ResetTextureBindings();
     }
+    if (cvars::xdroid_tex_probe) {
+      ++probe_counters_.evicted;
+      if (probe_evicted_.size() >= 4096) {
+        probe_evicted_.clear();
+      }
+      probe_evicted_[texture->key()] = probe_frame();
+    }
     // Remove the texture from the map and destroy it via its unique_ptr.
     auto found_texture_it = textures_.find(texture->key());
     assert_true(found_texture_it != textures_.end());
@@ -305,6 +341,279 @@ void TextureCache::BeginFrame() {
   // sure bindings are reset so a new attempt will surely be made if the texture
   // is requested again.
   ResetTextureBindings();
+  unloaded_null_slots_ = 0;
+  probe_frame_.fetch_add(1, std::memory_order_relaxed);
+  if (cvars::xdroid_tex_probe) {
+    ProbeMaybeSummary();
+  }
+  if (cvars::xdroid_tex_census) {
+    CensusMaybeSummary();
+  } else if (!census_.empty()) {
+    census_.clear();
+  }
+}
+
+bool TextureCache::IsTextureHiddenAsUnloaded(const Texture* texture) {
+  return texture && !texture->ever_loaded() && cvars::xdroid_tex_unloaded_null;
+}
+
+void TextureCache::ProbeNoteStandIn(ProbeStandIn kind) {
+  ++probe_counters_.stand_in[uint32_t(kind)];
+}
+
+void TextureCache::ProbeLog(const char* event, const TextureKey& key,
+                            const char* detail) {
+  XELOGW(
+      "XDROID-TEXMISS {} frame={} base=0x{:08X} mips=0x{:08X} {}x{}x{} {} {} "
+      "fmt={} mips={} {}",
+      event, probe_frame(), key.base_page << 12, key.mip_page << 12,
+      key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+      key.GetLogDimensionName(), key.tiled ? "tiled" : "linear",
+      FormatInfo::GetName(key.format), key.mip_max_level + 1, detail);
+}
+
+void TextureCache::ProbeFirstLoad(Texture& texture) {
+  texture.ever_loaded_ = true;
+  if (!cvars::xdroid_tex_probe) {
+    return;
+  }
+  texture.probe_.first_load_frame = probe_frame();
+  // Data that hasn't arrived yet: sample the guest memory the load read, 32
+  // probes of 16 bytes over the base level (or the mips without a base).
+  const TextureKey& key = texture.key();
+  uint32_t size = texture.GetGuestBaseSize();
+  uint32_t start = key.base_page << 12;
+  if (!size) {
+    size = texture.GetGuestMipsSize();
+    start = key.mip_page << 12;
+  }
+  // Render-to-texture data lives on the GPU; guest RAM may lack it.
+  if (size < 16 || key.scaled_resolve ||
+      shared_memory().IsRangeAnyGpuWritten(start, size)) {
+    return;
+  }
+  if (shared_memory().IsRangeSampledZero(start, size)) {
+    ++probe_counters_.zero_first;
+    ProbeLog("zero_first", key,
+             "reason=first load read zeroed guest memory (data not there yet)");
+  }
+}
+
+void TextureCache::ProbeLoadResult(Texture& texture, const char* fail_reason) {
+  if (!fail_reason) {
+    if (!texture.ever_loaded()) {
+      ProbeFirstLoad(texture);
+    } else if (texture.probe_.early_invalidation && cvars::xdroid_tex_probe) {
+      ++probe_counters_.early_reload;
+      ProbeLog(
+          "early_reload", texture.key(),
+          fmt::format("reason=data rewritten by the {} within {} frames "
+                      "of the first load (first use drew stale data)",
+                      (texture.probe_.early_invalidation & 2) ? "GPU" : "CPU",
+                      probe_frame() - texture.probe_.first_load_frame)
+              .c_str());
+      texture.probe_.early_invalidation = 0;
+    }
+    if (cvars::xdroid_tex_probe) {
+      ++probe_counters_.loads;
+    }
+    return;
+  }
+  if (!cvars::xdroid_tex_probe) {
+    return;
+  }
+  ++probe_counters_.load_fail;
+  ProbeLog("load_fail", texture.key(),
+           fmt::format("reason={} ever_loaded={}", fail_reason,
+                       texture.ever_loaded() ? 1 : 0)
+               .c_str());
+}
+
+void TextureCache::ProbeMaybeSummary() {
+  uint64_t frame = probe_frame();
+  if (frame - probe_summary_frame_ < 300) {
+    return;
+  }
+  probe_summary_frame_ = frame;
+  const ProbeCounters& c = probe_counters_;
+  XELOGW(
+      "XDROID-TEXMISS summary frame={} textures={} mem_mb={} created={} "
+      "loads={} create_fail={} load_fail={} unwatched={} bound_unloaded={} "
+      "zero_first={} early_reload={} evicted={} evict_recreate={} "
+      "standin_placeholder={} standin_skipped={} standin_waited={} "
+      "standin_wait_timeout={}",
+      frame, textures_.size(),
+      (textures_total_host_memory_usage_ + ((UINT32_C(1) << 20) - 1)) >> 20,
+      c.created, c.loads, c.create_fail, c.load_fail, c.unwatched,
+      c.bound_unloaded, c.zero_first, c.early_reload, c.evicted,
+      c.evict_recreate, c.stand_in[0], c.stand_in[1], c.stand_in[2],
+      c.stand_in[3]);
+  probe_counters_ = ProbeCounters();
+}
+
+bool TextureCache::CompleteResolveLink(Texture& texture) {
+  // The resolve's watch callback has just marked the base outdated (and
+  // dropped the watch); the copy recorded before it made the image current.
+  auto global_lock = global_critical_region_.Acquire();
+  if (!texture.MakeUpToDateAndWatch(global_lock)) {
+    return false;
+  }
+  // The bytes are GPU-written: no hash for TEX-1a to match against.
+  texture.census_.base_hash = 0;
+  texture.census_.inval = 0;
+  return true;
+}
+
+void TextureCache::CensusNoteResolve(const CensusResolve& resolve) {
+  if (!cvars::xdroid_tex_census || !resolve.extent_length) {
+    return;
+  }
+  CensusResolve& r = census_resolves_[resolve.extent_start >> 12];
+  uint32_t resolves = r.resolves;
+  r = resolve;
+  r.resolves = resolves + 1;
+}
+
+TextureCache::CensusLink TextureCache::CensusClassifyLink(
+    const Texture& texture, bool& multi) {
+  multi = false;
+  const TextureKey& key = texture.key();
+  auto it = census_resolves_.find(key.base_page);
+  if (it == census_resolves_.end()) {
+    return kCensusLinkNoRecord;
+  }
+  CensusResolve& r = it->second;
+  multi = r.resolves > 1;
+  r.resolves = 0;
+  if (key.dimension != xenos::DataDimension::k2DOrStacked ||
+      key.depth_or_array_size_minus_1 || !key.tiled || key.scaled_resolve) {
+    return kCensusLinkShape;
+  }
+  if (key.mip_max_level || key.packed_mips) {
+    return kCensusLinkMips;
+  }
+  if (!r.fast) {
+    return kCensusLinkNotFast;
+  }
+  if (r.offset_x_div_8 || r.offset_y_div_8 ||
+      r.extent_start != (uint32_t(key.base_page) << 12)) {
+    return kCensusLinkOffset;
+  }
+  if (r.pitch_div_32 != key.pitch) {
+    return kCensusLinkPitch;
+  }
+  if (r.height_div_32 != (key.GetHeight() + 31) / 32) {
+    return kCensusLinkHeight;
+  }
+  if (r.format != uint32_t(key.format)) {
+    return kCensusLinkFormat;
+  }
+  if (r.endian != uint32_t(key.endianness)) {
+    return kCensusLinkEndian;
+  }
+  if (r.extent_length < texture.GetGuestBaseSize()) {
+    return kCensusLinkCoverage;
+  }
+  return r.direct ? kCensusLinkDirect : kCensusLinkEdram;
+}
+
+void TextureCache::CensusRecord(Texture& texture, uint8_t inval, bool base,
+                                bool mips, bool same, bool skipped,
+                                uint64_t bytes, uint64_t ns) {
+  CensusEntry& e = census_[texture.key()];
+  e.key = texture.key();
+  ++e.loads;
+  if (!texture.ever_loaded()) {
+    ++e.first;
+  } else if (inval & 0b1010) {
+    ++e.inval_gpu;
+    bool multi;
+    CensusLink link = CensusClassifyLink(texture, multi);
+    e.link = link;
+    ++census_link_[link];
+    census_link_bytes_[link] += bytes;
+    census_link_multi_ += multi ? 1 : 0;
+  } else if (inval & 0b0101) {
+    ++e.inval_cpu;
+  }
+  e.base += base ? 1 : 0;
+  e.mips += mips ? 1 : 0;
+  e.same += same ? 1 : 0;
+  e.skipped += skipped ? 1 : 0;
+  e.bytes += bytes;
+  e.ns += ns;
+}
+
+void TextureCache::CensusMaybeSummary() {
+  uint64_t frame = probe_frame();
+  if (frame - census_summary_frame_ < 300) {
+    return;
+  }
+  uint64_t frames = frame - census_summary_frame_;
+  census_summary_frame_ = frame;
+  if (census_.empty() || frames > 600) {
+    // First window after enabling: the start frame is unknown.
+    census_.clear();
+    return;
+  }
+  std::vector<const CensusEntry*> entries;
+  entries.reserve(census_.size());
+  CensusEntry total;
+  for (const auto& it : census_) {
+    const CensusEntry& e = it.second;
+    entries.push_back(&e);
+    total.loads += e.loads;
+    total.first += e.first;
+    total.inval_cpu += e.inval_cpu;
+    total.inval_gpu += e.inval_gpu;
+    total.same += e.same;
+    total.skipped += e.skipped;
+    total.bytes += e.bytes;
+    total.ns += e.ns;
+  }
+  XELOGW(
+      "XDROID-TEXCENSUS summary frame={} frames={} keys={} loads={} "
+      "loads_per_frame={:.1f} first={} inval_cpu={} inval_gpu={} same={} "
+      "skipped={} kb_per_frame={} cpu_us_per_frame={}",
+      frame, frames, census_.size(), total.loads,
+      double(total.loads) / double(frames), total.first, total.inval_cpu,
+      total.inval_gpu, total.same, total.skipped, (total.bytes >> 10) / frames,
+      total.ns / 1000 / frames);
+  static const char* const kLinkNames[kCensusLinkCount] = {
+      "direct", "edram",  "no_record", "not_fast", "offset", "pitch",
+      "height", "format", "endian",    "coverage", "mips",   "shape"};
+  std::string link_line;
+  for (uint32_t i = 0; i < kCensusLinkCount; ++i) {
+    link_line += fmt::format(" {}={}/{}kb", kLinkNames[i], census_link_[i],
+                             (census_link_bytes_[i] >> 10) / frames);
+  }
+  XELOGW("XDROID-TEXCENSUS link frames={} multi={}{}", frames,
+         census_link_multi_, link_line);
+  std::fill(std::begin(census_link_), std::end(census_link_), 0);
+  std::fill(std::begin(census_link_bytes_), std::end(census_link_bytes_), 0);
+  census_link_multi_ = 0;
+  census_resolves_.clear();
+  size_t top = std::min(entries.size(), size_t(12));
+  std::partial_sort(entries.begin(), entries.begin() + top, entries.end(),
+                    [](const CensusEntry* a, const CensusEntry* b) {
+                      return a->loads > b->loads;
+                    });
+  for (size_t i = 0; i < top; ++i) {
+    const CensusEntry& e = *entries[i];
+    const TextureKey& key = e.key;
+    XELOGW(
+        "XDROID-TEXCENSUS top={} loads={} first={} base={} mips={} cpu={} "
+        "gpu={} same={} skipped={} link={} kb={} us={} base=0x{:08X} "
+        "mips=0x{:08X} {}x{}x{} {} {} fmt={} levels={}{}",
+        i, e.loads, e.first, e.base, e.mips, e.inval_cpu, e.inval_gpu, e.same,
+        e.skipped, e.link < kCensusLinkCount ? kLinkNames[e.link] : "-",
+        e.bytes >> 10, e.ns / 1000, key.base_page << 12, key.mip_page << 12,
+        key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(),
+        key.GetLogDimensionName(), key.tiled ? "tiled" : "linear",
+        FormatInfo::GetName(key.format), key.mip_max_level + 1,
+        key.scaled_resolve ? " scaled" : "");
+  }
+  census_.clear();
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
@@ -519,6 +828,39 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
 
   LoadTexturesData(textures_to_load, num_textures_to_load);
 
+  // TEX-1: a texture bound before any successful load samples undefined
+  // contents. Report it (probe), or bind the null image until it loads.
+  if (cvars::xdroid_tex_probe || cvars::xdroid_tex_unloaded_null ||
+      unloaded_null_slots_) {
+    uint32_t used_remaining = used_texture_mask;
+    while (xe::bit_scan_forward(used_remaining, &index)) {
+      uint32_t index_bit = UINT32_C(1) << index;
+      used_remaining = xe::clear_lowest_bit(used_remaining);
+      const TextureBinding& binding = texture_bindings_[index];
+      bool hidden = false;
+      for (Texture* texture : {binding.texture, binding.texture_signed}) {
+        if (!texture || texture->ever_loaded()) {
+          continue;
+        }
+        if (cvars::xdroid_tex_probe && !texture->probe_.reported_unloaded) {
+          texture->probe_.reported_unloaded = true;
+          ++probe_counters_.bound_unloaded;
+          ProbeLog("bound_unloaded", texture->key(),
+                   cvars::xdroid_tex_unloaded_null
+                       ? "reason=bound before any load (null image bound)"
+                       : "reason=bound before any load (undefined contents "
+                         "sampled)");
+        }
+        hidden |= IsTextureHiddenAsUnloaded(texture);
+      }
+      // Rebind when a slot enters or leaves the null image.
+      if (hidden != bool(unloaded_null_slots_ & index_bit)) {
+        unloaded_null_slots_ ^= index_bit;
+        bindings_changed |= index_bit;
+      }
+    }
+  }
+
   if (bindings_changed) {
     SCOPE_profile_cpu_i("gpu", "TextureCache::UpdateTextureBindings");
     UpdateTextureBindingsImpl(bindings_changed);
@@ -682,6 +1024,11 @@ TextureCache::Texture::Texture(TextureCache& texture_cache,
 }
 
 TextureCache::Texture::~Texture() {
+  auto link_it = texture_cache_.link_candidates_.find(key_.base_page);
+  if (link_it != texture_cache_.link_candidates_.end() &&
+      link_it->second == this) {
+    texture_cache_.link_candidates_.erase(link_it);
+  }
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -788,6 +1135,15 @@ void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
+  if (cvars::xdroid_tex_census) {
+    texture.census_.inval |=
+        uint8_t((invalidated_by_gpu ? 2 : 1) << (argument != 0 ? 2 : 0));
+  }
+  if (cvars::xdroid_tex_probe && texture.ever_loaded() &&
+      texture.texture_cache().probe_frame() - texture.probe_.first_load_frame <=
+          4) {
+    texture.probe_.early_invalidation |= invalidated_by_gpu ? 2 : 1;
+  }
   texture.texture_cache().texture_became_outdated_.store(
       true, std::memory_order_release);
 }
@@ -833,6 +1189,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   if (host_width > max_host_width_height ||
       host_height > max_host_width_height ||
       key.GetDepthOrArraySize() > max_host_depth_or_array_size) {
+    if (cvars::xdroid_tex_probe) {
+      ++probe_counters_.create_fail;
+      ProbeLog("create_fail", key, "reason=over host size limit");
+    }
     return nullptr;
   }
 
@@ -850,6 +1210,11 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
     if (!new_texture) {
       key.LogAction("Failed to create");
+      if (cvars::xdroid_tex_probe) {
+        ++probe_counters_.create_fail;
+        ProbeLog("create_fail", key,
+                 "reason=no host format or image allocation failed");
+      }
       return nullptr;
     }
     assert_true(new_texture->key() == key);
@@ -858,6 +1223,24 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
+  if (cvars::xdroid_tex_probe) {
+    ++probe_counters_.created;
+    auto evicted_it = probe_evicted_.find(key);
+    if (evicted_it != probe_evicted_.end()) {
+      uint64_t frames_since = probe_frame() - evicted_it->second;
+      probe_evicted_.erase(evicted_it);
+      if (frames_since <= 900) {
+        ++probe_counters_.evict_recreate;
+        ProbeLog("evict_recreate", key,
+                 fmt::format("reason=budget evicted {} frames ago mem_mb={}",
+                             frames_since,
+                             (textures_total_host_memory_usage_ +
+                              ((UINT32_C(1) << 20) - 1)) >>
+                                 20)
+                     .c_str());
+      }
+    }
+  }
   return texture;
 }
 
@@ -1005,6 +1388,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
         if (!shared_memory().RequestRange(
                 texture_key.base_page << 12,
                 xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+          ProbeLoadResult(texture, "shared memory upload of the base failed");
           continue;
         }
       }
@@ -1012,6 +1396,7 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
         if (!shared_memory().RequestRange(
                 texture_key.mip_page << 12,
                 xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+          ProbeLoadResult(texture, "shared memory upload of the mips failed");
           continue;
         }
       }
@@ -1022,21 +1407,24 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       // by an actual resolve, but is still included in the texture size, so the
       // GPU won't be trying to access unmapped memory.
       if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
-                                              texture.GetGuestBaseSize(), 4)) {
-        continue;
-      }
-      if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
+                                              texture.GetGuestBaseSize(), 4) ||
+          !EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
                                               texture.GetGuestMipsSize(), 4)) {
+        ProbeLoadResult(texture, "scaled resolve memory commit failed");
         continue;
       }
     }
 
     // Actually load the texture data.
+    load_fail_reason_ = nullptr;
     if (!LoadTextureDataFromResidentMemoryImpl(
             texture, (index_base_outdated & (1ULL << i)) != 0,
             (index_mips_outdated & (1ULL << i)) != 0)) {
+      ProbeLoadResult(texture,
+                      load_fail_reason_ ? load_fail_reason_ : "load failed");
       continue;
     }
+    ProbeLoadResult(texture, nullptr);
 
     // reque for makeuptodatandwatch
     textures[i] = &texture;
@@ -1054,6 +1442,12 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       // regular texture or a vertex buffer, and thus the scaled resolve version
       // is not up to date anymore.
       if (!texture->MakeUpToDateAndWatch(crit)) {
+        if (cvars::xdroid_tex_probe) {
+          ++probe_counters_.unwatched;
+          ProbeLog("unwatched", texture->key(),
+                   "reason=guest memory rewritten during the load (torn "
+                   "data until the next use reloads it)");
+        }
         continue;
       }
 
@@ -1072,10 +1466,13 @@ bool TextureCache::LoadTextureData(Texture& texture) {
 
   // Check what needs to be uploaded.
   bool base_outdated, mips_outdated;
+  uint8_t census_inval;
   {
     auto global_lock = global_critical_region_.Acquire();
     base_outdated = texture.base_outdated(global_lock);
     mips_outdated = texture.mips_outdated(global_lock);
+    census_inval = texture.census_.inval;
+    texture.census_.inval = 0;
   }
   if (!base_outdated && !mips_outdated) {
     return true;
@@ -1101,6 +1498,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.base_page << 12,
             xe::align(texture.GetGuestBaseSize(), UINT32_C(16)))) {
+      ProbeLoadResult(texture, "shared memory upload of the base failed");
       return false;
     }
   }
@@ -1108,6 +1506,7 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     if (!shared_memory().RequestRange(
             texture_key.mip_page << 12,
             xe::align(texture.GetGuestMipsSize(), UINT32_C(16)))) {
+      ProbeLoadResult(texture, "shared memory upload of the mips failed");
       return false;
     }
   }
@@ -1117,27 +1516,102 @@ bool TextureCache::LoadTextureData(Texture& texture) {
     // by an actual resolve, but is still included in the texture size, so the
     // GPU won't be trying to access unmapped memory.
     if (!EnsureScaledResolveMemoryCommitted(texture_key.base_page << 12,
-                                            texture.GetGuestBaseSize(), 4)) {
-      return false;
-    }
-    if (!EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
+                                            texture.GetGuestBaseSize(), 4) ||
+        !EnsureScaledResolveMemoryCommitted(texture_key.mip_page << 12,
                                             texture.GetGuestMipsSize(), 4)) {
+      ProbeLoadResult(texture, "scaled resolve memory commit failed");
       return false;
     }
   }
 
-  // Actually load the texture data.
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, base_outdated,
-                                             mips_outdated)) {
-    return false;
+  // TEX-1a: hash the CPU-written guest bytes of the outdated parts after
+  // RequestRange, so the hash matches what was uploaded: a CPU write after it
+  // invalidates the range, MakeUpToDateAndWatch then fails and the hash is
+  // dropped. A part whose bytes equal the last loaded ones (the watch fired on
+  // a write that changed nothing in it, or on other data sharing its pages) is
+  // already in the host texture: xdroid_tex_skip_same skips loading it.
+  const bool census = cvars::xdroid_tex_census;
+  const bool skip_same = cvars::xdroid_tex_skip_same;
+  std::chrono::steady_clock::time_point census_start;
+  if (census) {
+    census_start = std::chrono::steady_clock::now();
   }
+  uint64_t base_hash = 0, mips_hash = 0;
+  bool base_same = false, mips_same = false;
+  if ((census || skip_same) && !texture_key.scaled_resolve) {
+    if (base_outdated) {
+      uint32_t start = texture_key.base_page << 12;
+      uint32_t size = texture.GetGuestBaseSize();
+      if (!shared_memory().IsRangeAnyGpuWritten(start, size)) {
+        base_hash = shared_memory().HashRange(start, size);
+      }
+      base_same = texture.ever_loaded() && base_hash &&
+                  base_hash == texture.census_.base_hash;
+    }
+    if (mips_outdated) {
+      uint32_t start = texture_key.mip_page << 12;
+      uint32_t size = texture.GetGuestMipsSize();
+      if (!shared_memory().IsRangeAnyGpuWritten(start, size)) {
+        mips_hash = shared_memory().HashRange(start, size);
+      }
+      mips_same = texture.ever_loaded() && mips_hash &&
+                  mips_hash == texture.census_.mips_hash;
+    }
+  }
+  const bool census_same =
+      (!base_outdated || base_same) && (!mips_outdated || mips_same);
+  bool load_base = base_outdated && !(skip_same && base_same);
+  bool load_mips = mips_outdated && !(skip_same && mips_same);
+
+  // Actually load the texture data.
+  if (load_base || load_mips) {
+    load_fail_reason_ = nullptr;
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base, load_mips)) {
+      ProbeLoadResult(texture,
+                      load_fail_reason_ ? load_fail_reason_ : "load failed");
+      return false;
+    }
+  }
+  if (census) {
+    CensusRecord(texture, census_inval, base_outdated, mips_outdated,
+                 census_same, !load_base && !load_mips,
+                 uint64_t(load_base ? texture.GetGuestBaseSize() : 0) +
+                     (load_mips ? texture.GetGuestMipsSize() : 0),
+                 uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - census_start)
+                              .count()));
+  }
+  ProbeLoadResult(texture, nullptr);
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   if (!texture.MakeUpToDateAndWatch(global_critical_region_.Acquire())) {
+    // Rewritten since RequestRange: the hashes may not match the loaded data.
+    texture.census_.base_hash = 0;
+    texture.census_.mips_hash = 0;
+    if (cvars::xdroid_tex_probe) {
+      ++probe_counters_.unwatched;
+      ProbeLog("unwatched", texture.key(),
+               "reason=guest memory rewritten during the load (torn data "
+               "until the next use reloads it)");
+    }
     return false;
+  }
+  if (base_outdated) {
+    texture.census_.base_hash = base_hash;
+    // TEX-1b: one 2D tiled level - what a resolve can write whole.
+    if (load_base &&
+        texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+        !texture_key.depth_or_array_size_minus_1 && texture_key.tiled &&
+        !texture_key.scaled_resolve && !texture_key.mip_max_level &&
+        !texture_key.packed_mips) {
+      link_candidates_[texture_key.base_page] = &texture;
+    }
+  }
+  if (mips_outdated) {
+    texture.census_.mips_hash = mips_hash;
   }
 
   texture.LogAction("Loaded");

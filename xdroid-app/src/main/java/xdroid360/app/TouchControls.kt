@@ -34,13 +34,16 @@ interface PadSink {
   /** The on-screen Guide button: opens the quick menu. */
   fun guide()
 
+  /** Back + Start held together: mark a glitch (Start is not forwarded). */
+  fun glitch()
+
   /** The on-screen fast-forward button (hidden by default). */
   fun setFastForward(on: Boolean)
 }
 
 /**
  * The virtual Xbox 360 pad: one view under the quick menu overlay, so the
- * stats box and the ⚑ flag keep their touches.
+ * stats box keeps its touches.
  *
  * Input: each finger owns the control it landed on (the D-pad and face
  * buttons follow a sliding finger; buttons too with "slide between
@@ -91,7 +94,7 @@ class TouchPadView(
 
   init {
     holder.setFormat(PixelFormat.TRANSLUCENT)
-    // Above the game's surface, under the window (menu, stats, flag).
+    // Above the game's surface, under the window (menu, stats).
     setZOrderMediaOverlay(true)
     holder.addCallback(this)
   }
@@ -191,6 +194,7 @@ class TouchPadView(
   private val lastUp = HashMap<String, Long>()
   private val lastUpPos = HashMap<String, Pair<Float, Float>>()
   private var sentButtons = 0
+  private var glitchCombo = false
   private val sentAxes = FloatArray(6)
   private val axes = FloatArray(6)
   private var lastLatencyMs = 0L
@@ -557,6 +561,10 @@ class TouchPadView(
         TouchKind.GUIDE, TouchKind.FAST_FORWARD -> {}
       }
     }
+    val combo = buttons and BACK_START == BACK_START
+    if (combo && !glitchCombo) sink.glitch()
+    glitchCombo = combo
+    if (combo) buttons = buttons and START.inv()
     val gained = buttons and sentButtons.inv()
     val lost = sentButtons and buttons.inv()
     val changed = buttons xor sentButtons
@@ -950,6 +958,9 @@ class TouchPadView(
     const val DEFAULT_OPACITY = 0.6f
     // Surface resolution against the view (SurfaceFlinger scales it up).
     private const val RENDER_SCALE = 0.5f
+    // XInput masks (xdroid_gamepad.h).
+    private const val START = 0x0010
+    private const val BACK_START = 0x0030
     const val MIN_SCALE = 0.5f
     const val MAX_SCALE = 2f
     private const val DIM_OPACITY = 0.2f

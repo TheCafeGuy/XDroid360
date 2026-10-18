@@ -15,11 +15,13 @@
 
 #include "xdroid_ac6_fixes.h"
 #include "xdroid_defaults.h"
+#include "xdroid_adpf.h"
 #include "xdroid_audio.h"
 #include "xdroid_build_id.h"
 #include "xdroid_content.h"
 #include "xdroid_driver.h"
 #include "xdroid_gamepad.h"
+#include "xdroid_gpu_bench.h"
 #include "xdroid_live.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
@@ -39,6 +41,7 @@
 #include "xenia/ui/windowed_app_context_android.h"
 
 DECLARE_int32(vulkan_pipeline_creation_threads);
+DECLARE_string(xdroid_gpu_bench);
 
 namespace xdroid {
 namespace {
@@ -133,6 +136,7 @@ XDroidApp::~XDroidApp() {
   // thread, their owner, has exited).
   paused_threads_.clear();
   if (emulator_) {
+    AdpfSetEmulator(nullptr);
     emulator_->TerminateTitle();
     emulator_->Shutdown();
     emulator_.reset();
@@ -165,6 +169,8 @@ bool XDroidApp::OnInitialize() {
   emulator_ = std::make_unique<xe::Emulator>("", storage_root, content_root,
                                             cache_root);
   InstallAc6Fixes(emulator_.get());
+  StartAdpf();
+  AdpfSetEmulator(emulator_.get());
   // Library cover fallback: the title's own icon from its XDBF.
   emulator_->on_launch.AddListener(
       [this, root = params_.storage_root](uint32_t title_id,
@@ -331,6 +337,9 @@ bool XDroidApp::Boot() {
   }
   SignInLocalProfile(emulator_.get());
   config::LoadGameConfigForFile(game_path);
+  // After the title config: loading it clears every game-config override,
+  // which is where the Diagnostics switch puts its values.
+  ApplyDiagnostics();
 
   result = emulator_->SetupSubsystems();
   if (XFAILED(result)) {
@@ -342,6 +351,13 @@ bool XDroidApp::Boot() {
   graphics_.store(emulator_->graphics_system(), std::memory_order_release);
   app_context().CallInUIThreadSynchronous(
       [this] { RebindPresenterIfSurfaceChanged(); });
+  SetLiveGraphicsSystem(emulator_->graphics_system());
+  if (StartGpuBench(emulator_->graphics_system(),
+                    std::filesystem::path(params_.storage_root))) {
+    XELOGI("XDroid360: GPU-BENCH replaying {} instead of the title",
+           cvars::xdroid_gpu_bench);
+    return true;
+  }
   result = emulator_->LaunchPath(game_path);
   if (XFAILED(result)) {
     SetBootError(fmt::format("Could not load the game (error {:08X})", result));

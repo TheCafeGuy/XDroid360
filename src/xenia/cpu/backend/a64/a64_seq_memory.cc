@@ -15,6 +15,8 @@
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/memory.h"
+#include "xenia/base/spin_accounting.h"
+#include "xenia/base/spin_sites.h"
 #include "xenia/base/wake_generation.h"
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #include "xenia/cpu/backend/a64/a64_emitter.h"
@@ -22,6 +24,7 @@
 #include "xenia/cpu/backend/a64/a64_seq_util.h"
 #include "xenia/cpu/backend/a64/a64_stack_layout.h"
 #include "xenia/cpu/backend/a64/a64_tracers.h"
+#include "xenia/cpu/guest_sampler.h"
 #include "xenia/cpu/hir/instr.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
@@ -49,9 +52,18 @@ DEFINE_uint32(guest_spin_sleep_us, 0,
 // stalled. 0 = off (upstream isb). 1 = park. 2 = call the helper but never
 // park (the "B" arm of a live A/B: the same code without parking). Chosen
 // when code is translated; switching between 1 and 2 works live.
+// 3 = park only at spin sites the GPU releases (CE-7b, spin_sites.h).
+// 4 = like 3, but the fiber parks in the guest scheduler (XR-3): other fibers
+// run meanwhile and the dispatch thread can sleep; 1 ms backstop.
 DEFINE_uint32(guest_spin_park, 0,
               "Park guest spin-waits (db16cyc) on GPU write-backs: 0 = off, "
-              "1 = park, 2 = helper without parking (A/B).",
+              "1 = park, 2 = helper without parking (A/B), 3 = park only at "
+              "sites GPU write-backs release, 4 = as 3 through the guest "
+              "scheduler (XR-3).",
+              "CPU");
+DEFINE_uint32(guest_spin_park_gpu_pct, 75,
+              "guest_spin_park 3/4: share of a site's spins GPU write-backs "
+              "must end (after 64 spins) before it parks. Live.",
               "CPU");
 DEFINE_uint32(guest_spin_park_hints, 32,
               "Consecutive db16cyc hints without a GPU write-back before a "
@@ -102,40 +114,161 @@ static void GuestSpinPause(void* /*raw_context*/) {
   }
 }
 
+// Spin-wait state of one guest thread. Kept per guest context, not per host
+// thread: guest threads are fibers, and while one is parked (XR-3) another
+// fiber can spin on the same host thread.
+struct GuestSpinState {
+  const void* context = nullptr;
+  uint32_t hints = 0;
+  uint32_t seen_generation = 0;
+  std::chrono::steady_clock::time_point last_hint;
+  xe::threading::SpinSite* site = nullptr;
+  std::chrono::steady_clock::time_point start;
+  uint32_t start_generation = 0;
+  uint32_t last_generation = 0;
+};
+
+static GuestSpinState& SpinStateFor(const void* context) {
+  // Few fibers share a dispatch thread; replace round-robin past that.
+  constexpr uint32_t kStates = 8;
+  thread_local GuestSpinState states[kStates];
+  thread_local uint32_t next_state = 0;
+  for (GuestSpinState& state : states) {
+    if (state.context == context) {
+      return state;
+    }
+  }
+  GuestSpinState& state = states[next_state++ % kStates];
+  state = GuestSpinState();
+  state.context = context;
+  return state;
+}
+
 // Lock-free (a futex wait on a generation counter): safe inside a scheduler
 // watchdog region. Hints count as one spin only while they arrive within
 // kSpinWindow of each other, so scattered db16cyc in normal code never park.
-static void GuestSpinPark(void* /*raw_context*/) {
-  thread_local uint32_t hints = 0;
-  thread_local uint32_t seen_generation = 0;
-  thread_local std::chrono::steady_clock::time_point last_hint;
+static void GuestSpinPark(void* raw_context, uint64_t guest_pc) {
+  GuestSpinState& state = SpinStateFor(raw_context);
+  uint32_t& hints = state.hints;
+  uint32_t& seen_generation = state.seen_generation;
+  std::chrono::steady_clock::time_point& last_hint = state.last_hint;
   constexpr auto kSpinWindow = std::chrono::microseconds(50);
-  if (cvars::guest_spin_park != 1) {
-    return;
+  // ADPF-1: charge the time between hints of one spin to this thread, so the
+  // performance hint can leave spinning out of the frame's work. A parked wait
+  // sleeps (no CPU) and restarts the window below, so it is never charged.
+  thread_local std::chrono::steady_clock::time_point last_charged;
+  if (xe::threading::SpinAccountingEnabled().load(std::memory_order_relaxed)) {
+    const auto charge_now = std::chrono::steady_clock::now();
+    const auto gap = charge_now - last_charged;
+    last_charged = charge_now;
+    if (gap <= kSpinWindow) {
+      if (xe::threading::SpinAccount* account =
+              xe::threading::ThisThreadSpinAccount()) {
+        account->spin_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(gap)
+                         .count()),
+            std::memory_order_relaxed);
+      }
+    }
   }
+  // CE-7b: one spin is a run of hints within kSpinWindow, filed under the
+  // site of its first hint (a db16cyc sled spans several guest addresses).
+  xe::threading::SpinSite*& spin_site = state.site;
+  std::chrono::steady_clock::time_point& spin_start = state.start;
+  uint32_t& spin_start_generation = state.start_generation;
+  uint32_t& spin_last_generation = state.last_generation;
+  const uint32_t park_mode = cvars::guest_spin_park;
   xe::threading::WakeGeneration& writebacks =
       xe::threading::GuestGpuWritebackGeneration();
   const uint32_t generation = writebacks.Load();
   const auto now = std::chrono::steady_clock::now();
-  if (generation != seen_generation || now - last_hint > kSpinWindow) {
+  if (now - last_hint > kSpinWindow) {
+    if (spin_site) {
+      spin_site->RecordSpin(spin_last_generation != spin_start_generation);
+      spin_site->spin_ns.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       last_hint - spin_start)
+                       .count()),
+          std::memory_order_relaxed);
+    }
+    spin_site = xe::threading::FindSpinSite(uint32_t(guest_pc));
+    spin_start = now;
+    spin_start_generation = generation;
+    seen_generation = generation;
+    hints = 0;
+  } else if (generation != seen_generation) {
     seen_generation = generation;
     hints = 0;
   }
+  spin_last_generation = generation;
   last_hint = now;
-  if (++hints < cvars::guest_spin_park_hints) {
+  const bool may_park =
+      park_mode == 1 ||
+      ((park_mode == 3 || park_mode == 4) && spin_site &&
+       spin_site->GpuReleased(cvars::guest_spin_park_gpu_pct));
+  if (!may_park || ++hints < cvars::guest_spin_park_hints) {
     return;
   }
   hints = 0;
+  if (park_mode == 4) {
+    // The site is global; `state` lives in this host thread's table and may
+    // be evicted, or left behind on another host thread, while parked.
+    xe::threading::SpinSite* parked_site = spin_site;
+    // Declined where a safepoint could not switch either: keep spinning.
+    if (!xe::cpu::backend::spin_park_handler ||
+        !xe::cpu::backend::spin_park_handler(generation)) {
+      return;
+    }
+    if (parked_site) {
+      parked_site->parks.fetch_add(1, std::memory_order_relaxed);
+    }
+    // The wait itself must not end the spin window.
+    GuestSpinState& resumed = SpinStateFor(raw_context);
+    resumed.last_hint = std::chrono::steady_clock::now();
+    if (!resumed.site) {
+      // Evicted while parked: keep filing the spin under its site.
+      resumed.site = parked_site;
+      resumed.start = resumed.last_hint;
+      resumed.start_generation = generation;
+      resumed.seen_generation = generation;
+      resumed.last_generation = generation;
+    }
+    last_charged = resumed.last_hint;
+    return;
+  }
+  if (spin_site) {
+    spin_site->parks.fetch_add(1, std::memory_order_relaxed);
+  }
   writebacks.WaitFor(
       generation, std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
   // The wait itself must not end the spin window.
   last_hint = std::chrono::steady_clock::now();
+  last_charged = last_hint;
+}
+
+// CE-7b: a db16cyc sled is one wait. Key it by its first hint, so a spin that
+// restarts mid-sled (descheduled for longer than the spin window) still files
+// under the same site. AC6 2026-10-17: the fence sled split into 8 sites.
+static uint32_t SpinSledAddress(const hir::Instr* instr) {
+  const hir::Instr* first = instr;
+  for (const hir::Instr* p = instr->prev; p; p = p->prev) {
+    const uint32_t op = p->GetOpcodeNum();
+    if (op == OPCODE_DELAY_EXECUTION) {
+      first = p;
+    } else if (op != OPCODE_SOURCE_OFFSET) {
+      break;
+    }
+  }
+  return first->GuestAddressFor();
 }
 
 struct DELAY_EXECUTION
     : Sequence<DELAY_EXECUTION, I<OPCODE_DELAY_EXECUTION, VoidOp>> {
   static void Emit(A64Emitter& e, const EmitArgType& i) {
+    // Translation-time only: lets the CPU sampler tell spin-waits from work.
+    xe::cpu::sampler::NoteSpinHint(i.instr->GuestAddressFor());
     if (cvars::guest_spin_park) {
+      e.mov(e.x1, uint64_t(SpinSledAddress(i.instr)));
       e.CallNativeSafe(reinterpret_cast<void*>(GuestSpinPark));
       return;
     }

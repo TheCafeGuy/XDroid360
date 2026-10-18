@@ -15,6 +15,7 @@
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/config.h"
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/gpu_flags.h"
@@ -395,6 +396,10 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback,
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   kernel_state()->EmulateCPInterruptDPC(interrupt_callback_,
                                         interrupt_callback_data_, source, cpu);
+  // XR-3: the guest ISR ran synchronously above and may have written what a
+  // guest spin-wait polls (AC6's title screen waits in the D3D runtime on a
+  // vblank-driven value), so wake parked spins as for a GPU write-back.
+  xe::threading::GuestGpuWritebackGeneration().Bump();
 }
 
 void GraphicsSystem::MarkVblank() {

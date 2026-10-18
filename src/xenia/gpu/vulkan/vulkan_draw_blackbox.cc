@@ -122,6 +122,13 @@ void VulkanDrawBlackbox::Dump(const std::filesystem::path& dir, uint64_t n) {
       for (uint32_t j = 0; j < record.vertex_range_count; ++j) {
         text += range_text("vb", record.vertex[j], true);
       }
+      for (uint32_t j = 0; j < std::min<uint32_t>(record.ib_depth, 3); ++j) {
+        const auto& ib = record.ib_chain[j];
+        text +=
+            fmt::format(" ib{}={:08X}+{:X}{}{}{}", j + 1, ib[0], ib[1],
+                        ib[2] & 1 ? "" : " notkicked", ib[2] & 2 ? " copy" : "",
+                        ib[2] & 4 ? " CHANGED_SINCE_KICK" : "");
+      }
       for (uint32_t j = 0; j < record.texture_count; ++j) {
         const auto& fetch = record.texture_fetch[j];
         text += fmt::format(" t{}={:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}",

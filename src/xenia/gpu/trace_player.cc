@@ -89,6 +89,15 @@ void TracePlayer::SeekCommand(int target_command) {
   }
 }
 
+void TracePlayer::PlayFrame(int frame, bool skip_identical_memory) {
+  current_frame_index_ = frame;
+  auto frame_data = current_frame();
+  current_command_index_ = int(frame_data->commands.size()) - 1;
+  skip_identical_memory_ = skip_identical_memory;
+  PlayTrace(frame_data->start_ptr, frame_data->end_ptr - frame_data->start_ptr,
+            TracePlaybackMode::kBreakOnSwap, false);
+}
+
 void TracePlayer::WaitOnPlayback() {
   xe::threading::Wait(playback_event_.get(), true);
 }
@@ -181,6 +190,19 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data,
       case TraceCommandType::kMemoryRead: {
         auto cmd = reinterpret_cast<const MemoryCommand*>(trace_ptr);
         trace_ptr += sizeof(*cmd);
+        if (skip_identical_memory_) {
+          memory_scratch_.resize(cmd->decoded_length);
+          DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
+                           memory_scratch_.data(), cmd->decoded_length);
+          uint8_t* dest = memory->TranslatePhysical(cmd->base_ptr);
+          if (std::memcmp(dest, memory_scratch_.data(), cmd->decoded_length)) {
+            std::memcpy(dest, memory_scratch_.data(), cmd->decoded_length);
+            command_processor->TracePlaybackWroteMemory(cmd->base_ptr,
+                                                        cmd->decoded_length);
+          }
+          trace_ptr += cmd->encoded_length;
+          break;
+        }
         DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
                          memory->TranslatePhysical(cmd->base_ptr),
                          cmd->decoded_length);
