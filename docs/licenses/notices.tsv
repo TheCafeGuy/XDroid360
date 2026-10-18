@@ -16,6 +16,8 @@ FidelityFX CAS	Sharpening filter	MIT	third_party/FidelityFX-CAS/LICENSE.txt
 FidelityFX FSR	Upscaling filter	MIT	third_party/FidelityFX-FSR/license.txt
 NVIDIA FXAA	Anti-aliasing filter	BSD-3-Clause	third_party/fxaa/LICENSE
 Dear ImGui	In-emulator overlays	MIT	third_party/imgui/LICENSE.txt
+Inter typeface	Overlay font embedded in the native library	OFL-1.1	assets/font/OFL.txt
+Xenia icon	Icon images embedded in the native library	CC-BY-SA-4.0	assets/icon/LICENSE
 {fmt}	Text formatting	MIT	third_party/fmt/LICENSE
 toml++	Configuration files	MIT	third_party/tomlplusplus/LICENSE
 cxxopts	Option parsing	MIT	third_party/cxxopts/LICENSE
