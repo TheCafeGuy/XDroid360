@@ -547,6 +547,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     bool demote_to_helper_invocation;
 
     bool fragment_shader_barycentric;
+    // SHD-1: index the split shared-memory bindings with a non-uniform index
+    // (one load) instead of a switch over every binding (a branch per dword).
+    bool storage_buffer_non_uniform_indexing = false;
 
     bool allow_float_contraction = false;
   };
@@ -1147,6 +1150,13 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id const_int_0_;
   spv::Id const_int4_0_;
   spv::Id const_uint_0_;
+  // SHD-1c (xdroid_shader_sign_spec): per-translation specialization constants
+  // replacing the texture_swizzled_signs system constant words (SpecId = word
+  // index), created on first use.
+  std::array<spv::Id, 8> spec_texture_swizzled_signs_;
+  // SHD-1e (xdroid_shader_vfetch_spec): vertex fetch endianness per vertex
+  // fetch constant (SpecId 64 + index), created on first use.
+  std::array<spv::Id, 96> spec_vfetch_endian_;
   spv::Id const_uint4_0_;
   union {
     struct {

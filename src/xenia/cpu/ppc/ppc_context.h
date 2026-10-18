@@ -447,6 +447,11 @@ typedef struct alignas(64) PPCContext_s {
   // this names a block it provably reached.
   uint32_t last_safepoint_pc;
 
+  // Host return address of the latest guest->host call (the A64
+  // GuestToHostThunk stores its LR here), so the CPU sampler can charge time
+  // in emulator code to the guest call site that entered it.
+  uint64_t host_call_return;
+
   template <typename T = uint8_t*>
   inline T TranslateVirtual(uint32_t guest_address) XE_RESTRICT const {
     static_assert(std::is_pointer_v<T>);

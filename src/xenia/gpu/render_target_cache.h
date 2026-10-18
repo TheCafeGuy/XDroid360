@@ -673,6 +673,16 @@ class RenderTargetCache {
   DirectResolveEligibility GetDirectResolveEligibility(
       const draw_util::ResolveInfo& resolve_info,
       draw_util::ResolveCopyShaderIndex copy_shader) const;
+  // RES-3: for a full copy the direct shader can do by averaging samples, the
+  // EdramDumpShaderKey::average_samples value (1 = 2 samples, 2 = 4), else 0.
+  static uint32_t GetDirectResolveAverageSamples(
+      const draw_util::ResolveInfo& resolve_info);
+  // Whether the backend's direct resolve sets average_samples in its key.
+  virtual bool IsDirectResolveAverageSupported() const { return false; }
+  // RES-4: whether the backend's direct resolve sets read_as_1x in its key -
+  // a 1x 32bpp color resolve over tiles a multisampled 32bpp color render
+  // target owns.
+  virtual bool IsDirectResolveReadAs1xSupported() const { return false; }
 
   // Sets up the needed render targets and transfers to perform a clear in a
   // resolve operation via a host render target clear. resolve_info is expected

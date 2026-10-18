@@ -132,7 +132,18 @@ recent.toml
 xdroid-core/.cxx/
 xdroid-app/.cxx/
 
+# Session handoff written before /clear (see CLAUDE.md)
+/.claude/handoff.md
 /.cache/
 
 # Exported APKs for testers
 out/
+
+# ==============================================================================
+# XDroid360 run artifacts: raw dumps and bundles stay local (logs, marks and
+# ledgers are committed; key glitch PNGs are added with git add -f)
+# ==============================================================================
+
+docs/runs/**/*.zip
+docs/runs/**/*.ppm
+docs/runs/**/*.png

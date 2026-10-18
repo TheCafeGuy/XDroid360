@@ -12,6 +12,9 @@ import java.io.File
  * period the game runs at, so the OS sizes clocks to the real demand. The
  * thread set is fixed per session, so it is rebuilt every 30 s as the hot
  * threads move. Call from one thread only.
+ *
+ * Steps aside (session closed) while live.toml sets `xdroid_adpf` != 0: the
+ * native per-frame hint (xdroid_adpf.cc, ADPF-1) owns the session then.
  */
 class PerfHint(private val context: Context) {
   private var session: PerformanceHintManager.Session? = null
@@ -21,10 +24,17 @@ class PerfHint(private val context: Context) {
   private var ticksSinceBuild = REBUILD_TICKS
   // All-thread CPU snapshot one tick before a rebuild picks the hot set.
   private var rebuildBase: Map<Int, Long>? = null
+  @Volatile var enabled = true
 
   /** One sampler tick: [frames] presented during it, at [fps]. */
   fun update(frames: Long, fps: Double) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+    if (!enabled) {
+      close()
+      ticksSinceBuild = REBUILD_TICKS
+      rebuildBase = null
+      return
+    }
     if (++ticksSinceBuild >= REBUILD_TICKS) {
       val previous = rebuildBase
       if (previous == null) {

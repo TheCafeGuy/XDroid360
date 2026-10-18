@@ -93,6 +93,14 @@ class GuestScheduler {
   // backoff remains a backstop so a missed wake only adds latency.
   void WakeAll();
 
+  // XR-3: parks the running guest fiber, which is spinning on memory a GPU
+  // write-back releases, until the write-back generation moves past
+  // |seen_generation| or a 1 ms backstop. Other fibers run meanwhile, or the
+  // dispatch thread sleeps. Returns false without parking where a safepoint
+  // could not switch either (not a fiber, global critical region held, IRQL
+  // >= 2 outside user code, inside another wait); the caller keeps spinning.
+  bool ParkOnGpuWriteback(uint32_t seen_generation);
+
   // Targeted WakeAll: pokes only the CPUs hosting a blocked waiter of
   // |object|. Untracked waits (9+ object sets) poll on the backoff cadence,
   // which remains the backstop throughout.
@@ -223,6 +231,8 @@ class GuestScheduler {
     // Hint read lock-free by WakeAll so it only wakes CPUs with a parked
     // waiter. A stale value costs a spurious wake or one backoff interval.
     std::atomic<bool> has_blocked{false};
+    // XR-3: fibers on this CPU parked by ParkOnGpuWriteback.
+    std::atomic<uint32_t> gpu_writeback_waiters{0};
     // Raw-tick end of the running fiber's slice, stamped by SwitchTo and
     // compared by the watchdog. Guarded by lock_.
     uint64_t quantum_deadline_tick = 0;
@@ -346,6 +356,12 @@ class GuestScheduler {
   std::unordered_set<uint64_t> global_lock_hazard_stacks_;
 
   std::atomic<bool> started_{false};
+  // XR-3: fibers parked by ParkOnGpuWriteback, so the write-back hook skips
+  // the lock when there are none.
+  std::atomic<uint32_t> gpu_writeback_waiters_{0};
+  static constexpr uint64_t kGpuWritebackBackstopMs = 1;
+  static void OnGpuWriteback();
+  void WakeGpuWritebackWaiters();
   std::atomic<bool> shutting_down_{false};
   std::atomic<bool> host_paused_{false};
   // Set once Shutdown has joined the dispatch threads and reclaimed every

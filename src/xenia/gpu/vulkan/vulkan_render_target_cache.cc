@@ -32,6 +32,8 @@
 #include "xenia/ui/vulkan/vulkan_util.h"
 
 DECLARE_bool(vulkan_dynamic_rendering);
+DECLARE_bool(xdroid_tex_census);
+DECLARE_bool(xdroid_tile_merge);
 
 DEFINE_bool(vulkan_render_target_format_list, false,
             "Give mutable-format color render targets their exact view format "
@@ -63,9 +65,38 @@ DEFINE_bool(xdroid_depth_read_skip_stencil, false,
             "STAB-S1 forensic (temp): depth dumps and direct resolves skip the "
             "stencil fetch (stencil reads as 0). Live-switchable.",
             "Vulkan");
-DEFINE_bool(vulkan_direct_resolve_post_barrier, false,
-            "STAB-S1 test arm (temp): a full memory barrier after every "
-            "direct resolve dispatch. Live-switchable.",
+DEFINE_uint32(vulkan_dump_barrier, 5,
+              "STAB-S1 fix for EDRAM dumps (the post-resolve barrier covers "
+              "only direct resolves; a 2x MSAA depth dump hung the GPU with "
+              "it on, 2026-10-15, and again with bit 1 alone: the dump itself "
+              "hangs, so bit 4 drains the depth pass first). Bits: 1 = full "
+              "memory barrier after every "
+              "depth dump dispatch, 2 = after every color dump dispatch, "
+              "4 = full barrier before every depth dump (drains the depth "
+              "pass first). Live-switchable.",
+              "Vulkan");
+DEFINE_uint32(xdroid_clear_pass_mode, 0,
+              "GE-2: resolve clears into a render target with no transfers "
+              "in the same call. 0 = full-surface pass with LOAD + "
+              "vkCmdClearAttachments (default). 1 = render area shrunk to the "
+              "clear rectangle (origin kept, far edges up to 64 px). 2 = like "
+              "1, and a clear rectangle at the origin clears through "
+              "LOAD_OP_CLEAR with the exact area (dynamic rendering only), so "
+              "nothing is loaded.",
+              "Vulkan");
+DEFINE_uint32(vulkan_direct_resolve_pre_barrier, 0,
+              "STAB-S1b: a full memory barrier before a direct resolve reads "
+              "its render target, draining the pass that drew it (the dump "
+              "fix, vulkan_dump_barrier bit 4, for direct resolves). 0 = off, "
+              "1 = MSAA sources only (the 4x MSAA averaging resolve trapped "
+              "every 120-140 ms GPU stall of 2026-10-17), 2 = every source. "
+              "Live-switchable.",
+              "Vulkan");
+DEFINE_bool(vulkan_direct_resolve_post_barrier, true,
+            "STAB-S1 fix: a full memory barrier after every direct resolve "
+            "dispatch, so no later work overlaps it (GPU hangs in the second "
+            "tile pass without it; 0 hangs in ~1.3 h of flight with it, "
+            "2026-10-14). Live-switchable.",
             "Vulkan");
 
 namespace xe {
@@ -739,6 +770,29 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       Shutdown();
       return false;
     }
+    // TEX-1b: the color layout plus the linear scratch buffer.
+    VkDescriptorSetLayout
+        dump_link_descriptor_set_layouts[kDumpDescriptorSetLink + 1];
+    dump_link_descriptor_set_layouts[kDumpDescriptorSetEdram] =
+        descriptor_set_layout_storage_buffer_;
+    dump_link_descriptor_set_layouts[kDumpDescriptorSetSource] =
+        descriptor_set_layout_sampled_image_;
+    dump_link_descriptor_set_layouts[kDumpDescriptorSetLink] =
+        descriptor_set_layout_storage_buffer_;
+    dump_pipeline_layout_create_info.setLayoutCount =
+        uint32_t(xe::countof(dump_link_descriptor_set_layouts));
+    dump_pipeline_layout_create_info.pSetLayouts =
+        dump_link_descriptor_set_layouts;
+    if (dfn.vkCreatePipelineLayout(device, &dump_pipeline_layout_create_info,
+                                   nullptr,
+                                   &dump_pipeline_layout_color_link_) !=
+        VK_SUCCESS) {
+      XELOGE(
+          "VulkanRenderTargetCache: Failed to create the color render target "
+          "resolve link pipeline layout");
+      Shutdown();
+      return false;
+    }
   } else if (path_ == Path::kPixelShaderInterlock) {
     // Pixel (fragment) shader interlock.
 
@@ -910,6 +964,11 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   // so ShutdownCommon is called by the RenderTargetCache destructor, when it's
   // already too late.
   DestroyAllRenderTargets(true);
+  for (const auto& wide : tile_merge_wide_cache_) {
+    delete wide.second;
+  }
+  tile_merge_wide_cache_.clear();
+  tile_merge_state_ = TileMergeState::kOff;
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
                                          resolve_fsi_clear_64bpp_pipeline_);
@@ -931,6 +990,8 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
   }
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          dump_pipeline_layout_depth_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                         dump_pipeline_layout_color_link_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                          dump_pipeline_layout_color_);
 
@@ -1062,6 +1123,30 @@ void VulkanRenderTargetCache::EndSubmission() {
   }
 }
 
+// TEX-1b Phase 0: what a resolve wrote, for the texture census.
+static void CensusNoteResolve(VulkanTextureCache& texture_cache,
+                              const draw_util::ResolveInfo& resolve_info,
+                              draw_util::ResolveCopyShaderIndex copy_shader,
+                              bool direct) {
+  if (!cvars::xdroid_tex_census) {
+    return;
+  }
+  TextureCache::CensusResolve r;
+  r.extent_start = resolve_info.copy_dest_extent_start;
+  r.extent_length = resolve_info.copy_dest_extent_length;
+  r.pitch_div_32 =
+      resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
+  r.height_div_32 =
+      resolve_info.copy_dest_coordinate_info.height_aligned_div_32;
+  r.offset_x_div_8 = resolve_info.copy_dest_coordinate_info.offset_x_div_8;
+  r.offset_y_div_8 = resolve_info.copy_dest_coordinate_info.offset_y_div_8;
+  r.format = uint32_t(resolve_info.copy_dest_info.copy_dest_format);
+  r.endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+  r.fast = copy_shader <= draw_util::ResolveCopyShaderIndex::kFast64bpp4xMSAA;
+  r.direct = direct;
+  texture_cache.CensusNoteResolve(r);
+}
+
 bool VulkanRenderTargetCache::Resolve(
     const Memory& memory, VulkanSharedMemory& shared_memory,
     VulkanTextureCache& texture_cache, uint32_t& written_address_out,
@@ -1070,6 +1155,8 @@ bool VulkanRenderTargetCache::Resolve(
   SCOPE_profile_cpu_f("gpu");
   written_address_out = 0;
   written_length_out = 0;
+  last_resolve_direct_ = false;
+  last_resolve_cleared_ = false;
   if (written_scaled_out) {
     *written_scaled_out = false;
   }
@@ -1099,6 +1186,9 @@ bool VulkanRenderTargetCache::Resolve(
 
   // Copying.
   bool copied = false;
+  bool copy_spliced = false;
+  // TEX-1b: the direct resolve also copied its pixels into a texture.
+  bool linked = false;
   if (resolve_info.copy_dest_extent_length) {
     if (command_processor_.debug_markers_enabled() || cvars::log_resolves) {
       char label[draw_util::kDebugMarkerLabelMaxLength];
@@ -1140,6 +1230,35 @@ bool VulkanRenderTargetCache::Resolve(
 
     bool copy_dest_scaled = draw_resolution_scaled && !copy_native;
 
+    // GE-4: a copy reading no render target bound in the open guest pass, into
+    // memory no draw already recorded in that pass read, can run before the
+    // pass instead of ending it. Nothing has been recorded for it yet (debug
+    // markers would split across the streams, so not with them).
+    if (GetPath() == Path::kHostRenderTargets && !draw_resolution_scaled &&
+        !command_processor_.debug_markers_enabled() && !cvars::log_resolves &&
+        command_processor_.IsSpliceCandidate(
+            VulkanCommandProcessor::kSpliceResolves) &&
+        !shared_memory.WasRangeReadByDraws(
+            resolve_info.copy_dest_extent_start,
+            resolve_info.copy_dest_extent_length,
+            command_processor_.pass_first_draw_serial(),
+            command_processor_.draw_serial())) {
+      std::vector<ResolveCopyDumpRectangle> source_rectangles;
+      GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used,
+                                     dump_rows, dump_pitch, source_rectangles);
+      bool source_bound = source_rectangles.empty();
+      for (const ResolveCopyDumpRectangle& rectangle : source_rectangles) {
+        if (command_processor_.IsRenderTargetBoundInSplicePass(
+                rectangle.render_target)) {
+          source_bound = true;
+          break;
+        }
+      }
+      copy_spliced =
+          !source_bound && command_processor_.BeginSplice(
+                               VulkanCommandProcessor::kSpliceResolves);
+    }
+
     bool resolved_directly = false;
     if (GetPath() == Path::kHostRenderTargets) {
       // Read the render targets straight into shared memory where the copy
@@ -1148,10 +1267,16 @@ bool VulkanRenderTargetCache::Resolve(
       if (cvars::direct_host_resolve &&
           GetDirectResolveEligibility(resolve_info, copy_shader) ==
               DirectResolveEligibility::kEligible) {
+        bool link = !copy_dest_scaled &&
+                    texture_cache.BeginResolveLink(resolve_info, copy_spliced);
         resolved_directly = DirectResolveRenderTargets(
             resolve_info, copy_shader_constants, dump_base,
             dump_row_length_used, dump_rows, dump_pitch, copy_dest_scaled,
-            shared_memory, texture_cache);
+            shared_memory, texture_cache, link, copy_spliced, &linked);
+        last_resolve_direct_ = resolved_directly;
+        if (!resolved_directly) {
+          texture_cache.EndResolveLink(false);
+        }
       }
       if (!resolved_directly) {
         DumpRenderTargets(dump_base, dump_row_length_used, dump_rows,
@@ -1160,9 +1285,12 @@ bool VulkanRenderTargetCache::Resolve(
     }
 
     if (resolved_directly) {
+      CensusNoteResolve(texture_cache, resolve_info, copy_shader,
+                        resolved_directly);
       texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                         resolve_info.copy_dest_extent_length,
                                         copy_dest_scaled);
+      texture_cache.EndResolveLink(linked);
       written_address_out = resolve_info.copy_dest_extent_start;
       written_length_out = resolve_info.copy_dest_extent_length;
       if (copy_dest_info_out) {
@@ -1363,8 +1491,7 @@ bool VulkanRenderTargetCache::Resolve(
                 copy_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
-          command_processor_.TagPassEnd(
-              VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveCopy);
@@ -1384,6 +1511,7 @@ bool VulkanRenderTargetCache::Resolve(
             }
           }
 
+          CensusNoteResolve(texture_cache, resolve_info, copy_shader, false);
           // Mark the range as scaled only if that's where the data actually
           // went.
           texture_cache.MarkRangeAsResolved(
@@ -1407,11 +1535,15 @@ bool VulkanRenderTargetCache::Resolve(
   } else {
     copied = true;
   }
+  if (copy_spliced) {
+    command_processor_.EndSplice();
+  }
 
   // Clearing.
   bool cleared = false;
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
+  last_resolve_cleared_ = clear_depth || clear_color;
   if (clear_depth || clear_color) {
     if (command_processor_.debug_markers_enabled() || cvars::log_resolves) {
       char label[draw_util::kDebugMarkerLabelMaxLength];
@@ -1467,8 +1599,7 @@ bool VulkanRenderTargetCache::Resolve(
           command_buffer.CmdVkPushConstants(
               resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
               0, sizeof(depth_clear_constants), &depth_clear_constants);
-          command_processor_.TagPassEnd(
-              VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
@@ -1495,8 +1626,7 @@ bool VulkanRenderTargetCache::Resolve(
                 resolve_fsi_clear_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
                 0, sizeof(color_clear_constants), &color_clear_constants);
           }
-          command_processor_.TagPassEnd(
-              VulkanCommandProcessor::PassEndReason::kResolve);
+          command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
           command_processor_.SubmitBarriers(true);
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveClear);
@@ -1539,9 +1669,92 @@ bool VulkanRenderTargetCache::Update(
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
+      // TILE-1: a draw binding anything else ends the merge before transfers
+      // read the guest render targets.
+      if (tile_merge_state_ == TileMergeState::kDrawing &&
+          !TileMergeMatches(depth_and_color_render_targets)) {
+        TileMergeAbort("render target change");
+      }
+      if (tile_merge_state_ == TileMergeState::kObserving) {
+        if (!TileMergeMatches(depth_and_color_render_targets)) {
+          if (tile_merge_observe_clean_) {
+            // Why this first tile can't merge (first cases only).
+            static uint32_t logged = 0;
+            if (logged < 16) {
+              ++logged;
+              for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets;
+                   ++i) {
+                RenderTarget* rt = depth_and_color_render_targets[i];
+                if (rt && rt != tile_merge_guest_[i]) {
+                  XELOGI("XDROID-TILE: first tile slot {} {} -> {}", i,
+                         tile_merge_guest_[i]
+                             ? tile_merge_guest_[i]->key().GetDebugName()
+                             : std::string("none"),
+                         rt->key().GetDebugName());
+                }
+              }
+            }
+          }
+          tile_merge_observe_clean_ = false;
+        } else {
+          for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+            if (depth_and_color_render_targets[i] && !tile_merge_guest_[i]) {
+              tile_merge_guest_[i] = depth_and_color_render_targets[i];
+            }
+          }
+        }
+      }
+
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets,
                                        last_update_transfers());
+
+      // TILE-1: draw into the wide render targets, each starting as a copy of
+      // the guest one in every tile.
+      RenderTarget* tile_merge_rts[1 + xenos::kMaxColorRenderTargets] = {};
+      uint32_t framebuffer_pitch_scale = 1;
+      if (tile_merge_state_ == TileMergeState::kDrawing) {
+        bool tile_merge_ok = true;
+        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+          RenderTarget* rt = depth_and_color_render_targets[i];
+          if (!rt) {
+            continue;
+          }
+          if (!tile_merge_guest_[i]) {
+            RenderTarget* wide = TileMergeGetWide(rt);
+            if (!wide) {
+              tile_merge_ok = false;
+              break;
+            }
+            tile_merge_guest_[i] = rt;
+            tile_merge_wide_[i] = wide;
+            if (i == 0) {
+              // Each tile starts from depth the previous tile's resolve
+              // cleared; color is fully redrawn.
+              RenderTarget* clear_rts[2] = {wide, nullptr};
+              uint64_t clear_values[2] = {
+                  register_file()[XE_GPU_REG_RB_DEPTH_CLEAR], 0};
+              std::vector<Transfer> no_transfers[2];
+              RenderTargetKey wide_key = wide->key();
+              Transfer::Rectangle clear_rectangle;
+              clear_rectangle.x_pixels = 0;
+              clear_rectangle.y_pixels = 0;
+              clear_rectangle.width_pixels = wide_key.GetWidth();
+              clear_rectangle.height_pixels = GetRenderTargetHeight(
+                  wide_key.pitch_tiles_at_32bpp, wide_key.msaa_samples);
+              PerformTransfersAndResolveClears(2, clear_rts, no_transfers,
+                                               clear_values, &clear_rectangle);
+            }
+          }
+          tile_merge_rts[i] = tile_merge_wide_[i];
+        }
+        if (tile_merge_ok) {
+          depth_and_color_render_targets = tile_merge_rts;
+          framebuffer_pitch_scale = 2;
+        } else {
+          TileMergeAbort("no wide render target");
+        }
+      }
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -1586,7 +1799,7 @@ bool VulkanRenderTargetCache::Update(
           ((rb_surface_info.surface_pitch << uint32_t(
                 rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X)) +
            (xenos::kEdramTileWidthSamples - 1)) /
-          xenos::kEdramTileWidthSamples;
+          xenos::kEdramTileWidthSamples * framebuffer_pitch_scale;
       if (framebuffer) {
         if (last_update_framebuffer_pitch_tiles_at_32bpp_ !=
                 pitch_tiles_at_32bpp ||
@@ -1613,6 +1826,8 @@ bool VulkanRenderTargetCache::Update(
                   depth_and_color_render_targets,
                   sizeof(last_update_framebuffer_attachments_));
       last_update_framebuffer_ = framebuffer;
+      std::memcpy(last_update_bound_rts_, depth_and_color_render_targets,
+                  sizeof(last_update_bound_rts_));
 
       // Transition the used render targets.
       for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
@@ -1664,13 +1879,184 @@ bool VulkanRenderTargetCache::Update(
   return true;
 }
 
+bool VulkanRenderTargetCache::TileMergeBegin(uint32_t tile_width) {
+  tile_merge_state_ = TileMergeState::kOff;
+  if (!cvars::xdroid_tile_merge || GetPath() != Path::kHostRenderTargets ||
+      IsDrawResolutionScaled() || !tile_width) {
+    return false;
+  }
+  tile_merge_state_ = TileMergeState::kDrawing;
+  tile_merge_width_ = tile_width;
+  std::memset(tile_merge_guest_, 0, sizeof(tile_merge_guest_));
+  std::memset(tile_merge_wide_, 0, sizeof(tile_merge_wide_));
+  return true;
+}
+
+bool VulkanRenderTargetCache::TileMergeMatches(RenderTarget* const* rts) const {
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (!rts[i]) {
+      continue;
+    }
+    if (tile_merge_guest_[i]) {
+      if (rts[i] != tile_merge_guest_[i]) {
+        return false;
+      }
+    } else if (rts[i]->key().GetWidth() != tile_merge_width_) {
+      return false;
+    }
+  }
+  return true;
+}
+
+RenderTargetCache::RenderTarget* VulkanRenderTargetCache::TileMergeGetWide(
+    RenderTarget* guest) {
+  RenderTargetKey key = guest->key();
+  for (const auto& wide : tile_merge_wide_cache_) {
+    if (wide.first == key.key) {
+      return wide.second;
+    }
+  }
+  // The pitch field is 8 bits wide.
+  if (key.pitch_tiles_at_32bpp > 127) {
+    return nullptr;
+  }
+  RenderTargetKey wide_key = key;
+  wide_key.pitch_tiles_at_32bpp = key.pitch_tiles_at_32bpp * 2;
+  RenderTarget* wide = CreateRenderTarget(wide_key);
+  if (!wide) {
+    return nullptr;
+  }
+  tile_merge_wide_cache_.emplace_back(key.key, wide);
+  XELOGI("XDROID-TILE: wide {} render target {}x{} for {}",
+         key.is_depth ? "depth" : "color", wide_key.GetWidth(),
+         GetRenderTargetHeight(wide_key.pitch_tiles_at_32bpp,
+                               wide_key.msaa_samples),
+         key.GetDebugName());
+  return wide;
+}
+
+void VulkanRenderTargetCache::TileMergeCopy(RenderTarget* src, uint32_t src_x,
+                                            RenderTarget* dst,
+                                            const uint32_t* dst_xs,
+                                            uint32_t dst_x_count,
+                                            uint32_t width) {
+  auto& src_rt = *static_cast<VulkanRenderTarget*>(src);
+  auto& dst_rt = *static_cast<VulkanRenderTarget*>(dst);
+  RenderTargetKey src_key = src->key();
+  RenderTargetKey dst_key = dst->key();
+  uint32_t height = std::min(
+      GetRenderTargetHeight(src_key.pitch_tiles_at_32bpp,
+                            src_key.msaa_samples),
+      GetRenderTargetHeight(dst_key.pitch_tiles_at_32bpp,
+                            dst_key.msaa_samples));
+  VkImageAspectFlags aspect =
+      src_key.is_depth
+          ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT |
+                               VK_IMAGE_ASPECT_STENCIL_BIT)
+          : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
+  VkImageSubresourceRange range =
+      ui::vulkan::util::InitializeSubresourceRange(aspect);
+  command_processor_.TagPassEnd(
+      VulkanCommandProcessor::PassEndReason::kTransfer);
+  command_processor_.EndRenderPass();
+  command_processor_.PushImageMemoryBarrier(
+      src_rt.image(), range, src_rt.current_stage_mask(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, src_rt.current_access_mask(),
+      VK_ACCESS_TRANSFER_READ_BIT, src_rt.current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  src_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  command_processor_.PushImageMemoryBarrier(
+      dst_rt.image(), range, dst_rt.current_stage_mask(),
+      VK_PIPELINE_STAGE_TRANSFER_BIT, dst_rt.current_access_mask(),
+      VK_ACCESS_TRANSFER_WRITE_BIT, dst_rt.current_layout(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  dst_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  command_processor_.SubmitBarriers(true);
+  VkImageCopy regions[2];
+  dst_x_count = std::min(dst_x_count, uint32_t(xe::countof(regions)));
+  for (uint32_t i = 0; i < dst_x_count; ++i) {
+    VkImageCopy& region = regions[i];
+    region.srcSubresource.aspectMask = aspect;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = 1;
+    region.srcOffset = {int32_t(src_x), 0, 0};
+    region.dstSubresource = region.srcSubresource;
+    region.dstOffset = {int32_t(dst_xs[i]), 0, 0};
+    region.extent = {width, height, 1};
+  }
+  command_processor_.deferred_command_buffer().CmdVkCopyImage(
+      src_rt.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_rt.image(),
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, dst_x_count, regions);
+}
+
+void VulkanRenderTargetCache::TileMergeResolveTile(uint32_t tile) {
+  if (tile_merge_state_ == TileMergeState::kOff) {
+    return;
+  }
+  tile_merge_state_ = TileMergeState::kResolving;
+  tile_merge_resolve_tile_ = tile;
+  // The next update binds the guest render targets again.
+  last_update_framebuffer_ = nullptr;
+}
+
+void VulkanRenderTargetCache::TileMergeObserveBegin(uint32_t tile_width) {
+  tile_merge_state_ = TileMergeState::kOff;
+  if (!cvars::xdroid_tile_merge || GetPath() != Path::kHostRenderTargets ||
+      IsDrawResolutionScaled() || !tile_width) {
+    return;
+  }
+  tile_merge_state_ = TileMergeState::kObserving;
+  tile_merge_observe_clean_ = true;
+  tile_merge_width_ = tile_width;
+  std::memset(tile_merge_guest_, 0, sizeof(tile_merge_guest_));
+  std::memset(tile_merge_wide_, 0, sizeof(tile_merge_wide_));
+}
+
+RenderTargetCache::RenderTarget* VulkanRenderTargetCache::TileMergeResolveSource(
+    RenderTarget* rt, uint32_t* x_offset_tiles) const {
+  *x_offset_tiles = 0;
+  if (tile_merge_state_ != TileMergeState::kResolving) {
+    return rt;
+  }
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (tile_merge_guest_[i] == rt && tile_merge_wide_[i]) {
+      *x_offset_tiles = tile_merge_resolve_tile_ * rt->key().GetPitchTiles();
+      return tile_merge_wide_[i];
+    }
+  }
+  return rt;
+}
+
+void VulkanRenderTargetCache::TileMergeAbort(const char* reason) {
+  // The guest render targets were not drawn: give them the first tile's half
+  // (no source offset) so drawing can go on there.
+  if (tile_merge_state_ == TileMergeState::kDrawing ||
+      (tile_merge_state_ == TileMergeState::kResolving &&
+       !tile_merge_resolve_tile_)) {
+    const uint32_t dst_x = 0;
+    for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+      if (tile_merge_wide_[i]) {
+        TileMergeCopy(tile_merge_wide_[i], 0, tile_merge_guest_[i], &dst_x, 1,
+                      tile_merge_width_);
+      }
+    }
+    last_update_framebuffer_ = nullptr;
+    ++tile_merge_aborts_;
+    XELOGW("XDROID-TILE: merge stopped in the first tile: {}", reason);
+  }
+  tile_merge_state_ = TileMergeState::kOff;
+}
+
 void VulkanRenderTargetCache::GetLastUpdateRenderingAttachments(
     VkRenderingAttachmentInfo* color_attachments,
     uint32_t* color_attachment_count_out,
     VkRenderingAttachmentInfo* depth_attachment,
     VkRenderingAttachmentInfo* stencil_attachment) const {
   RenderPassKey key = last_update_render_pass_key_;
-  const RenderTarget* const* rts = last_update_accumulated_render_targets();
+  const RenderTarget* const* rts = last_update_bound_rts_;
 
   // Initialize depth/stencil attachments. Must match what pipeline creation
   // declared (depthAttachmentFormat from key.depth_and_color_used bit 0); null
@@ -2012,6 +2398,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(
   }
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  if (cvars::xdroid_tile_merge) {
+    // TILE-1 copies tiles between the guest and the wide render targets.
+    image_create_info.usage |=
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -2959,8 +3350,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant),
             &host_depth_store_rectangle_constant);
-        command_processor_.TagPassEnd(
-            VulkanCommandProcessor::PassEndReason::kTransfer);
+        command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kTransfer);
         command_processor_.SubmitBarriers(true);
         command_processor_.TagDispatch(
             VulkanGpuBreadcrumbs::WorkKind::kTransfer);
@@ -3707,9 +4097,6 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
     // Perform the clear.
     if (resolve_clear_needed) {
-      command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
-          transfer_render_pass, transfer_framebuffer, transfer_dest_view,
-          dest_rt_key.is_depth);
       VkClearAttachment resolve_clear_attachment;
       resolve_clear_attachment.colorAttachment = 0;
       std::memset(&resolve_clear_attachment.clearValue, 0,
@@ -3809,8 +4196,43 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           } break;
         }
       }
-      command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1,
-                                           &resolve_clear_rect);
+      // GE-2: a pass holding only this clear doesn't need the whole surface
+      // loaded and stored. Outside the render area the attachment keeps its
+      // contents, and the pass is never reused for other work.
+      const uint32_t clear_pass_mode = cvars::xdroid_clear_pass_mode;
+      VkRect2D clear_pass_area;
+      const VkRect2D* clear_pass_area_ptr = nullptr;
+      const VkClearValue* clear_pass_load_value = nullptr;
+      if (clear_pass_mode && current_transfers.empty()) {
+        const VkRect2D& rect = resolve_clear_rect.rect;
+        const VkExtent2D& extent = transfer_framebuffer->host_extent;
+        if (clear_pass_mode >= 2 && !rect.offset.x && !rect.offset.y) {
+          clear_pass_area = rect;
+          clear_pass_load_value = &resolve_clear_attachment.clearValue;
+        } else {
+          // Like vulkan_tight_render_area: an area not starting at the origin
+          // made Turnip store stripes.
+          constexpr uint32_t kAlign = 64;
+          clear_pass_area.offset.x = 0;
+          clear_pass_area.offset.y = 0;
+          clear_pass_area.extent.width = std::min(
+              extent.width,
+              xe::align(uint32_t(rect.offset.x) + rect.extent.width, kAlign));
+          clear_pass_area.extent.height = std::min(
+              extent.height,
+              xe::align(uint32_t(rect.offset.y) + rect.extent.height, kAlign));
+        }
+        clear_pass_area_ptr = &clear_pass_area;
+      }
+      bool cleared_by_load_op = false;
+      command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+          transfer_render_pass, transfer_framebuffer, transfer_dest_view,
+          dest_rt_key.is_depth, clear_pass_area_ptr, clear_pass_load_value,
+          &cleared_by_load_op);
+      if (!cleared_by_load_op) {
+        command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1,
+                                             &resolve_clear_rect);
+      }
     }
   }
 
@@ -3829,6 +4251,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(EdramDumpShaderKey key) {
   // EDRAM buffer - one storage buffer either way, so one pipeline layout.
   shader_options.descriptor_set_dest = kDumpDescriptorSetEdram;
   shader_options.descriptor_set_source = kDumpDescriptorSetSource;
+  shader_options.descriptor_set_link = kDumpDescriptorSetLink;
   shader_options.resolution_scale_x = draw_resolution_scale_x();
   shader_options.resolution_scale_y = draw_resolution_scale_y();
   shader_options.msaa_2x_attachments_supported = msaa_2x_attachments_supported_;
@@ -3846,7 +4269,9 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(EdramDumpShaderKey key) {
   // to create it again later.
   VkPipeline pipeline = ui::vulkan::util::CreateComputePipeline(
       command_processor_.GetVulkanDevice(),
-      key.is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
+      key.is_depth       ? dump_pipeline_layout_depth_
+      : key.link_scratch ? dump_pipeline_layout_color_link_
+                         : dump_pipeline_layout_color_,
       shader_code.data(), sizeof(uint32_t) * shader_code.size());
   if (pipeline == VK_NULL_HANDLE) {
     XELOGE(
@@ -3867,9 +4292,13 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
     const draw_util::ResolveCopyShaderConstants& copy_shader_constants,
     uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
     uint32_t dump_pitch, bool copy_dest_scaled,
-    VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache) {
+    VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
+    bool link, bool link_spliced, bool* linked_out) {
   SCOPE_profile_cpu_f("gpu");
   assert_true(GetPath() == Path::kHostRenderTargets);
+  if (linked_out) {
+    *linked_out = false;
+  }
 
   // Unscaled, the whole buffer bound persistently is what lets copy_dest_base
   // stay an absolute byte offset, which is what the shader adds to the tiled
@@ -3916,6 +4345,17 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
   // dispatch is in, falling back would resolve the same range twice.
   dump_invocations_.clear();
   dump_invocations_.reserve(dump_rectangles_.size());
+  // TEX-1b: only when every source stores 32bpp color pixels unscaled.
+  if (link) {
+    link = !copy_dest_scaled && !resolve_info.IsCopyingDepth() &&
+           !resolve_info.color_edram_info.format_is_64bpp;
+    for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+      RenderTargetKey rt_key = rectangle.render_target->key();
+      if (rt_key.is_depth || rt_key.Is64bpp()) {
+        link = false;
+      }
+    }
+  }
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     RenderTargetKey rt_key =
         static_cast<VulkanRenderTarget*>(rectangle.render_target)->key();
@@ -3926,8 +4366,16 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
     pipeline_key.source_scale_native = rt_key.scale_native;
     pipeline_key.native_layout = uint32_t(!copy_dest_scaled);
     pipeline_key.direct_resolve = 1;
+    pipeline_key.average_samples =
+        GetDirectResolveAverageSamples(resolve_info);
     pipeline_key.skip_stencil =
         uint32_t(rt_key.is_depth && cvars::xdroid_depth_read_skip_stencil);
+    // RES-4: eligibility only lets a sample count mismatch through for a 1x
+    // 32bpp color resolve of a multisampled 32bpp color source.
+    pipeline_key.read_as_1x = uint32_t(
+        rt_key.msaa_samples != resolve_info.color_edram_info.msaa_samples &&
+        !rt_key.is_depth);
+    pipeline_key.link_scratch = uint32_t(link);
     if (GetDumpPipeline(pipeline_key) == VK_NULL_HANDLE) {
       return false;
     }
@@ -4038,6 +4486,48 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
         vulkan_device->device(), 1, &write_dest, 0, nullptr);
   }
 
+  // TEX-1b: the linear pixels, pitched by the resolve width.
+  uint32_t link_pitch_pixels = resolve_info.coordinate_info.width_div_8 << 3;
+  uint32_t link_rows = resolve_info.height_div_8 << 3;
+  VulkanCommandProcessor::ScratchBufferAcquisition link_scratch;
+  VkDescriptorSet link_descriptor_set = VK_NULL_HANDLE;
+  if (link) {
+    VkDeviceSize link_size =
+        VkDeviceSize(link_pitch_pixels) * link_rows * sizeof(uint32_t);
+    link_scratch = command_processor_.AcquireScratchGpuBuffer(
+        link_size, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_WRITE_BIT);
+    if (link_scratch.buffer() != VK_NULL_HANDLE) {
+      link_descriptor_set =
+          command_processor_.AllocateSingleTransientDescriptor(
+              VulkanCommandProcessor::SingleTransientDescriptorLayout::
+                  kStorageBuffer);
+    }
+    if (link_descriptor_set == VK_NULL_HANDLE) {
+      // Too late to drop the bit from the keys - fall back to the round trip.
+      return false;
+    }
+    VkDescriptorBufferInfo link_buffer_info;
+    link_buffer_info.buffer = link_scratch.buffer();
+    link_buffer_info.offset = 0;
+    link_buffer_info.range = link_size;
+    VkWriteDescriptorSet write_link;
+    write_link.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_link.pNext = nullptr;
+    write_link.dstSet = link_descriptor_set;
+    write_link.dstBinding = 0;
+    write_link.dstArrayElement = 0;
+    write_link.descriptorCount = 1;
+    write_link.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    write_link.pImageInfo = nullptr;
+    write_link.pBufferInfo = &link_buffer_info;
+    write_link.pTexelBufferView = nullptr;
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        command_processor_.GetVulkanDevice();
+    vulkan_device->functions().vkUpdateDescriptorSets(
+        vulkan_device->device(), 1, &write_link, 0, nullptr);
+  }
+
   command_processor_.PushDebugMarker("DirectResolveRenderTargets: base tile %u",
                                      dump_base);
 
@@ -4062,9 +4552,10 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
   }
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    auto& vulkan_rt =
-        *static_cast<VulkanRenderTarget*>(rectangle.render_target);
-    RenderTargetKey rt_key = vulkan_rt.key();
+    uint32_t tile_merge_x_offset_tiles;
+    auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(TileMergeResolveSource(
+        rectangle.render_target, &tile_merge_x_offset_tiles));
+    RenderTargetKey rt_key = rectangle.render_target->key();
     command_processor_.PushImageMemoryBarrier(
         vulkan_rt.image(),
         ui::vulkan::util::InitializeSubresourceRange(
@@ -4107,27 +4598,51 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
   DeferredCommandBuffer& command_buffer =
       command_processor_.deferred_command_buffer();
   bool dest_bound = false, resolve_constants_bound = false;
+  bool link_bound = false;
   VkDescriptorSet last_source_descriptor_set = VK_NULL_HANDLE;
   EdramDumpShaderPitches last_pitches;
   EdramDumpShaderOffsets last_offsets;
   bool pitches_bound = false, offsets_bound = false;
   for (const DumpInvocation& invocation : dump_invocations_) {
     const ResolveCopyDumpRectangle& rectangle = invocation.rectangle;
-    auto& vulkan_rt =
-        *static_cast<VulkanRenderTarget*>(rectangle.render_target);
-    RenderTargetKey rt_key = vulkan_rt.key();
+    uint32_t tile_merge_x_offset_tiles;
+    auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(TileMergeResolveSource(
+        rectangle.render_target, &tile_merge_x_offset_tiles));
+    RenderTargetKey rt_key = rectangle.render_target->key();
+    const uint32_t pre_barrier = cvars::vulkan_direct_resolve_pre_barrier;
+    if (pre_barrier >= 2 ||
+        (pre_barrier == 1 && rt_key.msaa_samples != xenos::MsaaSamples::k1X)) {
+      // STAB-S1b: the render target's pass finishes before the read starts.
+      command_processor_.SubmitBarriers(true);
+      VkMemoryBarrier pre;
+      pre.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+      pre.pNext = nullptr;
+      pre.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+      pre.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      command_buffer.CmdVkPipelineBarrier(
+          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &pre, 0, nullptr, 0,
+          nullptr);
+    }
     command_processor_.BindExternalComputePipeline(
         GetDumpPipeline(invocation.pipeline_key));
 
-    VkPipelineLayout pipeline_layout = rt_key.is_depth
-                                           ? dump_pipeline_layout_depth_
-                                           : dump_pipeline_layout_color_;
+    VkPipelineLayout pipeline_layout =
+        rt_key.is_depth ? dump_pipeline_layout_depth_
+        : link          ? dump_pipeline_layout_color_link_
+                        : dump_pipeline_layout_color_;
 
     if (!dest_bound) {
       dest_bound = true;
       command_buffer.CmdVkBindDescriptorSets(
           VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
           kDumpDescriptorSetEdram, 1, &descriptor_set_dest, 0, nullptr);
+    }
+    if (link && !link_bound) {
+      link_bound = true;
+      command_buffer.CmdVkBindDescriptorSets(
+          VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout,
+          kDumpDescriptorSetLink, 1, &link_descriptor_set, 0, nullptr);
     }
 
     VkDescriptorSet source_descriptor_set =
@@ -4153,6 +4668,7 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
     EdramDumpShaderPitches pitches;
     pitches.dest_pitch = dump_pitch;
     pitches.source_pitch = rt_key.GetPitchTiles();
+    pitches.source_x_offset_tiles = tile_merge_x_offset_tiles;
     if (last_pitches != pitches) {
       last_pitches = pitches;
       pitches_bound = false;
@@ -4167,13 +4683,17 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
 
     // Tiles cover this many destination pixels, which is what the dispatch is
     // sized in - host pixels, so scaled along with the destination.
+    // In the resolve's sample grid - the source's unless read_as_1x.
+    xenos::MsaaSamples grid_msaa_samples =
+        invocation.pipeline_key.read_as_1x ? xenos::MsaaSamples::k1X
+                                           : rt_key.msaa_samples;
     uint32_t tile_pixels_x =
         ((xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) >>
-         uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k4X)) *
+         uint32_t(grid_msaa_samples >= xenos::MsaaSamples::k4X)) *
         (copy_dest_scaled ? draw_resolution_scale_x() : 1);
     uint32_t tile_pixels_y =
         (xenos::kEdramTileHeightSamples >>
-         uint32_t(rt_key.msaa_samples >= xenos::MsaaSamples::k2X)) *
+         uint32_t(grid_msaa_samples >= xenos::MsaaSamples::k2X)) *
         (copy_dest_scaled ? draw_resolution_scale_y() : 1);
     uint32_t pixels_per_thread =
         GetEdramDumpShaderResolvePixelsPerThread(rt_key.Is64bpp());
@@ -4212,8 +4732,7 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
           sizeof(uint32_t) * kEdramDumpShaderPushConstantResolveDispatchTile,
           sizeof(dispatch_tile), &dispatch_tile);
 
-      command_processor_.TagPassEnd(
-          VulkanCommandProcessor::PassEndReason::kResolve);
+      command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kResolve);
       command_processor_.SubmitBarriers(true);
       uint32_t threads_x =
           (dispatch.width_tiles * tile_pixels_x + (pixels_per_thread - 1)) /
@@ -4229,8 +4748,7 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
             transient_dest_offset,
             uint32_t(transient_dest_range),
             resolve_push_constants[kEdramDumpShaderPushConstantResolveDestBase],
-            resolve_push_constants
-                [kEdramDumpShaderPushConstantResolveEdramInfo],
+            resolve_push_constants[kEdramDumpShaderPushConstantResolveEdramInfo],
             resolve_push_constants
                 [kEdramDumpShaderPushConstantResolveCoordinateInfo],
             resolve_push_constants[kEdramDumpShaderPushConstantResolveDestInfo],
@@ -4280,9 +4798,26 @@ bool VulkanRenderTargetCache::DirectResolveRenderTargets(
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         command_buffer.CmdVkPipelineBarrier(
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post_barrier, 0, nullptr,
-            0, nullptr);
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &post_barrier, 0,
+            nullptr, 0, nullptr);
       }
+    }
+  }
+
+  if (link) {
+    // The resolve's pixels on to the image, in the same stream as the
+    // dispatches (the splice segment when the resolve is spliced).
+    command_processor_.PushBufferMemoryBarrier(
+        link_scratch.buffer(), 0, VK_WHOLE_SIZE,
+        link_scratch.SetStageMask(VK_PIPELINE_STAGE_TRANSFER_BIT),
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        link_scratch.SetAccessMask(VK_ACCESS_TRANSFER_READ_BIT),
+        VK_ACCESS_TRANSFER_READ_BIT);
+    texture_cache.RecordResolveLinkCopy(link_scratch.buffer(),
+                                        link_pitch_pixels, link_rows,
+                                        link_spliced);
+    if (linked_out) {
+      *linked_out = true;
     }
   }
 
@@ -4490,6 +5025,23 @@ void VulkanRenderTargetCache::EndEdramSnapshotReadback() {
       dfn.vkFreeMemory, device, edram_snapshot_download_buffer_memory_);
 }
 
+namespace {
+
+// STAB-S1 (vulkan_dump_barrier): a global memory barrier around a dump.
+void DumpFullBarrier(
+    DeferredCommandBuffer& command_buffer, VkPipelineStageFlags src_stage_mask,
+    VkAccessFlags src_access_mask, VkPipelineStageFlags dst_stage_mask) {
+  VkMemoryBarrier barrier;
+  barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+  barrier.pNext = nullptr;
+  barrier.srcAccessMask = src_access_mask;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  command_buffer.CmdVkPipelineBarrier(src_stage_mask, dst_stage_mask, 0, 1,
+                                      &barrier, 0, nullptr, 0, nullptr);
+}
+
+}  // namespace
+
 void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
                                                 uint32_t dump_row_length_used,
                                                 uint32_t dump_rows,
@@ -4524,9 +5076,10 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
   uint32_t rt_sort_index = 0;
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
-    auto& vulkan_rt =
-        *static_cast<VulkanRenderTarget*>(rectangle.render_target);
-    RenderTargetKey rt_key = vulkan_rt.key();
+    uint32_t tile_merge_x_offset_tiles;
+    auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(TileMergeResolveSource(
+        rectangle.render_target, &tile_merge_x_offset_tiles));
+    RenderTargetKey rt_key = rectangle.render_target->key();
     command_processor_.PushImageMemoryBarrier(
         vulkan_rt.image(),
         ui::vulkan::util::InitializeSubresourceRange(
@@ -4568,9 +5121,10 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
   bool pitches_bound = false, offsets_bound = false;
   for (const DumpInvocation& invocation : dump_invocations_) {
     const ResolveCopyDumpRectangle& rectangle = invocation.rectangle;
-    auto& vulkan_rt =
-        *static_cast<VulkanRenderTarget*>(rectangle.render_target);
-    RenderTargetKey rt_key = vulkan_rt.key();
+    uint32_t tile_merge_x_offset_tiles;
+    auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(TileMergeResolveSource(
+        rectangle.render_target, &tile_merge_x_offset_tiles));
+    RenderTargetKey rt_key = rectangle.render_target->key();
     EdramDumpShaderKey pipeline_key = invocation.pipeline_key;
     VkPipeline pipeline = GetDumpPipeline(pipeline_key);
     if (!pipeline) {
@@ -4604,6 +5158,7 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
     EdramDumpShaderPitches pitches;
     pitches.dest_pitch = dump_pitch;
     pitches.source_pitch = rt_key.GetPitchTiles();
+    pitches.source_x_offset_tiles = tile_merge_x_offset_tiles;
     if (last_pitches != pitches) {
       last_pitches = pitches;
       pitches_bound = false;
@@ -4636,16 +5191,25 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
             sizeof(uint32_t) * kEdramDumpShaderPushConstantOffsets,
             sizeof(last_offsets), &last_offsets);
       }
+      const uint32_t dump_barrier = cvars::vulkan_dump_barrier;
+      if (rt_key.is_depth && (dump_barrier & 4)) {
+        // Everything before (the depth pass included) finishes first.
+        DumpFullBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        VK_ACCESS_MEMORY_WRITE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+      }
       command_processor_.SubmitBarriers(true);
       // STAB-S1 forensic (temp): identical repeats write identical values.
       const uint32_t repeats =
           rt_key.is_depth ? std::max(cvars::xdroid_depth_read_repeat, 1u) : 1;
       for (uint32_t repeat = 0; repeat < repeats; ++repeat) {
         // The native layout has a 1x1 footprint.
-        command_processor_.TagDispatch(VulkanGpuBreadcrumbs::WorkKind::kDump);
+        command_processor_.TagDispatch(
+            VulkanGpuBreadcrumbs::WorkKind::kDump);
         command_buffer.CmdVkDispatch(
             ((native_layout ? 1 : draw_resolution_scale_x()) *
-                 (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
+                 (xenos::kEdramTileWidthSamples >>
+                  uint32_t(rt_key.Is64bpp())) *
                  dispatch.width_tiles +
              (kEdramDumpShaderSamplesPerGroupX - 1)) /
                 kEdramDumpShaderSamplesPerGroupX,
@@ -4654,6 +5218,12 @@ void VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base,
              (kEdramDumpShaderSamplesPerGroupY - 1)) /
                 kEdramDumpShaderSamplesPerGroupY,
             1);
+      }
+      if (dump_barrier & (rt_key.is_depth ? 1 : 2)) {
+        // Nothing after this dispatch may start before it has finished.
+        DumpFullBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
       }
     }
     MarkEdramBufferModified();

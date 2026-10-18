@@ -16,8 +16,6 @@ FidelityFX CAS	Sharpening filter	MIT	third_party/FidelityFX-CAS/LICENSE.txt
 FidelityFX FSR	Upscaling filter	MIT	third_party/FidelityFX-FSR/license.txt
 NVIDIA FXAA	Anti-aliasing filter	BSD-3-Clause	third_party/fxaa/LICENSE
 Dear ImGui	In-emulator overlays	MIT	third_party/imgui/LICENSE.txt
-Inter typeface	Overlay font embedded in the native library	OFL-1.1	assets/font/OFL.txt
-Xenia icon	Icon images embedded in the native library	CC-BY-SA-4.0	assets/icon/LICENSE
 {fmt}	Text formatting	MIT	third_party/fmt/LICENSE
 toml++	Configuration files	MIT	third_party/tomlplusplus/LICENSE
 cxxopts	Option parsing	MIT	third_party/cxxopts/LICENSE
@@ -44,3 +42,4 @@ Boost.Context, Asio, UTF8-CPP	Fibers, sockets, UTF-8	BSL-1.0	third_party/asio/LI
 microprofile	Profiler hooks	Public domain (Unlicense)	docs/licenses/microprofile-NOTICE.txt
 miniaudio	Audio helpers	Public domain (Unlicense) or MIT-0	third_party/miniaudio/LICENSE
 Android Jetpack (AndroidX, Compose), Kotlin standard library, kotlinx.coroutines	App user interface	Apache-2.0	third_party/Vulkan-Headers/LICENSES/Apache-2.0.txt
+Snapdragon Game Super Resolution 1	Optional upscaling shader for the final image (present_snapdragon_gsr)	BSD-3-Clause	docs/licenses/snapdragon-gsr-LICENSE.txt

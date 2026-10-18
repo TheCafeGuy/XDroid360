@@ -9,10 +9,13 @@
 
 #include "xenia/gpu/shared_memory.h"
 
+#include <algorithm>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/bit_range.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/xxhash.h"
 
 namespace xe {
 namespace gpu {
@@ -423,6 +426,35 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
   watch_range_first_free_ = range;
 }
 
+void SharedMemory::MarkDrawRead(uint32_t start, uint32_t length) {
+  if (page_draw_read_serials_.empty()) {
+    page_draw_read_serials_.resize(size_t(kBufferSize) >> page_size_log2_);
+  }
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    page_draw_read_serials_[page] = draw_read_marking_serial_;
+  }
+}
+
+bool SharedMemory::WasRangeReadByDraws(uint32_t start, uint32_t length,
+                                       uint64_t first_serial,
+                                       uint64_t end_serial) const {
+  if (!length || page_draw_read_serials_.empty() || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    uint64_t serial = page_draw_read_serials_[page];
+    if (serial >= first_serial && serial < end_serial) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // todo: optimize, an enormous amount of cpu time (1.34%) is spent here.
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   if (!length) {
@@ -434,6 +466,10 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   }
 
   SCOPE_profile_cpu_f("gpu");
+
+  if (draw_read_marking_serial_) {
+    MarkDrawRead(start, length);
+  }
 
   if (!EnsureHostGpuMemoryAllocated(start, length)) {
     return false;
@@ -519,6 +555,54 @@ bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
       valid_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
     if ((system_page_flags_valid_[i] & valid_mask) != valid_mask) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool SharedMemory::IsRangeAnyGpuWritten(uint32_t start, uint32_t length) const {
+  if (!length || !system_page_flags_valid_and_gpu_written_ ||
+      start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+  const uint32_t page_first = start >> page_size_log2_;
+  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t i = page_first >> 6; i <= page_last >> 6; ++i) {
+    uint64_t mask = UINT64_MAX;
+    if (i == page_first >> 6) {
+      mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
+    }
+    if (i == page_last >> 6 && (page_last & 63) != 63) {
+      mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+    }
+    if (system_page_flags_valid_and_gpu_written_[i] & mask) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint64_t SharedMemory::HashRange(uint32_t start, uint32_t length) const {
+  if (!length || start > kBufferSize || (kBufferSize - start) < length) {
+    return 0;
+  }
+  return XXH3_64bits(memory_.TranslatePhysical<const uint8_t*>(start), length);
+}
+
+bool SharedMemory::IsRangeSampledZero(uint32_t start, uint32_t length) const {
+  if (length < 16 || start > kBufferSize || (kBufferSize - start) < length) {
+    return false;
+  }
+  const uint8_t* data = memory_.TranslatePhysical<const uint8_t*>(start);
+  uint32_t step =
+      std::max(((length - 16) / 31) & ~UINT32_C(15), UINT32_C(16));
+  for (uint32_t i = 0; i < 32; ++i) {
+    uint32_t offset = std::min(i * step, length - 16);
+    uint64_t lo, hi;
+    std::memcpy(&lo, data + offset, sizeof(lo));
+    std::memcpy(&hi, data + offset + 8, sizeof(hi));
+    if (lo | hi) {
       return false;
     }
   }

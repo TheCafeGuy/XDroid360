@@ -504,12 +504,6 @@ target_include_directories(pugixml PUBLIC pugixml/src)
 # reuse the current generator + toolchain. Without them they fall back to the
 # platform default (NMake on Windows), which fails when cross-compiling
 # (e.g. Android NDK) or without VS installed.
-# CI exports CMAKE_<LANG>_COMPILER_LAUNCHER=sccache; with the Ninja generator
-# the nested probes would honor it, and sccache fails on MSVC's /Zi try_compile
-# PDBs. The probes only generate headers, so run them without a launcher.
-set(_xe_nested_cmake ${CMAKE_COMMAND} -E env
-    --unset=CMAKE_C_COMPILER_LAUNCHER --unset=CMAKE_CXX_COMPILER_LAUNCHER
-    ${CMAKE_COMMAND})
 set(_xe_nested_configure_args "")
 if(CMAKE_GENERATOR)
   list(APPEND _xe_nested_configure_args -G "${CMAKE_GENERATOR}")
@@ -540,7 +534,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/snappy/snappy-stubs-public.h")
     set(_snappy_avx_flag "-DSNAPPY_REQUIRE_AVX=OFF")
   endif()
   execute_process(
-    COMMAND ${_xe_nested_cmake}
+    COMMAND ${CMAKE_COMMAND}
       ${_xe_nested_configure_args}
       -DSNAPPY_BUILD_TESTS=OFF
       -DSNAPPY_BUILD_BENCHMARKS=OFF
@@ -623,7 +617,7 @@ foreach(_hdr zlib-ng.h zconf-ng.h zlib_name_mangling-ng.h gzread.c)
 endforeach()
 if(_zlibng_needs_configure)
   execute_process(
-    COMMAND ${_xe_nested_cmake}
+    COMMAND ${CMAKE_COMMAND}
       ${_xe_nested_configure_args}
       -DZLIB_ENABLE_TESTS=OFF
       -DWITH_GTEST=OFF

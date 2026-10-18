@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -22,9 +23,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -41,6 +42,7 @@
 #include "xenia/gpu/vulkan/vulkan_draw_blackbox.h"
 #include "xenia/gpu/vulkan/vulkan_glitch_recorder.h"
 #include "xenia/gpu/vulkan/vulkan_gpu_breadcrumbs.h"
+#include "xenia/gpu/vulkan/vulkan_gpu_sanity.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 #include "xenia/gpu/vulkan/vulkan_primitive_processor.h"
@@ -217,7 +219,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
       VkAccessFlags src_access_mask, VkAccessFlags dst_access_mask,
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-      bool skip_if_equal = true);
+      bool skip_if_equal = true, uint32_t site_line = __builtin_LINE(),
+      const char* site_file = __builtin_FILE());
   bool PushImageMemoryBarrier(
       VkImage image, const VkImageSubresourceRange& subresource_range,
       VkPipelineStageFlags src_stage_mask, VkPipelineStageFlags dst_stage_mask,
@@ -225,7 +228,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
       VkImageLayout old_layout, VkImageLayout new_layout,
       uint32_t src_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
       uint32_t dst_queue_family_index = VK_QUEUE_FAMILY_IGNORED,
-      bool skip_if_equal = true);
+      bool skip_if_equal = true, uint32_t site_line = __builtin_LINE(),
+      const char* site_file = __builtin_FILE());
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
@@ -248,6 +252,38 @@ class VulkanCommandProcessor final : public CommandProcessor {
     kCount,
   };
   void TagPassEnd(PassEndReason reason) { pass_end_reason_ = reason; }
+
+  // GE-4 pass splice (xdroid_pass_splice bits). Work that would end the open
+  // guest render pass (a texture load, a shared-memory upload, a resolve) can
+  // instead be recorded into a segment that runs right before that pass's
+  // begin, when nothing the pass's earlier draws used is touched by it.
+  enum SpliceKind : uint32_t {
+    kSpliceTextureLoads = 1,
+    kSpliceUploads = 2,
+    kSpliceResolves = 4,
+  };
+  // Draw serials: each recorded guest draw gets the current value, which then
+  // advances, so "used by an earlier draw of the open pass" is a range check.
+  uint64_t draw_serial() const { return draw_serial_; }
+  uint64_t pass_first_draw_serial() const { return pass_first_draw_serial_; }
+  bool IsDrawSerialEarlierInPass(uint64_t serial) const {
+    return serial >= pass_first_draw_serial_ && serial < draw_serial_;
+  }
+  // Whether this kind of work may be spliced into the open pass now (the
+  // caller still checks its own resources).
+  bool IsSpliceCandidate(SpliceKind kind) const;
+  // Whether a render target (RenderTargetCache::RenderTarget*) is bound in the
+  // open guest pass.
+  bool IsRenderTargetBoundInSplicePass(const void* render_target) const;
+  // On true, the following commands go to the segment until EndSplice; the
+  // caller must not record anything that belongs inside the pass meanwhile.
+  // On false nothing changed, and the caller ends the pass as it used to.
+  bool BeginSplice(SpliceKind kind);
+  void EndSplice();
+  bool is_splice_recording() const { return splice_depth_ != 0; }
+  // An image written by spliced work, so its later barriers may join the
+  // segment too.
+  void NoteSplicedImage(VkImage image);
 
   // STAB-S1: every GPU hang of 2026-10-11 stopped between render passes with
   // the shader processor busy, so compute dispatches get breadcrumbs too.
@@ -289,10 +325,19 @@ class VulkanCommandProcessor final : public CommandProcessor {
       const VulkanRenderTargetCache::Framebuffer* framebuffer);
   // Overload for transfer operations with dynamic rendering.
   // transfer_dest_view is the destination render target view for the transfer.
-  void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+  // Returns whether a new pass was begun. GE-2 (xdroid_clear_pass_mode): a
+  // pass that will only hold a resolve clear may pass render_area (must
+  // contain the clear rect; such a pass is never reused for later work), and
+  // load_op_clear_value to clear through the load op instead of a
+  // vkCmdClearAttachments (dynamic rendering only; *load_op_clear_applied
+  // tells whether it was used, otherwise the caller still clears).
+  bool SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       VkRenderPass render_pass,
       const VulkanRenderTargetCache::Framebuffer* framebuffer,
-      VkImageView transfer_dest_view, bool transfer_dest_is_depth);
+      VkImageView transfer_dest_view, bool transfer_dest_is_depth,
+      const VkRect2D* render_area = nullptr,
+      const VkClearValue* load_op_clear_value = nullptr,
+      bool* load_op_clear_applied = nullptr);
   // Must be called before doing anything outside the render pass scope,
   // including adding pipeline barriers that are not a part of the render pass
   // scope. Submission must be open.
@@ -434,6 +479,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
                  IndexBufferInfo* index_buffer_info,
                  bool major_mode_explicit) override;
   bool IssueCopy() override;
+  // MSAA-1X (gpu_force_msaa_1x): clears the MSAA sample count in
+  // RB_SURFACE_INFO before a draw or a resolve uses it.
+  void ApplyForceMsaa1x();
 
   void InitializeTrace() override;
   bool DumpEdramSnapshotToFile(const std::filesystem::path& path) override;
@@ -672,6 +720,48 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VulkanGlitchRecorder glitch_recorder_;
   // HUD-1 per-draw state ring (xdroid_draw_blackbox, temp).
   VulkanDrawBlackbox draw_blackbox_;
+  // GPU-SAN (xdroid_gpu_sanity): the draw about to be recorded, and a drop of
+  // it reported as an event.
+  VulkanGpuSanity::DrawId XdroidSanDrawId(const VulkanShader* vertex_shader,
+                                          const VulkanShader* pixel_shader) const;
+  // XR-4 Phase 0: runs of back-to-back mergeable resolves (index = run
+  // length, last = that or longer; index 0 counts resolves that are not
+  // mergeable).
+  void XdroidNoteResolve(bool mergeable);
+  void XdroidEndResolveRun();
+  uint32_t resolve_run_ = 0;
+  std::array<uint64_t, 10> resolve_runs_total_{};
+  std::array<uint64_t, 10> resolve_runs_window_start_{};
+  void XdroidSanDrop(const char* reason, int severity,
+                     const VulkanShader* vertex_shader,
+                     const VulkanShader* pixel_shader) const;
+
+  // XDroid360 SHADER-1: shader/pipeline compile stalls on this thread in the
+  // current frame, logged at the frame's end with xdroid_shader_stall_log.
+  struct ShaderStallFrame {
+    // Shader translation on the draw thread (no async path for the draw).
+    uint32_t translate_count = 0;
+    uint64_t translate_ticks = 0;
+    // A draw that can't use a stand-in waiting for its real pipeline.
+    uint32_t await_count = 0;
+    uint64_t await_ticks = 0;
+    // A query resolve draining pipeline creation.
+    uint32_t query_drain_count = 0;
+    uint64_t query_drain_ticks = 0;
+    // Draws skipped because their pipeline isn't ready (pop-in, not a stall).
+    uint32_t skipped_draws = 0;
+    // Early submits at a primary buffer end held back by pipeline creation.
+    uint32_t submit_deferred = 0;
+  };
+  ShaderStallFrame shader_stall_frame_;
+  // Running totals between summaries.
+  uint64_t shader_stall_summary_frames_ = 0;
+  uint64_t shader_stall_summary_stalled_frames_ = 0;
+  uint64_t shader_stall_summary_hitch_frames_ = 0;
+  uint64_t shader_stall_summary_ticks_ = 0;
+  uint64_t shader_stall_summary_worst_ticks_ = 0;
+  uint64_t shader_stall_summary_skipped_draws_ = 0;
+  void EndFrameShaderStalls();
   // GPU stall reports (vulkan_gpu_stall_report_ms): one per stuck
   // submission, capped per session.
   static constexpr uint32_t kMaxStallReports = 32;
@@ -750,6 +840,30 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // each one is a tile store plus an attachment reload.
   uint64_t render_passes_total_ = 0;
   uint64_t render_passes_window_start_ = 0;
+  // MSAA-1X: draws per guest sample count (index = xenos::MsaaSamples) and
+  // draws/resolves turned into 1x by gpu_force_msaa_1x.
+  std::array<uint64_t, 4> msaa_draws_total_ = {};
+  // TILE-1 bound: predicated tile index of the current draw (-1 = untiled).
+  uint64_t xdroid_tile_last_select_ = ~uint64_t(0);
+  int32_t xdroid_tile_index_ = -1;
+  bool xdroid_tile_second_checked_ = false;
+  // TILE-1: a frame merges only after this many frames whose first tile
+  // bound one set of render targets and resolved only at its end.
+  uint32_t xdroid_tile_clean_streak_ = 0;
+  bool xdroid_tile0_resolved_ = false;
+  bool xdroid_tile0_draw_after_resolve_ = false;
+  uint32_t xdroid_tile_aborts_seen_ = 0;
+  // Per-window counts for the XDROID-TILE stats line.
+  uint32_t xdroid_tile_stat_frames_ = 0;
+  uint32_t xdroid_tile_stat_merged_ = 0;
+  uint32_t xdroid_tile_stat_rt_change_ = 0;
+  uint32_t xdroid_tile_stat_offset_ = 0;
+  uint32_t xdroid_tile_stat_other_ = 0;
+  void XdroidTileChanged(int32_t from, int32_t to);
+  void XdroidTileCheckSecond();
+  std::array<uint64_t, 4> msaa_draws_window_start_ = {};
+  uint64_t msaa_forced_total_ = 0;
+  uint64_t msaa_forced_window_start_ = 0;
   uint32_t render_pass_window_frames_ = 0;
   uint64_t vblank_window_start_ = 0;
   PassEndReason pass_end_reason_ = PassEndReason::kOther;
@@ -779,6 +893,78 @@ class VulkanCommandProcessor final : public CommandProcessor {
   void CreateGpuTimeQueryPool();
   void DestroyGpuTimeQueryPool();
   void CollectCompletedGpuTimeQueries();
+
+  // XR-3 pass profiler (xdroid_pass_profiler = N): bottom-of-pipe timestamps
+  // before every render pass begin and after its end, for one frame in N, so
+  // GPU time splits into per-pass and between-pass (dispatch/copy) time.
+  enum class PassProfKind : uint8_t { kGuest, kTransfer, kClear, kCount };
+  struct PassProfRecord {
+    uint64_t submission;
+    uint32_t query;  // Begin timestamp; the end one is query + 1.
+    uint32_t draws;
+    uint32_t width;
+    uint32_t height;
+    PassProfKind kind;
+    PassEndReason end_reason;
+    // GE-0: for a kBarrier end, the call site of the first barrier pushed
+    // since the previous submit (PassProfBarrierSite), else 0.
+    uint32_t barrier_site;
+  };
+  enum class PassProfState : uint8_t { kIdle, kRecording, kWaiting };
+  static constexpr uint32_t kPassProfMaxPasses = 512;
+  VkQueryPool pass_prof_pool_ = VK_NULL_HANDLE;
+  bool pass_prof_pool_failed_ = false;
+  PassProfState pass_prof_state_ = PassProfState::kIdle;
+  uint64_t pass_prof_frame_ = 0;
+  uint64_t pass_prof_last_submission_ = 0;
+  // Whether the open render pass is being timed (its record is the last one).
+  bool pass_prof_in_pass_ = false;
+  std::vector<PassProfRecord> pass_prof_records_;
+  // GE-0: call site of the first barrier pending since the last
+  // SubmitBarriers while a frame is being profiled, and the site that ended
+  // the open pass through SubmitBarriers.
+  uint32_t pass_prof_pending_site_ = 0;
+  uint32_t pass_prof_end_site_ = 0;
+  void PassProfNoteBarrierSite(uint32_t line, const char* file);
+  void PassProfBeginPass(PassProfKind kind, const VkExtent2D& extent);
+  void PassProfEndPass(PassEndReason end_reason, const VkRect2D* patched_area);
+  void PassProfCollect();
+  void DestroyPassProfPool();
+  // GE-2: the open pass has a render area smaller than its framebuffer, so it
+  // can't be reused by anything that may write outside that area.
+  bool pass_area_restricted_ = false;
+
+  // GE-4 pass splice state for the open guest pass.
+  bool splice_segment_open_ = false;
+  size_t splice_segment_placeholder_ = 0;
+  uint32_t splice_depth_ = 0;
+  uint64_t draw_serial_ = 1;
+  uint64_t pass_first_draw_serial_ = 1;
+  std::array<const void*, 1 + xenos::kMaxColorRenderTargets> splice_pass_rts_ =
+      {};
+  std::vector<VkImage> splice_images_;
+  // Spliced operations (texture loads, uploads, resolves, Enter-time barrier
+  // batches), for the frame stats line.
+  std::array<uint64_t, 4> splice_ops_total_ = {};
+  std::array<uint64_t, 4> splice_ops_window_start_ = {};
+  void OpenSpliceSegment(
+      const VulkanRenderTargetCache::Framebuffer* framebuffer);
+  void CloseSpliceSegment();
+  // Ends a recording that is still open (only an aborted one is), keeping the
+  // segment open for later work.
+  void CloseSpliceRecordingIfAny() {
+    if (splice_depth_) {
+      splice_depth_ = 0;
+      deferred_command_buffer_.EndSegment();
+    }
+  }
+  // Whether every pending barrier may run before the open pass: buffers the
+  // spliced work owns (shared memory, scratch) and images it wrote.
+  bool ArePendingBarriersSpliceable() const;
+  // Moves the pending barriers into the segment when the pass is about to be
+  // reused, so they don't end it.
+  bool TrySubmitPendingBarriersIntoSegment();
+  void RecordPendingBarriers();
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
   uint64_t frame_current_ = 1;
@@ -1061,6 +1247,12 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // framebuffer. For dynamic rendering, current_render_pass_ is VK_NULL_HANDLE
   // but in_render_pass_ is true.
   VkRenderPass current_render_pass_;
+  // SHD-1 (xdroid_shader_stats): draws and indices per (VS, PS) hash pair.
+  struct ShaderDrawStat {
+    uint64_t draws = 0;
+    uint64_t indices = 0;
+  };
+  std::map<std::pair<uint64_t, uint64_t>, ShaderDrawStat> shader_draw_stats_;
   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
   // True when inside a render pass or dynamic rendering block.
   bool in_render_pass_ = false;

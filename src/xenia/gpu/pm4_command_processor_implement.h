@@ -87,9 +87,25 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
   if (count != 0) {
     RingBuffer old_reader = reader_;
 
+    // XDroid360 HUD-1 F1 (temp): execute the copy taken at kick if any.
+    uint32_t xdroid_flags = 0;
+    const void* xdroid_source = nullptr;
+    auto xdroid_ib_source =
+        GetXdroidGpuHooks().ib_source.load(std::memory_order_acquire);
+    if (xdroid_ib_source) {
+      xdroid_source = xdroid_ib_source(ptr, count, &xdroid_flags);
+    }
+    if (xdroid_ib_depth_ < xdroid_ib_stack_.size()) {
+      xdroid_ib_stack_[xdroid_ib_depth_] = {ptr, count, xdroid_flags};
+    }
+    ++xdroid_ib_depth_;
+
     // Execute commands!
-    new (&reader_)
-        RingBuffer(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+    new (&reader_) RingBuffer(
+        xdroid_source
+            ? const_cast<uint8_t*>(static_cast<const uint8_t*>(xdroid_source))
+            : memory_->TranslatePhysical(ptr),
+        count * sizeof(uint32_t));
     reader_.set_write_offset(count * sizeof(uint32_t));
     // prefetch the wraparound range
     // it likely is already in L3 cache, but in a zen system it may be another
@@ -106,6 +122,14 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
         break;
       }
     } while (reader_.read_count());
+
+    --xdroid_ib_depth_;
+    if (xdroid_ib_source) {
+      if (auto xdroid_ib_end =
+              GetXdroidGpuHooks().ib_end.load(std::memory_order_acquire)) {
+        xdroid_ib_end();
+      }
+    }
 
     trace_writer_.WriteIndirectBufferEnd();
     reader_ = old_reader;
@@ -488,6 +512,22 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
     if (packet & 1) {
       bool any_pass = (bin_select_ & bin_mask_) != 0;
       if (!any_pass || opcode == PM4_XE_SWAP) {
+        // XDroid360 TILE-1: remember the window offset another tile sets.
+        if (opcode == PM4_SET_CONSTANT && count >= 2) {
+          uint32_t offset_type = reader_.ReadAndSwap<uint32_t>();
+          bool registers = ((offset_type >> 16) & 0xFF) == 4;
+          uint32_t first_register = 0x2000 + (offset_type & 0x7FF);
+          for (uint32_t i = 0; i + 1 < count; ++i) {
+            uint32_t value = reader_.ReadAndSwap<uint32_t>();
+            if (registers &&
+                first_register + i == XE_GPU_REG_PA_SC_WINDOW_OFFSET) {
+              xdroid_skipped_window_offset_ = value;
+              xdroid_skipped_window_offset_valid_ = true;
+            }
+          }
+          trace_writer_.WritePacketEnd();
+          return true;
+        }
         reader_.AdvanceRead(count * sizeof(uint32_t));
         trace_writer_.WritePacketEnd();
         return true;
@@ -812,6 +852,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
 
   // Advance the present-frame counter shown in the log prefix.
   logging::IncrementFrameNumber();
+  // XDroid360 (ADPF-1): one wake per frame for the performance hint.
+  xe::threading::PresentFrameGeneration().Bump();
 
   // Apply host frame rate limiting (separate from guest vblank timing)
   COMMAND_PROCESSOR::ThrottlePresentation();
@@ -879,6 +921,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  // XDroid360 LAT-1: wall time of the wait.
+  uint64_t xdroid_wait_begin_ns = 0;
 
   do {
     uint32_t value = value_ref;
@@ -904,6 +948,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     }
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
+    if (!matched && !xdroid_wait_begin_ns) {
+      xdroid_wait_begin_ns = uint64_t(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count());
+    }
     if (!matched) {
       // Wait using the duration specified by the guest.
       if (wait >= 0x100) {
@@ -937,6 +987,21 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     }
   } while (!matched);
 
+  if (xdroid_wait_begin_ns) {
+    uint64_t waited =
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count()) -
+        xdroid_wait_begin_ns;
+    XdroidGpuHooks& hooks = GetXdroidGpuHooks();
+    hooks.cp_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+    if (waited > hooks.cp_wait_longest_ns.load(std::memory_order_relaxed)) {
+      hooks.cp_wait_longest_ns.store(waited, std::memory_order_relaxed);
+      hooks.cp_wait_longest_addr.store(
+          is_memory ? poll_reg_addr : (poll_reg_addr | 0x80000000u),
+          std::memory_order_relaxed);
+    }
+  }
   return true;
 }
 XE_NOINLINE

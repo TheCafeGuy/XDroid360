@@ -33,6 +33,17 @@ class DeferredCommandBuffer {
   void Reset();
   void Execute(VkCommandBuffer command_buffer);
 
+  // GE-4 pass splice: a placeholder that executes a segment of commands
+  // recorded later, so work recorded while a render pass is open can still
+  // run before that pass's begin. Returns the placeholder's argument offset.
+  size_t CmdExecuteSegmentPlaceholder();
+  // Until EndSegment, every command goes to the segment of the placeholder at
+  // placeholder_arguments_offset instead of the main stream. Segments must be
+  // filled in placeholder order (one open render pass at a time).
+  void BeginSegment(size_t placeholder_arguments_offset);
+  void EndSegment();
+  bool is_recording_segment() const { return segment_placeholder_ != SIZE_MAX; }
+
   // Position of the arguments of the most recently written command, valid
   // until Reset, for patching a command after recording it.
   size_t last_command_arguments_offset() const {
@@ -179,6 +190,15 @@ class DeferredCommandBuffer {
     args.query_pool = query_pool;
     args.first_query = first_query;
     args.query_count = query_count;
+  }
+
+  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage,
+                           VkQueryPool query_pool, uint32_t query) {
+    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
+        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
+    args.pipeline_stage = pipeline_stage;
+    args.query_pool = query_pool;
+    args.query = query;
   }
 
   void CmdClearAttachmentsEmplace(uint32_t attachment_count,
@@ -532,6 +552,7 @@ class DeferredCommandBuffer {
 
  private:
   enum class Command {
+    kExecuteSegment,
     kVkBeginRenderPass,
     kVkBindDescriptorSets,
     kVkBindIndexBuffer,
@@ -541,6 +562,7 @@ class DeferredCommandBuffer {
     kVkEndQuery,
     kVkCopyQueryPoolResults,
     kVkResetQueryPool,
+    kVkWriteTimestamp,
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
@@ -657,6 +679,17 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
+  };
+
+  struct ArgsExecuteSegment {
+    size_t first;
+    size_t count;
+  };
+
+  struct ArgsVkWriteTimestamp {
+    VkPipelineStageFlagBits pipeline_stage;
+    VkQueryPool query_pool;
+    uint32_t query;
   };
 
   struct ArgsVkClearAttachments {
@@ -815,12 +848,18 @@ class DeferredCommandBuffer {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void ExecuteRange(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                    size_t stream_remaining);
 
   const VulkanCommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
   size_t last_arguments_offset_ = 0;
+  // GE-4: commands of all segments, each a contiguous range referenced by its
+  // placeholder in command_stream_.
+  std::vector<uintmax_t> segment_stream_;
+  size_t segment_placeholder_ = SIZE_MAX;
 };
 
 }  // namespace vulkan

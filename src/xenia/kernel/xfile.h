@@ -218,6 +218,10 @@ class XFile : public XObject {
 
   // Holds the request open until |deadline_ms| by parking the calling fiber.
   void AwaitDriveTime(uint64_t deadline_ms);
+  // Feeds the load_probe cvar's burst log.
+  void RecordLoadProbe(uint64_t offset, uint32_t length, int64_t t0_us,
+                       int64_t t1_us, uint64_t reserve_ms,
+                       uint64_t deadline_ms);
 
   // Bodies run on an I/O worker via RunSynchronousIo. All take file_lock_
   // themselves except ReadInternal, which runs under one its caller holds.

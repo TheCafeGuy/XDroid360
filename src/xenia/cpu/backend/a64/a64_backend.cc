@@ -236,6 +236,12 @@ GuestToHostThunk A64HelperEmitter::EmitGuestToHostThunk() {
 
   code_offsets.prolog = getSize();
 
+  // Guest call site for the CPU sampler (guest_sampler.h); one store.
+  static_assert(offsetof(ppc::PPCContext, host_call_return) % 8 == 0 &&
+                offsetof(ppc::PPCContext, host_call_return) < 32768);
+  str(x30, ptr(x20, static_cast<uint32_t>(
+                        offsetof(ppc::PPCContext, host_call_return))));
+
   // The guest JIT uses v4-v15, v16-v31 as allocatable VEC regs.
   // v0-v7, v16-v31 are caller-saved in AAPCS64 (fully clobbered by C).
   // v8-v15 lower 64 bits are callee-saved, but upper 64 bits are not.

@@ -14,13 +14,13 @@
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "third_party/stb/stb_image_write.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/threading.h"
-#include "xenia/base/wake_generation.h"
 #include "xenia/config.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/graphics_system.h"
@@ -652,6 +652,11 @@ XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
   XE_UNLIKELY_IF(cvars::log_ringbuffer_kickoff_initiator_bts) {
     LogKickoffInitator(value);
+  }
+  if (auto before_publish = GetXdroidGpuHooks().before_publish.load(
+          std::memory_order_acquire)) {
+    before_publish(memory_, primary_buffer_ptr_, primary_buffer_size_ / 4,
+                   write_ptr_index_.load(std::memory_order_relaxed), value);
   }
   write_ptr_index_ = value;
   if (auto on_kick =

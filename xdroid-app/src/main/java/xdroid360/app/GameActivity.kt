@@ -1,6 +1,8 @@
 package xdroid360.app
 
 import android.app.AlertDialog
+import android.app.GameManager
+import android.app.GameState
 import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.hardware.input.InputManager
@@ -149,6 +151,8 @@ class GameActivity : ComponentActivity() {
         menuState.menuOpen = true
       }
 
+      override fun glitch() = markGlitch()
+
       override fun setFastForward(on: Boolean) = this@GameActivity.setFastForward(on)
     }
   private val deviceListener =
@@ -217,7 +221,7 @@ class GameActivity : ComponentActivity() {
         }
       }
     root.addView(surfaceView, matchParent())
-    // Under the overlay: the stats box and the flag keep their touches.
+    // Under the overlay: the stats box keeps its touches.
     touchPad =
       TouchPadView(this, settings, padSink) { c ->
         editorState.selectedId = c?.id.orEmpty()
@@ -290,6 +294,7 @@ class GameActivity : ComponentActivity() {
   override fun onStart() {
     super.onStart()
     stopped = false
+    reportGameState(loading = !booted)
     if (!booted) return
     SessionReports.setState(this, "foreground")
     forensics?.event("start")
@@ -390,6 +395,8 @@ class GameActivity : ComponentActivity() {
     val cache = File(cacheDir, "xdroid").apply { mkdirs() }
     val driverPath = prefs().getString("driver_path", "").orEmpty()
     SessionReports.recoverDeadSession(this)?.let { setStatus(it) }
+    val diagnostics = Diagnostics.enabled(storage)
+    Diagnostics.linkLog(this, storage, diagnostics)
     SessionReports.begin(this, gamePath)
     val rc =
       Bridge.boot(this, assets, storage.absolutePath, cache.absolutePath, gamePath, driverPath)
@@ -398,10 +405,12 @@ class GameActivity : ComponentActivity() {
       return
     }
     booted = true
+    reportGameState(loading = false)
     forensics =
-      Forensics(this, gamePath).also {
+      if (!diagnostics) null
+      else Forensics(this, gamePath).also {
         it.begin(prefs().getString("driver_name", "").orEmpty().ifEmpty { "system" })
-        Toast.makeText(this, "Forensic build: data goes to Download/${it.zipFile.name}", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "Diagnostics on: data goes to Download/${it.zipFile.name}", Toast.LENGTH_LONG).show()
       }
     Bridge.setFastForward(false)
     // The surface may predate the boot, with no more callbacks coming.
@@ -581,6 +590,9 @@ class GameActivity : ComponentActivity() {
     liveFile.poll()?.let { live ->
       if (settings.applyLive(live)) runOnUiThread { touchPad.settingsChanged() }
       live["xdroid_frame_rate_vote"]?.let { frameRateVoter.enabled = it == "true" }
+      live["xdroid_display_high_refresh"]?.let { frameRateVoter.highRefresh = it == "true" }
+      // ADPF-1: the native per-frame hint owns the session when on.
+      live["xdroid_adpf"]?.let { perfHint.enabled = it.trim() == "0" }
       // DISP-4 A/B: the stats overlay redraws a full-size layer every second.
       live["xdroid_show_stats"]?.let { show -> runOnUiThread { menuState.showStats = show == "true" } }
     }
@@ -711,6 +723,9 @@ class GameActivity : ComponentActivity() {
     lifecycleExecutor.execute {
       try {
         java.io.File(filesDir, "xdroid/logs/glitch-marks.txt").appendText(line + "\n")
+        // MC-1: with Diagnostics on the emulator saves the last 6 s (frames,
+        // audio, frame times) to xdroid/clips/.
+        java.io.File(filesDir, "xdroid/clip.req").writeText("$frame\n")
       } catch (e: java.io.IOException) {
         Log.w("XDroid360", "glitch mark not saved: $e")
       }
@@ -789,9 +804,10 @@ class GameActivity : ComponentActivity() {
       KeyEvent.KEYCODE_BUTTON_R2 -> sendAxis(AXIS_RT, 1f)
       else -> {
         if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT) selectHeld = true
-        // Select + Start opens the menu; Start is not forwarded then.
+        // Select + Start marks a glitch (what the auto-catcher cannot see:
+        // wrong colors, missing geometry, A/V desync); Start is not forwarded.
         if (keyCode == KeyEvent.KEYCODE_BUTTON_START && selectHeld) {
-          if (first) toggleMenu()
+          if (first) markGlitch()
           return true
         }
         val mask = BUTTON_MAP[keyCode] ?: return super.onKeyDown(keyCode, event)
@@ -902,6 +918,16 @@ class GameActivity : ComponentActivity() {
     )
 
   @Suppress("DEPRECATION")
+  // Tells the platform game service (Game Dashboard and OEM boosters that read
+  // GameManager) whether the emulator is loading or in gameplay.
+  private fun reportGameState(loading: Boolean) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    runCatching {
+      getSystemService(GameManager::class.java)
+        ?.setGameState(GameState(loading, GameState.MODE_GAMEPLAY_INTERRUPTIBLE))
+    }
+  }
+
   private fun hideSystemUi() {
     window.addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN)
     window.decorView.systemUiVisibility =

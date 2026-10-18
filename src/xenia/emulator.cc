@@ -69,6 +69,8 @@
 #include "xenia/cpu/backend/a64/a64_backend.h"
 #endif  // XE_ARCH
 
+DECLARE_bool(load_probe);
+
 DEFINE_double(time_scalar, 1.0,
               "Scalar used to speed or slow time (1x, 2x, 1/2x, etc).",
               "General");
@@ -2098,7 +2100,12 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
   auto xam = kernel_state()->GetKernelModule<kernel::xam::XamModule>("xam.xex");
 
   XELOGI("Loading module {}", module_path);
+  const uint64_t probe_launch_ms = Clock::QueryHostUptimeMillis();
   auto module = kernel_state_->LoadUserModule(module_path);
+  if (cvars::load_probe) {
+    XELOGI("LOADPROBE phase=xex_load ms={}",
+           Clock::QueryHostUptimeMillis() - probe_launch_ms);
+  }
   if (!module) {
     XELOGE("Failed to load user module {}", path);
     return X_STATUS_NOT_FOUND;
@@ -2120,6 +2127,10 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
   if (XFAILED(result)) {
     XELOGE("Failed to initialize user module {}", path);
     return result;
+  }
+  if (cvars::load_probe) {
+    XELOGI("LOADPROBE phase=module_ready ms={}",
+           Clock::QueryHostUptimeMillis() - probe_launch_ms);
   }
   // Grab the current title ID.
   xex2_opt_execution_info* info = nullptr;
@@ -2278,7 +2289,13 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
     on_shader_storage_initialization(true);
     graphics_system_->InitializeShaderStorage(
         cache_root_, title_id_.value(), false,
-        [this]() { on_shader_storage_initialization(false); });
+        [this, probe_launch_ms]() {
+          if (cvars::load_probe) {
+            XELOGI("LOADPROBE phase=shader_storage_ready ms={}",
+                   Clock::QueryHostUptimeMillis() - probe_launch_ms);
+          }
+          on_shader_storage_initialization(false);
+        });
   }
 
   auto main_thread = kernel_state_->LaunchModule(module);

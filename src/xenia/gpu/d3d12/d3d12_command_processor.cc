@@ -12,6 +12,7 @@
 #include <cstdarg>
 #include <cstring>
 
+#include "xenia/base/wake_generation.h"
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/clock.h"
@@ -19,7 +20,6 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 #include "xenia/base/profiling.h"
-#include "xenia/base/wake_generation.h"
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_zpd_query_pool.h"
 #include "xenia/gpu/draw_util.h"

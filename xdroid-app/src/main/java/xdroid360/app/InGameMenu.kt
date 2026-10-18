@@ -134,23 +134,6 @@ fun InGameOverlay(state: InGameState, host: InGameHost) {
           }
         }
       }
-      // Glitch flag (top-center): tap reports a glitch, hold opens the menu.
-      if (!state.menuOpen && !state.touchEditing) {
-        Text(
-          "⚑",
-          color = Color(0x88FFFFFF),
-          fontSize = 18.sp,
-          modifier = Modifier
-            .align(Alignment.TopCenter)
-            .pointerInput(Unit) {
-              detectTapGestures(
-                onTap = { host.markGlitch() },
-                onLongPress = { state.menuOpen = true },
-              )
-            }
-            .padding(horizontal = 24.dp, vertical = 2.dp),
-        )
-      }
       // The game dims behind the panel; a tap outside closes it.
       AnimatedVisibility(visible = state.menuOpen, enter = fadeIn(tween(150)), exit = fadeOut(tween(150))) {
         Box(

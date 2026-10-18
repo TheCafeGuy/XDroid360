@@ -11,14 +11,25 @@
 #include "xenia/vfs/virtual_file_system.h"
 
 #include <algorithm>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <string>
 
 #include "xenia/base/byte_stream.h"
 #include "xenia/base/clock.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/xthread.h"
+
+DEFINE_bool(load_probe, false,
+            "Log storage load bursts (LOADPROBE lines): bytes, request count, "
+            "seeks, host read time and drive-model wait, to split load time "
+            "into host I/O, drive pacing and guest work. Diagnostics only.",
+            "Storage");
 
 namespace xe {
 namespace kernel {
@@ -27,6 +38,113 @@ namespace {
 // What the I/O manager waits with for a title's synchronous request.
 constexpr uint32_t kWaitReasonExecutive = 0;
 constexpr uint32_t kUserMode = 1;
+
+// Groups title reads into bursts separated by idle gaps, and logs one line
+// per burst (plus a progress line while one runs long, e.g. streaming).
+class LoadProbe {
+ public:
+  static int64_t NowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  void Record(const std::string& name, uint64_t offset, uint32_t length,
+              int64_t start_us, int64_t host_us, int64_t wait_us,
+              int64_t modeled_us) {
+    std::lock_guard<std::mutex> lock(lock_);
+    const int64_t now = NowUs();
+    if (reads_ && start_us - last_end_us_ > kGapUs) {
+      Flush("burst", last_end_us_);
+      Reset();
+    }
+    if (!reads_) {
+      start_us_ = start_us;
+      last_tick_us_ = start_us;
+      wall_start_ms_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    }
+    const bool seek = &name != last_name_ || offset != next_offset_;
+    last_name_ = &name;
+    next_offset_ = offset + length;
+    ++reads_;
+    seeks_ += seek ? 1 : 0;
+    bytes_ += length;
+    host_us_ += host_us;
+    wait_us_ += wait_us;
+    modeled_us_ += modeled_us;
+    max_host_us_ = std::max(max_host_us_, host_us);
+    file_bytes_[name] += length;
+    last_end_us_ = now;
+    if (now - last_tick_us_ > kTickUs) {
+      Flush("progress", now);
+      last_tick_us_ = now;
+    }
+  }
+
+ private:
+  static constexpr int64_t kGapUs = 1500000;
+  static constexpr int64_t kTickUs = 5000000;
+
+  void Reset() {
+    reads_ = seeks_ = bytes_ = 0;
+    host_us_ = wait_us_ = modeled_us_ = max_host_us_ = 0;
+    file_bytes_.clear();
+    last_name_ = nullptr;
+  }
+
+  void Flush(const char* kind, int64_t end_us) {
+    const double dur_ms = double(end_us - start_us_) / 1000.0;
+    const double host_ms = double(host_us_) / 1000.0;
+    const double wait_ms = double(wait_us_) / 1000.0;
+    const double mb = double(bytes_) / (1024.0 * 1024.0);
+    // Wall time neither reading nor drive-waiting: guest work, mostly.
+    const double other_ms = std::max(0.0, dur_ms - host_ms - wait_ms);
+    std::string top;
+    std::multimap<uint64_t, const std::string*, std::greater<uint64_t>> order;
+    for (auto& it : file_bytes_) {
+      order.emplace(it.second, &it.first);
+    }
+    int n = 0;
+    for (auto& it : order) {
+      if (n++ == 3) {
+        break;
+      }
+      top += fmt::format("{}{}:{:.1f}MB", top.empty() ? "" : ",", *it.second,
+                         double(it.first) / (1024.0 * 1024.0));
+    }
+    XELOGI(
+        "LOADPROBE {} wall_ms={} dur_ms={:.0f} reads={} seeks={} MB={:.2f} "
+        "host_io_ms={:.0f} max_req_ms={:.1f} drive_wait_ms={:.0f} "
+        "modeled_ms={:.0f} other_ms={:.0f} host_MBps={:.1f} top={}",
+        kind, wall_start_ms_, dur_ms, reads_, seeks_, mb, host_ms,
+        double(max_host_us_) / 1000.0, wait_ms,
+        double(modeled_us_) / 1000.0, other_ms,
+        host_ms > 0 ? mb / (host_ms / 1000.0) : 0.0, top);
+  }
+
+  std::mutex lock_;
+  int64_t start_us_ = 0;
+  int64_t last_end_us_ = 0;
+  int64_t last_tick_us_ = 0;
+  int64_t wall_start_ms_ = 0;
+  uint64_t reads_ = 0;
+  uint64_t seeks_ = 0;
+  uint64_t bytes_ = 0;
+  int64_t host_us_ = 0;
+  int64_t wait_us_ = 0;
+  int64_t modeled_us_ = 0;
+  int64_t max_host_us_ = 0;
+  const std::string* last_name_ = nullptr;
+  uint64_t next_offset_ = 0;
+  std::map<std::string, uint64_t> file_bytes_;
+};
+
+LoadProbe& load_probe() {
+  static LoadProbe probe;
+  return probe;
+}
 }  // namespace
 
 XFile::XFile(KernelState* kernel_state, vfs::File* file, bool synchronous,
@@ -196,6 +314,11 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length,
   // file_lock_ is taken inside the closure, on an I/O worker, so it is never
   // held while the calling fiber waits.
   // Booked before the offload, so requests queue in the order they are issued.
+  const bool probe = cvars::load_probe;
+  const uint64_t probe_offset =
+      byte_offset == uint64_t(-1) ? position_.load() : byte_offset;
+  const int64_t t0 = probe ? LoadProbe::NowUs() : 0;
+  const uint64_t reserve_ms = probe ? Clock::QueryHostUptimeMillis() : 0;
   const uint64_t deadline_ms = ReserveDriveTime(byte_offset, buffer_length);
   X_STATUS result = X_STATUS_SUCCESS;
   RunSynchronousIo([&]() {
@@ -203,7 +326,12 @@ X_STATUS XFile::Read(uint32_t buffer_guest_address, uint32_t buffer_length,
     result = ReadInternal(buffer_guest_address, buffer_length, byte_offset,
                           out_bytes_read, apc_context, notify_completion);
   });
+  const int64_t t1 = probe ? LoadProbe::NowUs() : 0;
   AwaitDriveTime(deadline_ms);
+  if (probe) {
+    RecordLoadProbe(probe_offset, buffer_length, t0, t1, reserve_ms,
+                    deadline_ms);
+  }
   return result;
 }
 
@@ -333,6 +461,17 @@ uint64_t XFile::ReserveDriveTime(uint64_t byte_offset, uint32_t length) {
   return device()->drive_timing().Reserve(file_->entry(), offset, length);
 }
 
+void XFile::RecordLoadProbe(uint64_t offset, uint32_t length, int64_t t0_us,
+                            int64_t t1_us, uint64_t reserve_ms,
+                            uint64_t deadline_ms) {
+  const int64_t t2 = LoadProbe::NowUs();
+  // Includes any backlog queued ahead of this request.
+  const int64_t modeled_us =
+      deadline_ms > reserve_ms ? int64_t(deadline_ms - reserve_ms) * 1000 : 0;
+  load_probe().Record(file_->entry()->name(), offset, length, t0_us,
+                      t1_us - t0_us, t2 - t1_us, modeled_us);
+}
+
 void XFile::AwaitDriveTime(uint64_t deadline_ms) {
   if (!deadline_ms) {
     return;
@@ -362,6 +501,11 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length,
                             uint64_t byte_offset, uint32_t* out_bytes_read,
                             uint32_t apc_context, bool notify_completion) {
   // The whole loop as one request, so the fiber waits once.
+  const bool probe = cvars::load_probe;
+  const uint64_t probe_offset =
+      byte_offset == uint64_t(-1) ? position_.load() : byte_offset;
+  const int64_t t0 = probe ? LoadProbe::NowUs() : 0;
+  const uint64_t reserve_ms = probe ? Clock::QueryHostUptimeMillis() : 0;
   const uint64_t deadline_ms = ReserveDriveTime(byte_offset, length);
   X_STATUS result = X_STATUS_SUCCESS;
   RunSynchronousIo([&]() {
@@ -369,7 +513,11 @@ X_STATUS XFile::ReadScatter(uint32_t segments_guest_address, uint32_t length,
         ReadScatterInternal(segments_guest_address, length, byte_offset,
                             out_bytes_read, apc_context, notify_completion);
   });
+  const int64_t t1 = probe ? LoadProbe::NowUs() : 0;
   AwaitDriveTime(deadline_ms);
+  if (probe) {
+    RecordLoadProbe(probe_offset, length, t0, t1, reserve_ms, deadline_ms);
+  }
   return result;
 }
 

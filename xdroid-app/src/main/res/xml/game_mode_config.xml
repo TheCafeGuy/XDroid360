@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Platform Game Mode (Android 12+ on some devices, all Android 13+). The
+     emulator handles both modes itself, so the system applies none of its
+     interventions; downscaling and FPS overrides would cost image quality
+     or add latency. -->
+<game-mode-config xmlns:android="http://schemas.android.com/apk/res/android"
+    android:supportsBatteryGameMode="true"
+    android:supportsPerformanceGameMode="true"
+    android:allowGameDownscaling="false"
+    android:allowGameFpsOverride="false" />

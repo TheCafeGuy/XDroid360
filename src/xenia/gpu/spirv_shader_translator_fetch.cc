@@ -24,6 +24,24 @@
 #include "xenia/gpu/spirv_compatibility.h"
 
 DECLARE_bool(spirv_fine_derivatives);
+DECLARE_bool(xdroid_shader_sign_spec);
+DEFINE_bool(xdroid_tfetch_implicit_lod, true,
+            "SHD-2: sample 2D textures with automatic LOD (implicit derivatives "
+            "+ the gradient exponent bias as a LOD bias, as cube and 3D already "
+            "do) instead of explicit gradients. Boot only.",
+            "GPU");
+DECLARE_bool(xdroid_shader_vfetch_spec);
+DEFINE_int32(xdroid_shd_bound_vendian, -1,
+             "SHD-1 bound experiment (may be WRONG, diagnostics only): if >= 0, "
+             "every vertex fetch uses this endianness instead of the fetch "
+             "constant's, so the swap folds.",
+             "GPU");
+DEFINE_bool(xdroid_shd_bound_signs, false,
+            "SHD-1 bound experiment (WRONG OUTPUT, diagnostics only): treat "
+            "every texture component as unsigned at translation time, so the "
+            "driver folds the per-component sign switches; measures what "
+            "specializing texture signs could save.",
+            "GPU");
 
 DEFINE_string(
     deswizzle_identity_ps_hashes, "",
@@ -271,10 +289,26 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
 
   // Endian swap the words, getting the endianness from bits 0:1 of the second
   // fetch constant word (loaded above).
-  words = EndianSwap32Uint(
-      words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+  spv::Id endian;
+  if (cvars::xdroid_shd_bound_vendian >= 0) {
+    endian = builder_->makeUintConstant(
+        uint32_t(cvars::xdroid_shd_bound_vendian) & 0b11);
+  } else if (cvars::xdroid_shader_vfetch_spec && IsSpirvVertexShader()) {
+    // SHD-1e: from the pipeline (PipelineDescription::vs_vfetch_endian).
+    uint32_t vfetch_index = instr.operands[1].storage_index;
+    spv::Id& spec = spec_vfetch_endian_[vfetch_index];
+    if (spec == spv::NoResult) {
+      spec = builder_->makeUintConstant(0, true);
+      builder_->addDecoration(spec, spv::DecorationSpecId,
+                              int(64 + vfetch_index));
+    }
+    endian = spec;
+  } else {
+    endian = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
                                    fetch_constant_word_1,
-                                   builder_->makeUintConstant(0b11)));
+                                   builder_->makeUintConstant(0b11));
+  }
+  words = EndianSwap32Uint(words, endian);
 
   spv::Id result = spv::NoResult;
 
@@ -780,9 +814,10 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
         GetSpirvShaderModification().pixel.param_gen_enable &&
         input_fragment_coordinates_ != spv::NoResult) {
-      const std::string& hashes = cvars::deswizzle_identity_ps_hashes.empty()
-                                      ? title_deswizzle_identity_ps_hashes
-                                      : cvars::deswizzle_identity_ps_hashes;
+      const std::string& hashes =
+          cvars::deswizzle_identity_ps_hashes.empty()
+              ? title_deswizzle_identity_ps_hashes
+              : cvars::deswizzle_identity_ps_hashes;
       deswizzle_identity =
           !hashes.empty() &&
           UcodeHashSlotInList(current_shader().ucode_data_hash(),
@@ -1789,11 +1824,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       // All 32 bits containing the values for 4 fetch constants (use
       // OpBitFieldUExtract to get the signednesses for the specific components
       // of this texture).
-      spv::Id swizzled_signs_word =
-          builder_->createLoad(builder_->createAccessChain(
-                                   spv::StorageClassUniform,
-                                   uniform_system_constants_, id_vector_temp_),
-                               spv::NoPrecision);
+      spv::Id swizzled_signs_word;
+      if (cvars::xdroid_shd_bound_signs) {
+        swizzled_signs_word = const_uint_0_;
+      } else if (cvars::xdroid_shader_sign_spec && is_pixel_shader()) {
+        // SHD-1c: the pipeline supplies the word (VulkanPipelineCache fills
+        // PipelineDescription::ps_texture_swizzled_signs).
+        uint32_t word_index = fetch_constant_index >> 2;
+        spv::Id& spec = spec_texture_swizzled_signs_[word_index];
+        if (spec == spv::NoResult) {
+          spec = builder_->makeUintConstant(0, true);
+          builder_->addDecoration(spec, spv::DecorationSpecId,
+                                  int(word_index));
+        }
+        swizzled_signs_word = spec;
+      } else {
+        swizzled_signs_word = builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassUniform,
+                                        uniform_system_constants_,
+                                        id_vector_temp_),
+            spv::NoPrecision);
+      }
       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
 
       spv::Builder::TextureParameters texture_parameters = {};
@@ -1978,10 +2029,14 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         // explicit 3D gradients of a coordinate that is constant across the
         // quad make NVIDIA return a different texel in one lane of the quad.
         // 1D and 2D keep explicit gradients.
+        // SHD-2 (xdroid_tfetch_implicit_lod): 2D too - an explicit-gradient
+        // sample costs Adreno extra cycles per quad over an implicit one.
         bool use_lod_bias =
             use_computed_lod && !instr.attributes.use_register_gradients &&
             (instr.dimension == xenos::FetchOpDimension::kCube ||
-             instr.dimension == xenos::FetchOpDimension::k3DOrStacked);
+             instr.dimension == xenos::FetchOpDimension::k3DOrStacked ||
+             (cvars::xdroid_tfetch_implicit_lod &&
+              instr.dimension == xenos::FetchOpDimension::k2D));
 
         if (use_lod_bias) {
           // The per-axis gradient exponent biases can't be applied to the

@@ -70,6 +70,8 @@ class PipelineCreationQueue {
     {
       std::lock_guard<std::mutex> lock(lock_);
       queue_ = {};
+      warmup_queue_ = {};
+      live_pending_ = 0;
       completion_callback_ = nullptr;
       completion_set_event_ = false;
     }
@@ -113,9 +115,15 @@ class PipelineCreationQueue {
   void Push(TRequest request) { PushRequest(std::move(request), true); }
 
   // Queues one nothing is drawing yet (the storage warm-up), stored as soon as
-  // it is built.
-  void PushUnordered(TRequest request) {
-    PushRequest(std::move(request), false);
+  // it is built. With low_priority it waits in a queue of its own that the
+  // threads only take from when nothing the game is drawing is queued
+  // (XDroid360 SHADER-1, xdroid_pipeline_live_first).
+  void PushUnordered(TRequest request, bool low_priority = false) {
+    {
+      std::lock_guard<std::mutex> lock(lock_);
+      (low_priority ? warmup_queue_ : queue_).emplace(0, std::move(request));
+    }
+    cond_.notify_one();
   }
 
   // Whether anything is queued or being created.
@@ -125,6 +133,59 @@ class PipelineCreationQueue {
     }
     std::lock_guard<std::mutex> lock(lock_);
     return IsBusyLocked();
+  }
+
+  // Drawn pipelines (Push requests) queued or being created.
+  size_t LivePendingCount() {
+    if (threads_.empty()) {
+      return 0;
+    }
+    std::lock_guard<std::mutex> lock(lock_);
+    return live_pending_;
+  }
+
+  // Whether a pipeline the game is drawing (a Push, not the warm-up) is still
+  // queued or being created. Ordered publishing means none is still held back
+  // either once this is false.
+  bool IsLiveBusy() {
+    if (threads_.empty()) {
+      return false;
+    }
+    std::lock_guard<std::mutex> lock(lock_);
+    return live_pending_ != 0;
+  }
+
+  // Requests the game is drawing still pending, and everything queued.
+  void GetPendingCounts(size_t& live, size_t& queued) {
+    std::lock_guard<std::mutex> lock(lock_);
+    live = live_pending_;
+    queued = queue_.size() + warmup_queue_.size();
+  }
+
+  // Blocks until |done| (read under the queue lock after each pipeline is
+  // stored) returns true, or nothing is left to create. Lets a draw wait for
+  // its own pipeline instead of the whole queue (XDroid360 SHADER-1).
+  template <typename F>
+  void AwaitUntil(F&& done) {
+    if (threads_.empty()) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(lock_);
+    while (!done() && IsBusyLocked()) {
+      created_cond_.wait(lock);
+    }
+  }
+
+  // Blocks until every pipeline the game is drawing has been created and
+  // stored, leaving the low priority warm-up running.
+  void AwaitLive() {
+    if (threads_.empty()) {
+      return;
+    }
+    std::unique_lock<std::mutex> lock(lock_);
+    while (live_pending_ != 0) {
+      created_cond_.wait(lock);
+    }
   }
 
   // Wakes a creation thread without waiting for it.
@@ -169,7 +230,10 @@ class PipelineCreationQueue {
   }
 
  private:
-  bool IsBusyLocked() const { return !queue_.empty() || threads_busy_ != 0; }
+  bool HasQueuedLocked() const {
+    return !queue_.empty() || !warmup_queue_.empty();
+  }
+  bool IsBusyLocked() const { return HasQueuedLocked() || threads_busy_ != 0; }
 
   void PushRequest(TRequest request, bool ordered) {
     {
@@ -178,6 +242,9 @@ class PipelineCreationQueue {
       // matches the queue order.
       queue_.emplace(ordered ? publish_order_.NextSequence() : 0,
                      std::move(request));
+      if (ordered) {
+        ++live_pending_;
+      }
     }
     cond_.notify_one();
   }
@@ -188,15 +255,17 @@ class PipelineCreationQueue {
     uint32_t sequence;
     {
       std::lock_guard<std::mutex> lock(lock_);
-      if (queue_.empty()) {
+      if (!HasQueuedLocked()) {
         return false;
       }
+      // The low priority warm-up only when nothing else is queued.
+      auto& source = queue_.empty() ? warmup_queue_ : queue_;
       // Busy until the pipeline is created rather than just dequeued: other
       // threads must be able to take requests, but must not report completion
       // while this one is still building.
-      sequence = queue_.front().first;
-      request = std::move(queue_.front().second);
-      queue_.pop();
+      sequence = source.front().first;
+      request = std::move(source.front().second);
+      source.pop();
       ++threads_busy_;
     }
     THandle handle = creator_(request, context);
@@ -208,6 +277,10 @@ class PipelineCreationQueue {
                            });
     std::unique_lock<std::mutex> lock(lock_);
     --threads_busy_;
+    if (sequence && live_pending_) {
+      --live_pending_;
+    }
+    created_cond_.notify_all();
     SignalCompletionLocked(lock);
     return true;
   }
@@ -241,7 +314,7 @@ class PipelineCreationQueue {
         std::unique_lock<std::mutex> lock(lock_);
         // A thread being shut down stops taking work, leaving the rest of the
         // queue to whoever is left.
-        if (thread_index >= threads_shutdown_from_ || queue_.empty()) {
+        if (thread_index >= threads_shutdown_from_ || !HasQueuedLocked()) {
           // Also the path a thread woken only to report completion takes.
           SignalCompletionLocked(lock);
           if (thread_index >= threads_shutdown_from_) {
@@ -266,6 +339,12 @@ class PipelineCreationQueue {
   // cached - so this holds nothing but requests waiting for a thread. FIFO, so
   // they build in the order the game first drew them.
   std::queue<std::pair<uint32_t, TRequest>> queue_;
+  // Low priority warm-up requests, taken only while queue_ is empty.
+  std::queue<std::pair<uint32_t, TRequest>> warmup_queue_;
+  // Ordered requests pushed and not yet created. Guarded by lock_.
+  size_t live_pending_ = 0;
+  // Notified after every created pipeline, for AwaitUntil.
+  std::condition_variable created_cond_;
   PipelinePublishOrder<Publication> publish_order_;
   // Threads that have taken a request but not finished creating it. Guarded by
   // lock_.

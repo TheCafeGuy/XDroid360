@@ -16,6 +16,8 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "xenia/base/hash.h"
 #include "xenia/base/xxhash.h"
@@ -124,6 +126,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // length was written).
   // written_scaled_out: whether the data went to the scaled resolve address
   // space rather than shared memory (native resolves don't).
+  // XR-4 Phase 0: how the last Resolve went (direct compute resolve, and
+  // whether it also cleared the render target).
+  bool last_resolve_direct() const { return last_resolve_direct_; }
+  bool last_resolve_cleared() const { return last_resolve_cleared_; }
   bool Resolve(const Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out,
@@ -154,6 +160,34 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       uint32_t* color_attachment_count_out,
       VkRenderingAttachmentInfo* depth_attachment,
       VkRenderingAttachmentInfo* stencil_attachment) const;
+
+  // TILE-1 (xdroid_tile_merge): a predicated-tiling frame replays the same
+  // draws once per EDRAM tile. While merging, the draws of the first tile go
+  // to render targets twice as wide (the two tiles side by side, depth
+  // starting cleared), and each tile's resolves read its half of them.
+  bool TileMergeBegin(uint32_t tile_width);
+  // Watches the first tile without merging: whether it binds one set of
+  // render targets of the tile's width throughout.
+  void TileMergeObserveBegin(uint32_t tile_width);
+  bool TileMergeObservedClean() const {
+    return tile_merge_state_ == TileMergeState::kObserving &&
+           tile_merge_observe_clean_;
+  }
+  uint32_t tile_merge_aborts() const { return tile_merge_aborts_; }
+  // From now on resolves of the guest render targets read tile `tile`.
+  void TileMergeResolveTile(uint32_t tile);
+  // Stops merging; while drawing or resolving the first tile, the guest
+  // render targets first get the first tile's half.
+  void TileMergeAbort(const char* reason);
+  void TileMergeEnd() { tile_merge_state_ = TileMergeState::kOff; }
+  bool tile_merge_drawing() const {
+    return tile_merge_state_ == TileMergeState::kDrawing;
+  }
+  bool tile_merge_resolving() const {
+    return tile_merge_state_ == TileMergeState::kResolving;
+  }
+  uint32_t tile_merge_resolve_tile() const { return tile_merge_resolve_tile_; }
+  uint32_t tile_merge_width() const { return tile_merge_width_; }
 
   // Using R16G16[B16A16]_SNORM, which are -1...1, not the needed -32...32.
   // Persistent data doesn't depend on this, so can be overriden by per-game
@@ -200,6 +234,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     return fsi_render_pass_;
   }
 
+  // GE-4: the render targets of the last update, which the guest pass entered
+  // right after it binds (depth first), as opaque pointers.
+  void GetLastUpdateBoundRenderTargets(
+      std::array<const void*, 1 + xenos::kMaxColorRenderTargets>& out) const {
+    RenderTarget* const* render_targets =
+        last_update_accumulated_render_targets();
+    for (size_t i = 0; i < out.size(); ++i) {
+      out[i] = render_targets[i];
+    }
+  }
+
   VkFormat GetDepthVulkanFormat(xenos::DepthRenderTargetFormat format) const;
   VkFormat GetColorVulkanFormat(xenos::ColorRenderTargetFormat format) const;
   VkFormat GetColorOwnershipTransferVulkanFormat(
@@ -208,6 +253,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
  protected:
   bool IsGammaFormatHostStorageSeparate() const override;
+  bool IsDirectResolveAverageSupported() const override { return true; }
+  bool IsDirectResolveReadAs1xSupported() const override {
+    return !IsDrawResolutionScaled();
+  }
 
   uint32_t GetMaxRenderTargetWidth() const override;
   uint32_t GetMaxRenderTargetHeight() const override;
@@ -348,6 +397,30 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       last_update_framebuffer_attachments_[1 + xenos::kMaxColorRenderTargets] =
           {};
   const Framebuffer* last_update_framebuffer_ = VK_NULL_HANDLE;
+  // The render targets the last update bound (the wide ones while merging).
+  RenderTarget* last_update_bound_rts_[1 + xenos::kMaxColorRenderTargets] = {};
+
+  // TILE-1.
+  enum class TileMergeState { kOff, kObserving, kDrawing, kResolving };
+  bool tile_merge_observe_clean_ = false;
+  uint32_t tile_merge_aborts_ = 0;
+  TileMergeState tile_merge_state_ = TileMergeState::kOff;
+  uint32_t tile_merge_width_ = 0;
+  uint32_t tile_merge_resolve_tile_ = 0;
+  // The render target a resolve reads for `rt` and the X offset in tiles.
+  RenderTarget* TileMergeResolveSource(RenderTarget* rt,
+                                       uint32_t* x_offset_tiles) const;
+  // Per slot: the guest render target and its wide counterpart.
+  RenderTarget* tile_merge_guest_[1 + xenos::kMaxColorRenderTargets] = {};
+  RenderTarget* tile_merge_wide_[1 + xenos::kMaxColorRenderTargets] = {};
+  // Wide render targets by guest key, kept across frames.
+  std::vector<std::pair<uint32_t, RenderTarget*>> tile_merge_wide_cache_;
+  bool TileMergeMatches(RenderTarget* const* rts) const;
+  RenderTarget* TileMergeGetWide(RenderTarget* guest);
+  // Copies a width x height region between two render targets of one format.
+  void TileMergeCopy(RenderTarget* src, uint32_t src_x, RenderTarget* dst,
+                     const uint32_t* dst_xs, uint32_t dst_x_count,
+                     uint32_t width);
 
   // For host render targets.
 
@@ -584,6 +657,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     kDumpDescriptorSetCount,
   };
+  // TEX-1b: the linear scratch buffer of a link_scratch key, only in
+  // dump_pipeline_layout_color_link_ (compatible with the color one below it).
+  static constexpr uint32_t kDumpDescriptorSetLink = kDumpDescriptorSetCount;
 
   struct DumpInvocation {
     ResolveCopyDumpRectangle rectangle;
@@ -650,7 +726,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       const draw_util::ResolveCopyShaderConstants& copy_shader_constants,
       uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
       uint32_t dump_pitch, bool copy_dest_scaled,
-      VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache);
+      VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
+      bool link = false, bool link_spliced = false,
+      bool* linked_out = nullptr);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_ - with the plain 1x1
@@ -709,6 +787,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
   VkPipelineLayout dump_pipeline_layout_color_ = VK_NULL_HANDLE;
   VkPipelineLayout dump_pipeline_layout_depth_ = VK_NULL_HANDLE;
+  VkPipelineLayout dump_pipeline_layout_color_link_ = VK_NULL_HANDLE;
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<EdramDumpShaderKey, VkPipeline, EdramDumpShaderKey::Hasher>
@@ -732,6 +811,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   VkPipelineLayout resolve_fsi_clear_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_fsi_clear_32bpp_pipeline_ = VK_NULL_HANDLE;
   VkPipeline resolve_fsi_clear_64bpp_pipeline_ = VK_NULL_HANDLE;
+
+  bool last_resolve_direct_ = false;
+  bool last_resolve_cleared_ = false;
 };
 
 }  // namespace vulkan

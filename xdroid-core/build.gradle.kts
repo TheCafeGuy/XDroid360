@@ -38,6 +38,11 @@ android {
                     "-DLLVM_AR=$llvmBin/llvm-ar.exe",
                     "-DLLVM_RANLIB=$llvmBin/llvm-ranlib.exe",
                 )
+                // GPU-BENCH capture build only (-PxdroidGpuTrace=true): the
+                // trace writer costs ~0.5% CPU, so perf builds leave it out.
+                if (project.findProperty("xdroidGpuTrace") == "true") {
+                    arguments += "-DXENIA_ENABLE_GPU_TRACE=ON"
+                }
             }
         }
     }

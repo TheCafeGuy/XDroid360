@@ -47,6 +47,16 @@ class WakeGeneration {
               FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 #endif  // XE_PLATFORM_LINUX
     }
+    if (void (*hook)() = on_bump_.load(std::memory_order_acquire)) {
+      hook();
+    }
+  }
+
+  // XR-3: called after every Bump, on the bumping thread, for waiters that
+  // are not on the futex (guest fibers parked in the scheduler). Must be
+  // cheap when nobody waits.
+  void SetBumpHook(void (*hook)()) {
+    on_bump_.store(hook, std::memory_order_release);
   }
 
   // Returns once the value differs from `seen`, the timeout passes, or
@@ -72,12 +82,20 @@ class WakeGeneration {
                 "The futex word must be the atomic itself");
   std::atomic<uint32_t> value_{0};
   std::atomic<uint32_t> waiters_{0};
+  std::atomic<void (*)()> on_bump_{nullptr};
 };
 
 // Bumped by the GPU command processor after every write-back to guest memory
 // that a guest thread may be polling (fences, the ring read pointer), so a
 // guest spin-wait can sleep until one happens instead of spinning (CE-7).
 inline WakeGeneration& GuestGpuWritebackGeneration() {
+  static WakeGeneration generation;
+  return generation;
+}
+
+// XDroid360 (ADPF-1): bumped by the GPU command processor once per guest
+// swap, so the ADPF thread wakes once per frame instead of polling.
+inline WakeGeneration& PresentFrameGeneration() {
   static WakeGeneration generation;
   return generation;
 }

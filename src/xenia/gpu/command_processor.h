@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_COMMAND_PROCESSOR_H_
 #define XENIA_GPU_COMMAND_PROCESSOR_H_
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <deque>
@@ -24,6 +25,7 @@
 
 #include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xenos.h"
@@ -599,6 +601,16 @@ class CommandProcessor {
 
   uint32_t counter_ = 0;
 
+  // XDroid360 HUD-1 (temp): the indirect buffers being executed, innermost
+  // last, with their XdroidIbFlags.
+  struct XdroidIbFrame {
+    uint32_t ptr;
+    uint32_t dwords;
+    uint32_t flags;
+  };
+  std::array<XdroidIbFrame, 4> xdroid_ib_stack_{};
+  uint32_t xdroid_ib_depth_ = 0;
+
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
 
@@ -612,6 +624,10 @@ class CommandProcessor {
 
   uint64_t bin_select_ = 0xFFFFFFFFull;
   uint64_t bin_mask_ = 0xFFFFFFFFull;
+  // XDroid360 TILE-1: PA_SC_WINDOW_OFFSET of a predicated SET_CONSTANT
+  // skipped for the current tile (another tile's offset).
+  uint32_t xdroid_skipped_window_offset_ = 0;
+  bool xdroid_skipped_window_offset_valid_ = false;
 
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;

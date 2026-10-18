@@ -147,6 +147,30 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // before state is consumed. This was added so strict ZPD query paths stop
   // racing pipeline compilation and then blocking work on incomplete state.
   void AwaitPipelineCompletion();
+  // Waits for one pipeline's real creation. With xdroid_pipeline_targeted_wait
+  // only until that pipeline is stored, otherwise for the whole queue as
+  // AwaitPipelineCompletion (XDroid360 SHADER-1).
+  void AwaitPipeline(const Pipeline& pipeline);
+  // Queue depth for the shader stall counter.
+  void GetCreationQueueCounts(size_t& live, size_t& queued);
+
+  // XDroid360 SHADER-1: draw thread time spent compiling, per frame. Counted
+  // only on the slow paths that create something, so it costs nothing in a
+  // frame without new shaders.
+  struct DrawThreadCompileStats {
+    // Translation + creation of a pipeline with no async path (no pixel
+    // shader, async off or no creation threads).
+    uint32_t sync_pipeline_count = 0;
+    uint64_t sync_pipeline_ticks = 0;
+    // Placeholder pipelines (interpreter or real VS + no-op PS).
+    uint32_t placeholder_count = 0;
+    uint64_t placeholder_ticks = 0;
+  };
+  DrawThreadCompileStats TakeDrawThreadCompileStats() {
+    DrawThreadCompileStats stats = draw_thread_compile_stats_;
+    draw_thread_compile_stats_ = {};
+    return stats;
+  }
 
   VulkanShader* LoadShader(xenos::ShaderType shader_type,
                            const uint32_t* host_address, uint32_t dword_count);
@@ -308,6 +332,14 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
+    // SHD-1c: post-swizzle signs of the pixel shader's textures (8 bits per
+    // fetch constant, 4 per word, others zero), specialization constants of
+    // the pixel shader when xdroid_shader_sign_spec is on.
+    uint32_t ps_texture_swizzled_signs[8];
+    // SHD-1e: endianness (2 bits, 16 per word) of the vertex shader's vertex
+    // fetch constants, specialization constants 64+ of the vertex shader.
+    uint32_t vs_vfetch_endian[6];
+
     // Including all the padding, for a stable hash.
     PipelineDescription() { Reset(); }
     PipelineDescription(const PipelineDescription& description) {
@@ -328,7 +360,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
       }
     };
 
-    static constexpr uint32_t kVersion = 0x20260903;
+    static constexpr uint32_t kVersion = 0x20261017;
   });
 
   // Pipeline storage constants.
@@ -571,6 +603,8 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   // boot.
   bool startup_loading_ = false;
 
+  DrawThreadCompileStats draw_thread_compile_stats_;
+
   // Deferred destruction of pipelines.
   // Pipelines are only destroyed after the GPU submission that might reference
   // them has completed (tracked via submission numbers from command processor).
@@ -591,7 +625,8 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   std::filesystem::path vk_pipeline_cache_path_;
   // Periodic VkPipelineCache saves (see MaybeSaveVkPipelineCache).
   void WriteVkPipelineCacheLocked();
-  void MaybeSaveVkPipelineCache();
+  // Counts a new pipeline; writes only when may_write.
+  void MaybeSaveVkPipelineCache(bool may_write);
   std::mutex vk_pipeline_cache_save_mutex_;
   std::atomic<uint32_t> vk_pipeline_cache_unsaved_{0};
   std::chrono::steady_clock::time_point vk_pipeline_cache_last_save_ =

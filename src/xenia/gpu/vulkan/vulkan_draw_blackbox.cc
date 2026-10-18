@@ -75,7 +75,8 @@ void VulkanDrawBlackbox::OnFrameEnd(const Memory& memory, uint64_t frame) {
     }
     for (uint32_t j = 0; j < record.vertex_range_count; ++j) {
       Range& range = record.vertex[j];
-      range.hash_swap = HashGuest(memory, range.address, range.length, nullptr);
+      range.hash_swap =
+          HashGuest(memory, range.address, range.length, nullptr);
     }
   }
 }
@@ -113,7 +114,8 @@ void VulkanDrawBlackbox::Dump(const std::filesystem::path& dir, uint64_t n) {
       const Record& record = slot.records[i];
       text += fmt::format("f{} d{} vs={:016X} ps={:016X} prim={} count={}",
                           record.frame, record.draw, record.vs_hash,
-                          record.ps_hash, record.primitive, record.index_count);
+                          record.ps_hash, record.primitive,
+                          record.index_count);
       if (record.indexed) {
         text += fmt::format(" ifmt={} ioff={}", record.index_format,
                             record.index_offset);
@@ -121,6 +123,13 @@ void VulkanDrawBlackbox::Dump(const std::filesystem::path& dir, uint64_t n) {
       }
       for (uint32_t j = 0; j < record.vertex_range_count; ++j) {
         text += range_text("vb", record.vertex[j], true);
+      }
+      for (uint32_t j = 0; j < std::min<uint32_t>(record.ib_depth, 3); ++j) {
+        const auto& ib = record.ib_chain[j];
+        text += fmt::format(" ib{}={:08X}+{:X}{}{}{}", j + 1, ib[0], ib[1],
+                            ib[2] & 1 ? "" : " notkicked",
+                            ib[2] & 2 ? " copy" : "",
+                            ib[2] & 4 ? " CHANGED_SINCE_KICK" : "");
       }
       for (uint32_t j = 0; j < record.texture_count; ++j) {
         const auto& fetch = record.texture_fetch[j];

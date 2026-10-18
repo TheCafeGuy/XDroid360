@@ -13,6 +13,10 @@ namespace xdroid {
 // afterwards sticks.
 void ApplyTestedDefaults();
 
+// Forces the diagnostic cvars on or off per xdroid_diagnostics, every boot,
+// without writing them to the config.
+void ApplyDiagnostics();
+
 }  // namespace xdroid
 
 #endif  // XDROID_DEFAULTS_H_

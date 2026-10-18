@@ -8,7 +8,9 @@
  */
 
 #include "xenia/ui/vulkan/vulkan_presenter.h"
+#include "xenia/ui/xdroid_ui_hooks.h"
 
+#include <algorithm>
 #include <cstdint>
 
 #include "xenia/base/assert.h"
@@ -67,8 +69,14 @@ DEFINE_bool(vulkan_presenter_use_backing_scale, false,
             "Vulkan");
 #endif  // XE_PLATFORM_MAC
 
+DECLARE_int32(present_resolution_scale_percent);
+DECLARE_int32(present_max_height);
+
 namespace xe {
 namespace ui {
+
+std::atomic<void (*)()> g_xdroid_on_present{nullptr};
+
 namespace vulkan {
 
 namespace {
@@ -77,7 +85,12 @@ uint32_t GetSwapchainCreationCvars() {
   return uint32_t(cvars::present_prerotate) |
          (uint32_t(cvars::vulkan_allow_present_mode_immediate) << 1) |
          (uint32_t(cvars::vulkan_allow_present_mode_mailbox) << 2) |
-         (uint32_t(cvars::vulkan_allow_present_mode_fifo_relaxed) << 3);
+         (uint32_t(cvars::vulkan_allow_present_mode_fifo_relaxed) << 3) |
+         (uint32_t(std::min(
+              std::max(cvars::present_resolution_scale_percent, 25), 100))
+          << 4) |
+         (uint32_t(std::min(std::max(cvars::present_max_height, 0), 4095))
+          << 11);
 }
 
 uint32_t GetSurfaceTransformQuarterTurns(
@@ -107,6 +120,8 @@ namespace shaders {
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_rotate_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_snapdragon_gsr_ps.h"
+#include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_snapdragon_gsr_soft_ps.h"
 #include "xenia/ui/shaders/bytecode/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -209,6 +224,8 @@ VulkanPresenter::~VulkanPresenter() {
   }
   util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
                              paint_context_.guest_output_descriptor_pool);
+  util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device,
+                             paint_context_.paint_time_query_pool);
   for (PaintContext::GuestOutputPaintPipeline& guest_output_paint_pipeline :
        paint_context_.guest_output_paint_pipelines) {
     util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
@@ -1033,7 +1050,8 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     uint32_t height, VkSwapchainKHR old_swapchain,
     uint32_t& present_queue_family_out, VkFormat& image_format_out,
     VkExtent2D& image_extent_out, bool& is_fifo_out,
-    bool& ui_surface_unusable_out, VkSurfaceTransformFlagBitsKHR& transform_out,
+    bool& ui_surface_unusable_out,
+    VkSurfaceTransformFlagBitsKHR& transform_out,
     VkExtent2D& image_native_extent_out) {
   ui_surface_unusable_out = false;
 
@@ -1567,6 +1585,44 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   return true;
 }
 
+void VulkanPresenter::CollectPaintGpuTime(uint32_t slot) {
+  if (!paint_context_.paint_time_slot_pending[slot]) {
+    return;
+  }
+  paint_context_.paint_time_slot_pending[slot] = false;
+  const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+  uint64_t timestamps[2] = {};
+  if (dfn.vkGetQueryPoolResults(vulkan_device_->device(),
+                                paint_context_.paint_time_query_pool, slot * 2,
+                                2, sizeof(timestamps), timestamps,
+                                sizeof(uint64_t),
+                                VK_QUERY_RESULT_64_BIT) != VK_SUCCESS ||
+      timestamps[1] <= timestamps[0]) {
+    return;
+  }
+  paint_context_.paint_time_window_ns += uint64_t(
+      double(timestamps[1] - timestamps[0]) *
+      vulkan_device_->properties().timestampPeriod);
+  // One line per window for on-device A/B of the presentation cost (UPS-1),
+  // next to the guest GPU time in the "Frame stats" line.
+  static constexpr uint32_t kPaintTimeWindow = 300;
+  if (++paint_context_.paint_time_window_paints >= kPaintTimeWindow) {
+    XELOGI(
+        "Present stats: gpu_us/paint={} paints={} swapchain={}x{} "
+        "native={}x{} scale={}% max_height={}",
+        paint_context_.paint_time_window_ns /
+            (uint64_t(1000) * paint_context_.paint_time_window_paints),
+        paint_context_.paint_time_window_paints,
+        paint_context_.swapchain_extent.width,
+        paint_context_.swapchain_extent.height,
+        paint_context_.swapchain_native_extent.width,
+        paint_context_.swapchain_native_extent.height,
+        cvars::present_resolution_scale_percent, cvars::present_max_height);
+    paint_context_.paint_time_window_ns = 0;
+    paint_context_.paint_time_window_paints = 0;
+  }
+}
+
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     bool execute_ui_drawers) {
   // Begin the submission in place of the one not currently potentially used on
@@ -1612,6 +1668,20 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   // vkResetCommandPool resets from both initial and recording states, still
   // safe to return early from this function in case of an error.
 
+  // UPS-1: the slot's previous submission has completed (awaited above).
+  const uint32_t paint_time_slot =
+      uint32_t(current_paint_submission_index % paint_submission_count);
+  if (paint_context_.paint_time_query_pool != VK_NULL_HANDLE) {
+    CollectPaintGpuTime(paint_time_slot);
+    dfn.vkCmdResetQueryPool(draw_command_buffer,
+                            paint_context_.paint_time_query_pool,
+                            paint_time_slot * 2, 2);
+    dfn.vkCmdWriteTimestamp(draw_command_buffer,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            paint_context_.paint_time_query_pool,
+                            paint_time_slot * 2);
+  }
+
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
 
   uint32_t swapchain_image_index;
@@ -1655,14 +1725,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_source_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     rotate_source_barrier.pNext = nullptr;
     rotate_source_barrier.srcAccessMask = 0;
-    rotate_source_barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    rotate_source_barrier.dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     rotate_source_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     rotate_source_barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     rotate_source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.image = paint_context_.rotate_source_image;
-    rotate_source_barrier.subresourceRange = util::InitializeSubresourceRange();
+    rotate_source_barrier.subresourceRange =
+        util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(draw_command_buffer,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
@@ -2239,7 +2311,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_source_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     rotate_source_barrier.image = paint_context_.rotate_source_image;
-    rotate_source_barrier.subresourceRange = util::InitializeSubresourceRange();
+    rotate_source_barrier.subresourceRange =
+        util::InitializeSubresourceRange();
     dfn.vkCmdPipelineBarrier(draw_command_buffer,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
@@ -2293,9 +2366,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     rotate_rect_constants.y = -1.0f;
     rotate_rect_constants.width = 2.0f;
     rotate_rect_constants.height = 2.0f;
-    dfn.vkCmdPushConstants(
-        draw_command_buffer, rotate_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT,
-        0, sizeof(rotate_rect_constants), &rotate_rect_constants);
+    dfn.vkCmdPushConstants(draw_command_buffer, rotate_pipeline_layout,
+                           VK_SHADER_STAGE_VERTEX_BIT, 0,
+                           sizeof(rotate_rect_constants),
+                           &rotate_rect_constants);
     int32_t rotate_constants[4] = {
         int32_t(paint_context_.swapchain_extent.width) - 1,
         int32_t(paint_context_.swapchain_extent.height) - 1,
@@ -2313,6 +2387,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     dfn.vkCmdEndRenderPass(draw_command_buffer);
   }
 
+  if (paint_context_.paint_time_query_pool != VK_NULL_HANDLE) {
+    dfn.vkCmdWriteTimestamp(draw_command_buffer,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            paint_context_.paint_time_query_pool,
+                            paint_time_slot * 2 + 1);
+  }
   dfn.vkEndCommandBuffer(draw_command_buffer);
 
   VkPipelineStageFlags acquire_semaphore_wait_stage =
@@ -2352,6 +2432,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const VkResult submit_result =
       paint_context_.completion_timeline.AcquireFenceAndSubmit(
           vulkan_device_->queue_family_graphics_compute(), 0, 1, &submit_info);
+  if (submit_result == VK_SUCCESS &&
+      paint_context_.paint_time_query_pool != VK_NULL_HANDLE) {
+    paint_context_.paint_time_slot_pending[paint_time_slot] = true;
+  }
   if (submit_result != VK_SUCCESS) {
     XELOGE(
         "VulkanPresenter: Failed to submit the presentation command buffer: {} "
@@ -2414,6 +2498,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result =
         dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+  }
+  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+    if (auto on_present = g_xdroid_on_present.load(std::memory_order_acquire)) {
+      on_present();
+    }
   }
   switch (present_result) {
     case VK_SUCCESS:
@@ -2637,6 +2726,18 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.pCode =
             shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
+      case GuestOutputPaintEffect::kSnapdragonGsr:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_snapdragon_gsr_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_snapdragon_gsr_ps;
+        break;
+      case GuestOutputPaintEffect::kSnapdragonGsrSoft:
+        shader_module_create_info.codeSize =
+            sizeof(shaders::guest_output_snapdragon_gsr_soft_ps);
+        shader_module_create_info.pCode =
+            shaders::guest_output_snapdragon_gsr_soft_ps;
+        break;
       default:
         // Not supported by this implementation.
         continue;
@@ -2728,6 +2829,21 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         PaintContext::Submission::Create(vulkan_device_);
     if (!paint_context_.submissions[i]) {
       return false;
+    }
+  }
+
+  // UPS-1: GPU time of the paint command buffers (Present stats line).
+  if (vulkan_device_->properties().timestampPeriod) {
+    VkQueryPoolCreateInfo paint_time_pool_info = {
+        VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    paint_time_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    paint_time_pool_info.queryCount =
+        uint32_t(PaintContext::kSubmissionCount * 2);
+    if (dfn.vkCreateQueryPool(device, &paint_time_pool_info, nullptr,
+                              &paint_context_.paint_time_query_pool) !=
+        VK_SUCCESS) {
+      XELOGW("VulkanPresenter: Failed to create the paint GPU time query pool");
+      paint_context_.paint_time_query_pool = VK_NULL_HANDLE;
     }
   }
 
@@ -2936,7 +3052,8 @@ bool VulkanPresenter::CreateRotateObjects(VkFormat format) {
   image_view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
   image_view_create_info.subresourceRange = util::InitializeSubresourceRange();
   if (dfn.vkCreateImageView(device, &image_view_create_info, nullptr,
-                            &paint_context_.rotate_source_view) != VK_SUCCESS) {
+                            &paint_context_.rotate_source_view) !=
+      VK_SUCCESS) {
     XELOGE("VulkanPresenter: Failed to create the pre-rotation source view");
     return false;
   }
@@ -2969,9 +3086,8 @@ bool VulkanPresenter::CreateRotateObjects(VkFormat format) {
   VkWriteDescriptorSet descriptor_write;
   descriptor_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   descriptor_write.pNext = nullptr;
-  descriptor_write.dstSet =
-      paint_context_.guest_output_descriptor_sets
-          [PaintContext::kGuestOutputDescriptorSetRotateSourceSampled];
+  descriptor_write.dstSet = paint_context_.guest_output_descriptor_sets
+      [PaintContext::kGuestOutputDescriptorSetRotateSourceSampled];
   descriptor_write.dstBinding = 0;
   descriptor_write.dstArrayElement = 0;
   descriptor_write.descriptorCount = 1;

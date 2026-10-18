@@ -61,6 +61,10 @@ class VulkanDrawBlackbox {
     uint32_t texture_count = 0;
     std::array<uint32_t, kMaxTextures> texture_slot{};
     std::array<std::array<uint32_t, 6>, kMaxTextures> texture_fetch{};
+    // Indirect buffers the draw was parsed in, outermost first (ptr, dwords,
+    // XdroidIbFlags).
+    uint32_t ib_depth = 0;
+    std::array<std::array<uint32_t, 3>, 3> ib_chain{};
   };
 
   // Whether a draw with this much vertex+index data is recorded.

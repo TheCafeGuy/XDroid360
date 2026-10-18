@@ -56,6 +56,21 @@ union EdramDumpShaderKey {
     // STAB-S1 forensic (temp): a depth source skips its stencil fetch and
     // packs stencil 0.
     uint32_t skip_stencil : 1;
+    // RES-3: direct resolve of an 8_8_8_8 UNORM MSAA color source that
+    // averages samples like the full resolve copy does (unpack to float, sum,
+    // scale, repack) - 1 for 2 samples (k01/k23), 2 for 4 (k0123).
+    uint32_t average_samples : 2;
+    // RES-4: a 1x 32bpp resolve over tiles a multisampled 32bpp color render
+    // target owns. The dispatch walks the resolve's 1x sample grid and each
+    // pixel reads the source sample the guest EDRAM slot holds - what the
+    // dump and the 1x copy do in two passes.
+    uint32_t read_as_1x : 1;
+    // TEX-1b: also store every pixel, after the red/blue swap and before the
+    // endian swap and tiling, into a linear buffer (descriptor_set_link) with
+    // the resolve width as its pitch - the bits a texture load of the
+    // destination would produce, ready for vkCmdCopyBufferToImage. 32bpp,
+    // unscaled only.
+    uint32_t link_scratch : 1;
   };
 
   EdramDumpShaderKey() : key(0) { static_assert_size(*this, sizeof(key)); }
@@ -153,7 +168,12 @@ union EdramDumpShaderPitches {
     // Both in tiles.
     uint32_t dest_pitch : xenos::kEdramPitchTilesBits;
     uint32_t source_pitch : xenos::kEdramPitchTilesBits;
+    // TILE-1: added to the source tile X, for a source wider than its pitch
+    // (the merged predicated tiles, side by side).
+    uint32_t source_x_offset_tiles : 8;
   };
+  static constexpr uint32_t kSourceXOffsetTilesShift =
+      2 * xenos::kEdramPitchTilesBits;
   EdramDumpShaderPitches() : pitches(0) {
     static_assert_size(*this, sizeof(pitches));
   }
@@ -196,6 +216,9 @@ struct EdramDumpShaderOptions {
   // the source set; everything else is binding 0 of its set.
   uint32_t descriptor_set_dest = 0;
   uint32_t descriptor_set_source = 1;
+  // TEX-1b: the linear scratch buffer of an EdramDumpShaderKey::link_scratch
+  // key, binding 0.
+  uint32_t descriptor_set_link = 2;
 
   // Guest-to-host resolution scale, which the tile addressing is computed
   // against.

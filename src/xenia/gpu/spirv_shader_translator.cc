@@ -121,6 +121,24 @@ DEFINE_bool(spirv_fine_derivatives, false,
             "same shader can pick a different LOD on different drivers.",
             "GPU.Debug");
 
+DEFINE_bool(xdroid_shared_memory_nonuniform, true,
+            "SHD-1: when the shared memory is split into several storage "
+            "buffers (Turnip: 128 MB each), load from it with one "
+            "non-uniformly indexed access instead of a switch over the "
+            "buffers. Needs shaderStorageBufferArrayNonUniformIndexing. "
+            "Applies to shaders translated after it is set (boot).",
+            "GPU");
+DEFINE_bool(xdroid_shader_sign_spec, true,
+            "SHD-1c: compile pixel shaders with the post-swizzle texture "
+            "signs as specialization constants (part of the pipeline key), so "
+            "the driver drops the per-component sign switches. Boot only.",
+            "GPU");
+DEFINE_bool(xdroid_shader_vfetch_spec, true,
+            "SHD-1e: compile vertex shaders with each vertex fetch constant's "
+            "endianness as a specialization constant (part of the pipeline "
+            "key), so the driver folds the byte swaps. Boot only.",
+            "GPU");
+DECLARE_bool(xdroid_shd_bound_noalpha);
 DEFINE_bool(spirv_no_contraction_all, false,
             "Decorate every float arithmetic result with NoContraction, "
             "removing the driver's freedom to fuse a multiply and add into "
@@ -242,7 +260,11 @@ SpirvShaderTranslator::Features::Features(
           vulkan_device->properties().fragmentShaderBarycentric),
       allow_float_contraction(cvars::spirv_moltenvk_allow_contraction &&
                               vulkan_device->properties().driverID ==
-                                  VK_DRIVER_ID_MOLTENVK) {
+                                  VK_DRIVER_ID_MOLTENVK),
+      storage_buffer_non_uniform_indexing(
+          cvars::xdroid_shared_memory_nonuniform &&
+          vulkan_device->properties()
+              .shaderStorageBufferArrayNonUniformIndexing) {
   // Check for SPIR-V version override from CVAR.
   const std::string& override_version = cvars::spirv_version_override;
   if (override_version == "1.0") {
@@ -543,6 +565,8 @@ void SpirvShaderTranslator::StartTranslation() {
   }
   const_int4_0_ = builder_->makeCompositeConstant(type_int4_, id_vector_temp_);
   const_uint_0_ = builder_->makeUintConstant(0);
+  spec_texture_swizzled_signs_.fill(spv::NoResult);
+  spec_vfetch_endian_.fill(spv::NoResult);
   id_vector_temp_.clear();
   for (uint32_t i = 0; i < 4; ++i) {
     id_vector_temp_.push_back(const_uint_0_);
@@ -1146,9 +1170,9 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
           builder_->makeUintConstant(1));
       builder_->createStore(iterations, var_main_loop_iterations_);
       builder_->createConditionalBranch(
-          builder_->createBinOp(
-              spv::OpULessThan, type_bool_, iterations,
-              builder_->makeUintConstant(uint32_t(max_iterations))),
+          builder_->createBinOp(spv::OpULessThan, type_bool_, iterations,
+                                builder_->makeUintConstant(
+                                    uint32_t(max_iterations))),
           main_loop_header_, main_loop_merge_);
     } else {
       builder_->createBranch(main_loop_header_);
@@ -2709,7 +2733,8 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderInMain() {
               builder_->makeUintConstant(xenos::kVertexIndexMask);
           spv::Id index_uint = builder_->createBinOp(
               spv::OpBitwiseAnd, type_uint_,
-              builder_->createUnaryOp(spv::OpBitcast, type_uint_, vertex_index),
+              builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                      vertex_index),
               const_index_mask);
           spv::Id index_min_max[2];
           for (uint32_t i = 0; i < 2; ++i) {
@@ -3602,7 +3627,8 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
   // Sample mask output for alpha-to-coverage.
   // Only needed for non-FSI mode. FSI uses main_fsi_sample_mask_ instead.
   output_fragment_sample_mask_ = spv::NoResult;
-  if (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_) {
+  if (!edram_fragment_shader_interlock_ && !is_depth_only_fragment_shader_ &&
+      !cvars::xdroid_shd_bound_noalpha) {
     // gl_SampleMask is an array of int in SPIR-V.
     spv::Id type_sample_mask_array =
         builder_->makeArrayType(type_int_, builder_->makeUintConstant(1), 0);
@@ -4896,6 +4922,36 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(
       spv::OpBitwiseAnd, type_int_, address_dwords_int,
       builder_->makeIntConstant(
           int((uint32_t(1) << binding_address_bits) - 1)));
+
+  if (features_.storage_buffer_non_uniform_indexing) {
+    // SHD-1: one load through a non-uniform index into the binding array.
+    // Same result as the switch: zero when the index is past the bindings.
+    uint32_t binding_count = uint32_t(1) << binding_count_log2;
+    if (features_.spirv_version < spv::Spv_1_5) {
+      builder_->addExtension("SPV_EXT_descriptor_indexing");
+    }
+    builder_->addCapability(spv::Capability::ShaderNonUniform);
+    builder_->addCapability(spv::Capability::StorageBufferArrayNonUniformIndexing);
+    spv::Id binding_in_range = builder_->createBinOp(
+        spv::OpULessThan, type_bool_, binding_index,
+        builder_->makeUintConstant(binding_count));
+    spv::Id binding_index_clamped = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_, binding_index,
+        builder_->makeUintConstant(binding_count - 1));
+    builder_->addDecoration(binding_index_clamped, spv::Decoration::NonUniform);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(binding_index_clamped);
+    // The only SSBO struct member.
+    id_vector_temp_.push_back(const_int_0_);
+    id_vector_temp_.push_back(binding_address);
+    spv::Id pointer = builder_->createAccessChain(
+        storage_class, buffers_shared_memory_, id_vector_temp_);
+    builder_->addDecoration(pointer, spv::Decoration::NonUniform);
+    spv::Id value = builder_->createLoad(pointer, spv::NoPrecision);
+    builder_->addDecoration(value, spv::Decoration::NonUniform);
+    return builder_->createTriOp(spv::OpSelect, type_uint_, binding_in_range,
+                                 value, const_uint_0_);
+  }
 
   auto value_phi_op = std::make_unique<spv::Instruction>(
       builder_->getUniqueId(), type_uint_, spv::OpPhi);

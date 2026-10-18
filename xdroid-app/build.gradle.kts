@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -81,11 +83,32 @@ android {
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
+        // One app on the phone: test builds share the release id and key, so
+        // each build (test or release) installs over the previous one.
+        // Keep versionCode >= the latest public release (v0.2.0 = 4).
         applicationId = "io.github.thecafeguy.xdroid360"
         minSdk = 29
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.1.0"
+        versionCode = 4
+        versionName = "0.2.0"
+    }
+
+    // Release key from ~/.xdroid360/release.properties (never in the repo).
+    // Without it, builds fall back to the debug key and cannot update an
+    // installed release.
+    val releaseProps = Properties().apply {
+        val f = File(System.getProperty("user.home"), ".xdroid360/release.properties")
+        if (f.isFile) f.inputStream().use { load(it) }
+    }
+    signingConfigs {
+        if (releaseProps.getProperty("storeFile") != null) {
+            create("xdroid") {
+                storeFile = file(releaseProps.getProperty("storeFile"))
+                storePassword = releaseProps.getProperty("storePassword")
+                keyAlias = releaseProps.getProperty("keyAlias")
+                keyPassword = releaseProps.getProperty("keyPassword")
+            }
+        }
     }
 
     compileOptions {
@@ -106,12 +129,13 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
+            versionNameSuffix = "-dev"
+            signingConfigs.findByName("xdroid")?.let { signingConfig = it }
         }
         release {
             isMinifyEnabled = false
             isShrinkResources = false
+            signingConfigs.findByName("xdroid")?.let { signingConfig = it }
         }
     }
 }

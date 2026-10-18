@@ -9,10 +9,14 @@
 
 #include "xenia/gpu/vulkan/vulkan_pipeline_cache.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/assert.h"
@@ -25,6 +29,7 @@
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/register_file.h"
+#include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/spirv_builtin_geometry_shader.h"
@@ -65,13 +70,106 @@ DEFINE_int32(
     "0 to disable multithreaded pipeline creation.",
     "Vulkan");
 
+DEFINE_bool(
+    xdroid_pipeline_live_first, false,
+    "XDroid360 SHADER-1: pipeline creation threads build the pipelines the "
+    "game is drawing before the stored-pipeline warm-up, instead of after "
+    "everything the warm-up queued ahead of them. Read when the warm-up "
+    "queues, so set it before the title starts.",
+    "XDroid360");
+DEFINE_bool(
+    xdroid_pipeline_targeted_wait, false,
+    "XDroid360 SHADER-1: a draw that can't use a placeholder waits only for "
+    "its own pipeline, and submissions/query resolves stop waiting for the "
+    "stored-pipeline warm-up, instead of draining the whole creation queue. "
+    "Changes GPU thread timing. Live.",
+    "XDroid360");
+
 DECLARE_bool(vulkan_dynamic_rendering);
 DECLARE_bool(spirv_disable_rounding_mode_rte);
 DECLARE_bool(precise_interpolation);
 
+DECLARE_bool(xdroid_shader_sign_spec);
+DECLARE_bool(xdroid_shader_vfetch_spec);
+DEFINE_bool(xdroid_shader_stats, false,
+            "SHD-1: capture driver statistics (instructions, registers, waves) "
+            "for every real pipeline and log XDROID-SHSTAT lines. Changes the "
+            "pipeline cache key (recompiles). Diagnostics only.",
+            "GPU");
+
 namespace xe {
 namespace gpu {
 namespace vulkan {
+
+namespace {
+// SHD-1: one XDROID-SHSTAT line per pipeline stage with every driver
+// statistic, keyed by the guest shader hashes for joining with draw counts.
+void LogPipelineStatistics(const ui::vulkan::VulkanDevice* vulkan_device,
+                           VkPipeline pipeline, uint64_t vs_hash,
+                           uint64_t ps_hash) {
+  auto get_properties = vulkan_device->get_pipeline_executable_properties_khr();
+  auto get_statistics = vulkan_device->get_pipeline_executable_statistics_khr();
+  if (!get_properties || !get_statistics) {
+    return;
+  }
+  VkDevice device = vulkan_device->device();
+  VkPipelineInfoKHR pipeline_info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+  pipeline_info.pipeline = pipeline;
+  uint32_t executable_count = 0;
+  if (get_properties(device, &pipeline_info, &executable_count, nullptr) !=
+          VK_SUCCESS ||
+      !executable_count) {
+    return;
+  }
+  std::vector<VkPipelineExecutablePropertiesKHR> executables(
+      executable_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+  if (get_properties(device, &pipeline_info, &executable_count,
+                     executables.data()) != VK_SUCCESS) {
+    return;
+  }
+  for (uint32_t i = 0; i < executable_count; ++i) {
+    VkPipelineExecutableInfoKHR executable_info = {
+        VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+    executable_info.pipeline = pipeline;
+    executable_info.executableIndex = i;
+    uint32_t stat_count = 0;
+    if (get_statistics(device, &executable_info, &stat_count, nullptr) !=
+            VK_SUCCESS ||
+        !stat_count) {
+      continue;
+    }
+    std::vector<VkPipelineExecutableStatisticKHR> stats(
+        stat_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
+    if (get_statistics(device, &executable_info, &stat_count, stats.data()) !=
+        VK_SUCCESS) {
+      continue;
+    }
+    std::string line;
+    for (const VkPipelineExecutableStatisticKHR& stat : stats) {
+      std::string name(stat.name);
+      std::replace(name.begin(), name.end(), ' ', '_');
+      switch (stat.format) {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+          line += fmt::format(" {}={}", name, stat.value.b32 ? 1 : 0);
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+          line += fmt::format(" {}={}", name, stat.value.i64);
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+          line += fmt::format(" {}={}", name, stat.value.u64);
+          break;
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+          line += fmt::format(" {}={:.2f}", name, stat.value.f64);
+          break;
+        default:
+          break;
+      }
+    }
+    XELOGI("XDROID-SHSTAT VS {:016X} PS {:016X} stage={}{}", vs_hash, ps_hash,
+           executables[i].name, line);
+  }
+}
+}  // namespace
 
 VulkanPipelineCache::VulkanPipelineCache(
     VulkanCommandProcessor& command_processor,
@@ -759,11 +857,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
           tessellation_control_shader;
       placeholder_args.render_pass = render_pass;
       placeholder_args.render_pass_key = render_pass_key;
+      uint64_t placeholder_start = xe::Clock::QueryHostTickCount();
       bool placeholder_created =
           use_interpreter
               ? EnsurePipelineCreatedWithInterpreterPlaceholder(
                     placeholder_args)
               : EnsurePipelineCreatedWithPlaceholder(placeholder_args);
+      ++draw_thread_compile_stats_.placeholder_count;
+      draw_thread_compile_stats_.placeholder_ticks +=
+          xe::Clock::QueryHostTickCount() - placeholder_start;
       if (placeholder_created) {
         if (use_interpreter) {
           XELOGI(
@@ -805,6 +907,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   } else {
     // Sync mode (no creation threads / async off / no pixel shader): translate
     // on this thread and create the pipeline immediately.
+    uint64_t sync_start = xe::Clock::QueryHostTickCount();
     if (!vertex_shader_translated ||
         (pixel_shader && !pixel_shader_translated)) {
       if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
@@ -828,7 +931,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
         tessellation_control_shader;
     creation_arguments.render_pass = render_pass;
     creation_arguments.render_pass_key = render_pass_key;
-    if (!EnsurePipelineCreated(creation_arguments)) {
+    bool sync_created = EnsurePipelineCreated(creation_arguments);
+    ++draw_thread_compile_stats_.sync_pipeline_count;
+    draw_thread_compile_stats_.sync_pipeline_ticks +=
+        xe::Clock::QueryHostTickCount() - sync_start;
+    if (!sync_created) {
       return false;
     }
   }
@@ -862,11 +969,38 @@ void VulkanPipelineCache::EndSubmission() {
 }
 
 bool VulkanPipelineCache::IsCreatingPipelines() {
+  // The warm-up isn't drawn by anything recorded, so it doesn't hold back a
+  // submission.
+  if (cvars::xdroid_pipeline_targeted_wait) {
+    return creation_queue_.IsLiveBusy();
+  }
   return creation_queue_.IsBusy();
 }
 
 void VulkanPipelineCache::AwaitPipelineCompletion() {
+  if (cvars::xdroid_pipeline_targeted_wait) {
+    // Every pipeline the game drew, stored in order, but not the warm-up.
+    creation_queue_.AwaitLive();
+    return;
+  }
   creation_queue_.AwaitCompletion();
+}
+
+void VulkanPipelineCache::AwaitPipeline(const Pipeline& pipeline) {
+  if (cvars::xdroid_pipeline_targeted_wait) {
+    // Published in queue order, so this also waits for whatever the game drew
+    // before it, but not for the warm-up queued ahead of it.
+    creation_queue_.AwaitUntil([&pipeline]() {
+      return !pipeline.creation_pending.load(std::memory_order_acquire);
+    });
+    return;
+  }
+  creation_queue_.AwaitCompletion();
+}
+
+void VulkanPipelineCache::GetCreationQueueCounts(size_t& live,
+                                                 size_t& queued) {
+  creation_queue_.GetPendingCounts(live, queued);
 }
 
 VkPipeline VulkanPipelineCache::CreateQueuedPipeline(
@@ -1239,6 +1373,25 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
   }
   description_out.render_pass_key = render_pass_key;
   description_out.zpd_total = uint32_t(zpd_total);
+  if (cvars::xdroid_shader_vfetch_spec) {
+    for (const Shader::VertexBinding& binding :
+         vertex_shader->shader().vertex_bindings()) {
+      uint32_t vfetch_index = binding.fetch_constant;
+      description_out.vs_vfetch_endian[vfetch_index >> 4] |=
+          (uint32_t(regs.GetVertexFetch(vfetch_index).endian) & 0b11)
+          << (2 * (vfetch_index & 15));
+    }
+  }
+  if (pixel_shader && cvars::xdroid_shader_sign_spec) {
+    for (const Shader::TextureBinding& binding :
+         pixel_shader->shader().texture_bindings()) {
+      uint32_t fetch_constant = binding.fetch_constant;
+      description_out.ps_texture_swizzled_signs[fetch_constant >> 2] |=
+          uint32_t(TextureCache::SwizzledSignsFromFetchConstant(
+              regs.GetTextureFetch(fetch_constant)))
+          << (8 * (fetch_constant & 3));
+    }
+  }
 
   // TODO(Triang3l): Implement primitive types currently using geometry shaders
   // without them.
@@ -1717,6 +1870,25 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       description.tessellation_mode != PipelineTessellationMode::kNone;
 
   // Up to 5 shader stages: VS, TCS, TES, GS, FS.
+  // SHD-1e: vertex fetch endianness as vertex specialization constants.
+  std::array<uint32_t, 96> vfetch_endian_values;
+  std::array<VkSpecializationMapEntry, 96> vfetch_specialization_entries;
+  for (uint32_t i = 0; i < 96; ++i) {
+    vfetch_endian_values[i] =
+        (creation_arguments.pipeline->first.vs_vfetch_endian[i >> 4] >>
+         (2 * (i & 15))) &
+        0b11;
+    vfetch_specialization_entries[i].constantID = 64 + i;
+    vfetch_specialization_entries[i].offset = uint32_t(sizeof(uint32_t) * i);
+    vfetch_specialization_entries[i].size = sizeof(uint32_t);
+  }
+  VkSpecializationInfo vfetch_specialization_info;
+  vfetch_specialization_info.mapEntryCount =
+      uint32_t(vfetch_specialization_entries.size());
+  vfetch_specialization_info.pMapEntries =
+      vfetch_specialization_entries.data();
+  vfetch_specialization_info.dataSize = sizeof(vfetch_endian_values);
+  vfetch_specialization_info.pData = vfetch_endian_values.data();
   std::array<VkPipelineShaderStageCreateInfo, 5> shader_stages;
   uint32_t shader_stage_count = 0;
 
@@ -1797,7 +1969,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
       return false;
     }
     shader_stage_vertex.pName = "main";
-    shader_stage_vertex.pSpecializationInfo = nullptr;
+    shader_stage_vertex.pSpecializationInfo =
+        cvars::xdroid_shader_vfetch_spec && vertex_shader_override == VK_NULL_HANDLE
+            ? &vfetch_specialization_info
+            : nullptr;
   }
 
   // Geometry shader.
@@ -1813,6 +1988,21 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     shader_stage_geometry.pName = "main";
     shader_stage_geometry.pSpecializationInfo = nullptr;
   }
+  // SHD-1c: texture sign words as fragment specialization constants (SpecId
+  // = word index); entries the shader does not declare are ignored.
+  std::array<VkSpecializationMapEntry, 8> sign_specialization_entries;
+  for (uint32_t i = 0; i < 8; ++i) {
+    sign_specialization_entries[i].constantID = i;
+    sign_specialization_entries[i].offset = uint32_t(sizeof(uint32_t) * i);
+    sign_specialization_entries[i].size = sizeof(uint32_t);
+  }
+  VkSpecializationInfo sign_specialization_info;
+  sign_specialization_info.mapEntryCount =
+      uint32_t(sign_specialization_entries.size());
+  sign_specialization_info.pMapEntries = sign_specialization_entries.data();
+  sign_specialization_info.dataSize = sizeof(uint32_t) * 8;
+  sign_specialization_info.pData =
+      creation_arguments.pipeline->first.ps_texture_swizzled_signs;
   // Fragment shader.
   VkPipelineShaderStageCreateInfo& shader_stage_fragment =
       shader_stages[shader_stage_count++];
@@ -1831,6 +2021,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     assert_true(creation_arguments.pixel_shader->is_translated());
     if (!creation_arguments.pixel_shader->is_valid()) {
       return false;
+    }
+    if (cvars::xdroid_shader_sign_spec) {
+      shader_stage_fragment.pSpecializationInfo = &sign_specialization_info;
     }
     shader_stage_fragment.module =
         creation_arguments.pixel_shader->GetOrCreateShaderModule();
@@ -2244,7 +2437,13 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_create_info.pNext =
       use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
-  pipeline_create_info.flags = 0;
+  // SHD-1: driver statistics for real pipelines (diagnostics only; the flag
+  // changes the pipeline cache key, so expect recompiles while it is on).
+  const bool capture_stats =
+      cvars::xdroid_shader_stats && !creating_placeholder &&
+      vulkan_device->extensions().ext_KHR_pipeline_executable_properties;
+  pipeline_create_info.flags =
+      capture_stats ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();
   pipeline_create_info.pVertexInputState = &vertex_input_state;
@@ -2290,6 +2489,13 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - pso_create_start)
             .count());
+  }
+  if (result == VK_SUCCESS && capture_stats) {
+    LogPipelineStatistics(
+        vulkan_device, pipeline, creation_arguments.vertex_shader->shader().ucode_data_hash(),
+        creation_arguments.pixel_shader
+            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
+            : 0);
   }
   if (result != VK_SUCCESS) {
     if (creation_arguments.pixel_shader) {
@@ -2374,7 +2580,6 @@ void VulkanPipelineCache::StoreCreatedPipeline(
   if (!creating_placeholder) {
     creation_arguments.pipeline->second.is_placeholder.store(
         false, std::memory_order_release);
-    MaybeSaveVkPipelineCache();
     XELOGI("Pipeline created for VS {:016X}, PS {:016X}",
            creation_arguments.vertex_shader->shader().ucode_data_hash(),
            creation_arguments.pixel_shader
@@ -2382,6 +2587,12 @@ void VulkanPipelineCache::StoreCreatedPipeline(
                : 0);
     creation_arguments.pipeline->second.creation_pending.store(
         false, std::memory_order_release);
+    // Save only after the draw awaiting this pipeline is released, and not
+    // while other drawn pipelines wait: vkGetPipelineCacheData holds the
+    // driver's cache lock for the whole 14 MB copy (S24 2026-10-17: 0.7-1 s
+    // GPU-idle stalls right after a save). At most one pending request (this
+    // one, if it was drawn) may remain.
+    MaybeSaveVkPipelineCache(creation_queue_.LivePendingCount() <= 1);
   }
 }
 
@@ -2707,7 +2918,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
         // Nothing is drawing these yet, so they publish as they are built.
         creation_arguments.pipeline->second.creation_pending.store(
             true, std::memory_order_relaxed);
-        creation_queue_.PushUnordered(creation_arguments);
+        creation_queue_.PushUnordered(creation_arguments,
+                                      cvars::xdroid_pipeline_live_first);
       } else {
         // No creation threads - create synchronously.
         EnsurePipelineCreated(creation_arguments);
@@ -2756,7 +2968,8 @@ void VulkanPipelineCache::InitializeShaderStorage(
 }
 
 void VulkanPipelineCache::WriteVkPipelineCacheLocked() {
-  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE ||
+      vk_pipeline_cache_path_.empty()) {
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -2796,14 +3009,15 @@ void VulkanPipelineCache::WriteVkPipelineCacheLocked() {
   XELOGI("Saved {} bytes of VkPipelineCache data", cache_size);
 }
 
-void VulkanPipelineCache::MaybeSaveVkPipelineCache() {
+void VulkanPipelineCache::MaybeSaveVkPipelineCache(bool may_write) {
   // Android usually ends sessions by killing the process, which never reaches
   // ShutdownShaderStorage, so save while running: after enough new pipelines,
   // at most every 30 seconds.
   constexpr uint32_t kMinNewPipelines = 32;
   constexpr auto kMinInterval = std::chrono::seconds(30);
   if (vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed) + 1 <
-      kMinNewPipelines) {
+      kMinNewPipelines ||
+      !may_write) {
     return;
   }
   // Never make a creation thread wait for another one's save.

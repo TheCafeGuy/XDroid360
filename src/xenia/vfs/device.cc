@@ -19,6 +19,11 @@ DEFINE_bool(storage_request_timing, true,
             "Make reads from the launched title's storage take as long as a "
             "console drive would. Disable to read at host speed.",
             "Storage");
+DEFINE_double(storage_timing_scale, 1.0,
+              "Scales the transfer part of storage_request_timing (seeks stay "
+              "unscaled). 1.0 = console speed; below 1 loads faster but "
+              "changes the title's load timing, which can reopen races.",
+              "Storage");
 
 namespace xe {
 namespace vfs {
@@ -45,7 +50,9 @@ uint64_t DriveTiming::Reserve(const Entry* entry, uint64_t offset,
   const bool seek = entry != head_entry_ || offset != head_offset_;
   head_entry_ = entry;
   head_offset_ = offset + length;
-  const double ms = (seek ? kSeekMs : 0.0) + double(length) / kBytesPerMs;
+  const double scale = std::clamp(cvars::storage_timing_scale, 0.0, 1.0);
+  const double ms =
+      (seek ? kSeekMs : 0.0) + double(length) / kBytesPerMs * scale;
 
   const double now = double(Clock::QueryHostUptimeMillis());
   // Past the cap this moves the queue backwards, deliberately dropping what an

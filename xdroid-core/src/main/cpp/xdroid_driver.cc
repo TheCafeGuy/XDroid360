@@ -66,7 +66,8 @@ void ApplyTuDebugFile(const std::string& path) {
     }
     const std::string name = line.substr(0, equals);
     if (name != "TU_DEBUG" && name != "IR3_SHADER_DEBUG" &&
-        name != "FD_MESA_DEBUG") {
+        name != "FD_MESA_DEBUG" && name != "TU_AUTOTUNE_ALGO" &&
+        name != "TU_AUTOTUNE_FLAGS") {
       XELOGW("XDroid360: {} ignores {}", path, name);
       continue;
     }

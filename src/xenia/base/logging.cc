@@ -32,6 +32,7 @@
 #include "xenia/base/string.h"
 #include "xenia/base/system.h"
 #include "xenia/base/threading.h"
+#include "xenia/base/wake_generation.h"
 
 // TODO(benvanik): generic API? logging_win.cc?
 #if XE_PLATFORM_ANDROID
@@ -44,6 +45,12 @@
 #include "third_party/fmt/include/fmt/format.h"
 
 #if XE_PLATFORM_ANDROID
+DEFINE_bool(log_idle_block, false,
+            "CE-4: when no log line is pending, the log writer thread sleeps "
+            "on a futex until one is published, instead of the disruptor "
+            "spin (sched_yield bursts and 1 ms naps, ~1000 wakeups/s while "
+            "idle). Live-switchable.",
+            "Logging");
 DEFINE_bool(log_to_logcat, true, "Write log output to Android Logcat.",
             "Logging");
 // Off unless the app sets a path: logcat drops lines past its per-process
@@ -283,6 +290,8 @@ class Logger {
   dp::spin_wait_strategy wait_strategy_;
   dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
   dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  // CE-4 (log_idle_block): bumped after every publish.
+  xe::threading::WakeGeneration published_generation_;
 
   std::vector<std::unique_ptr<LogSink>> sinks_;
 
@@ -308,6 +317,20 @@ class Logger {
       // many blocks needed for at least one log line.
       auto next_range = dp::sequence_range(next_sequence, desired_count);
 
+      if (cvars::log_idle_block) {
+        // Sleep until a producer publishes (the generation is read before
+        // the probe, so a publish after the probe makes the wait return).
+        while (true) {
+          const uint32_t seen = published_generation_.Load();
+          if (dp::difference(claim_strategy_.wait_until_published(
+                                 next_range.last(), last_sequence,
+                                 std::chrono::steady_clock::now()),
+                             next_range.last()) >= 0) {
+            break;
+          }
+          published_generation_.WaitFor(seen, std::chrono::milliseconds(50));
+        }
+      }
       claim_strategy_.wait_until_published(next_range.last(), last_sequence);
 
       size_t read_count = 0;
@@ -432,6 +455,7 @@ class Logger {
     }
 
     claim_strategy_.publish(range);
+    published_generation_.Bump();
   }
 };
 

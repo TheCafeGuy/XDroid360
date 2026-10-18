@@ -257,6 +257,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     // #180. GPU breadcrumbs (vulkan_gpu_breadcrumbs); no feature struct.
     XE_UI_VULKAN_STRUCT_EXTENSION(AMD_buffer_marker)
+    // #270. Driver shader statistics (SHD-1, xdroid_shader_stats).
+    if (get_physical_device_properties2_supported) {
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
+    }
     // #179. Import guest RAM as device memory for a zero-copy shared-memory
     // buffer that aliases guest RAM.
     if (get_physical_device_properties2_supported) {
@@ -404,6 +408,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceFaultFeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT>
       features_EXT_device_fault;
+  VulkanFeatures<
+      VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
+      features_KHR_pipeline_executable_properties;
   // VK_EXT_external_memory_host (#179) properties (host pointer import
   // alignment).
   VkPhysicalDeviceExternalMemoryHostPropertiesEXT
@@ -487,6 +495,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (device->extensions_.ext_EXT_device_fault) {
       features_EXT_device_fault.Link(supported_features_2, device_create_info);
     }
+    if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+      features_KHR_pipeline_executable_properties.Link(supported_features_2,
+                                                       device_create_info);
+    }
     if (device->extensions_.ext_EXT_external_memory_host) {
       properties_EXT_external_memory_host.pNext = properties_2.pNext;
       properties_2.pNext = &properties_EXT_external_memory_host;
@@ -503,6 +515,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     features_EXT_device_fault.enabled.deviceFault =
         features_EXT_device_fault.supported.deviceFault;
+    if (device->extensions_.ext_KHR_pipeline_executable_properties &&
+        !features_KHR_pipeline_executable_properties.supported
+             .pipelineExecutableInfo) {
+      device->extensions_.ext_KHR_pipeline_executable_properties = false;
+    }
+    features_KHR_pipeline_executable_properties.enabled
+        .pipelineExecutableInfo =
+        features_KHR_pipeline_executable_properties.supported
+            .pipelineExecutableInfo;
   }
 
   uint32_t queue_family_count = 0;
@@ -851,6 +872,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, hostQueryReset);
       XE_UI_VULKAN_FEATURE_2(features_1_2, shaderFloat16);
+      XE_UI_VULKAN_FEATURE_2(features_1_2,
+                             shaderStorageBufferArrayNonUniformIndexing);
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
@@ -1036,10 +1059,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   if (queue_global_priority_requested) {
     if (device_create_result == VK_ERROR_NOT_PERMITTED_KHR ||
         device_create_result == VK_ERROR_INITIALIZATION_FAILED) {
-      XELOGW(
-          "Vulkan queue global priority '{}' refused ({}), using the default",
-          cvars::vulkan_queue_global_priority,
-          vk::to_string(vk::Result(device_create_result)));
+      XELOGW("Vulkan queue global priority '{}' refused ({}), using the default",
+             cvars::vulkan_queue_global_priority,
+             vk::to_string(vk::Result(device_create_result)));
       for (VkDeviceQueueCreateInfo& queue_create_info : queue_create_infos) {
         queue_create_info.pNext = nullptr;
       }
@@ -1129,6 +1151,18 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         ifn.vkGetDeviceProcAddr(device->device_, "vkGetDeviceFaultInfoEXT"));
     if (!device->vkGetDeviceFaultInfoEXT_) {
       device->extensions_.ext_EXT_device_fault = false;
+    }
+  }
+  if (device->extensions_.ext_KHR_pipeline_executable_properties) {
+    device->vkGetPipelineExecutablePropertiesKHR_ =
+        PFN_vkGetPipelineExecutablePropertiesKHR(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPipelineExecutablePropertiesKHR"));
+    device->vkGetPipelineExecutableStatisticsKHR_ =
+        PFN_vkGetPipelineExecutableStatisticsKHR(ifn.vkGetDeviceProcAddr(
+            device->device_, "vkGetPipelineExecutableStatisticsKHR"));
+    if (!device->vkGetPipelineExecutablePropertiesKHR_ ||
+        !device->vkGetPipelineExecutableStatisticsKHR_) {
+      device->extensions_.ext_KHR_pipeline_executable_properties = false;
     }
   }
   if (device->extensions_.ext_AMD_buffer_marker) {

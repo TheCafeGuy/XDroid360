@@ -19,7 +19,9 @@
 #include "xenia/base/math.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/profiling.h"
+#include "xenia/base/wake_generation.h"
 #include "xenia/cpu/backend/backend.h"
+#include "xenia/cpu/guest_sampler.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/stack_walker.h"
@@ -28,6 +30,27 @@
 #include "xenia/kernel/xdroid_wait_probe.h"
 #include "xenia/kernel/xobject.h"
 #include "xenia/kernel/xthread.h"
+
+#if XE_PLATFORM_ANDROID
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#endif
+
+DEFINE_int32(
+    xdroid_audio_producer_nice, 0,
+    "XDroid360 (AUD-5): while the guest audio producer fiber (AC6: thread 18, "
+    "the XAudio2 render thread) runs, set its dispatch host thread to this "
+    "nice value, and restore it at switch-out. 0 = off; -16 is Android's "
+    "audio class. Host scheduling only: the guest sees the same ordering, "
+    "but other fibers on that dispatch thread's core get less CPU while the "
+    "producer renders. Live.",
+    "XDroid360");
 
 DEFINE_uint32(
     guest_scheduler_spin_quanta, 0,
@@ -55,6 +78,48 @@ static thread_local int t_current_cpu = -1;
 // Set while a shared I/O worker is inside a queued call, so code reached from
 // it can tell it is not on a guest thread.
 static thread_local bool t_in_blocking_call = false;
+
+// XR-3: the running scheduler, for the GPU write-back hook (a plain function
+// pointer on WakeGeneration).
+static std::atomic<GuestScheduler*> g_writeback_scheduler{nullptr};
+
+#if XE_PLATFORM_ANDROID
+namespace {
+// XDroid360 AUD-5: host-side view of the calling (dispatch) thread.
+struct HostThreadSample {
+  uint64_t wall_us = 0;
+  uint64_t cpu_us = 0;
+  uint64_t runq_us = 0;
+};
+HostThreadSample SampleHostThread() {
+  static thread_local int fd = -2;
+  if (fd == -2) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat",
+                  int(gettid()));
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+  }
+  HostThreadSample sample;
+  sample.wall_us = XdroidNowUs();
+  timespec ts;
+  if (!clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) {
+    sample.cpu_us = uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) /
+                                                          1000ull;
+  }
+  if (fd >= 0) {
+    char text[96];
+    ssize_t length = pread(fd, text, sizeof(text) - 1, 0);
+    if (length > 0) {
+      text[length] = '\0';
+      char* end = nullptr;
+      std::strtoull(text, &end, 10);  // On-CPU time, same as above.
+      sample.runq_us = std::strtoull(end, nullptr, 10) / 1000ull;
+    }
+  }
+  return sample;
+}
+}  // namespace
+#endif
 
 // Raises |target| to |value| if larger. A racing stats reset drops one sample.
 static void AccumulateMax(std::atomic<uint64_t>& target, uint64_t value) {
@@ -197,6 +262,16 @@ static void PreemptCurrentFiber(void* /*raw_context*/) {
                                                               forced_at_irql);
 }
 
+// XR-3: spin_park_handler.
+static bool ParkSpinOnGpuWriteback(uint32_t seen_generation) {
+  XThread* self = XThread::GetCurrentFiberThread();
+  if (!self) {
+    return false;
+  }
+  return self->kernel_state()->guest_scheduler()->ParkOnGpuWriteback(
+      seen_generation);
+}
+
 // Raw host ticks per us for the watchdog's deadline math, 0 if unusable.
 static double CalibrateTicksPerUs() {
   // Median of three short samples. A single busy-spin sample can be stretched
@@ -235,7 +310,14 @@ static double CalibrateTicksPerUs() {
 GuestScheduler::GuestScheduler(KernelState* kernel_state)
     : kernel_state_(kernel_state) {}
 
-GuestScheduler::~GuestScheduler() { Shutdown(); }
+GuestScheduler::~GuestScheduler() {
+  GuestScheduler* self = this;
+  if (g_writeback_scheduler.compare_exchange_strong(self, nullptr)) {
+    xe::cpu::backend::spin_park_handler = nullptr;
+    xe::threading::GuestGpuWritebackGeneration().SetBumpHook(nullptr);
+  }
+  Shutdown();
+}
 
 bool GuestScheduler::enabled() { return cvars::guest_scheduler; }
 
@@ -256,6 +338,9 @@ void GuestScheduler::EnsureStarted() {
     return;
   }
   xe::cpu::backend::preempt_yield_handler = &PreemptCurrentFiber;
+  g_writeback_scheduler.store(this, std::memory_order_release);
+  xe::threading::GuestGpuWritebackGeneration().SetBumpHook(&OnGpuWriteback);
+  xe::cpu::backend::spin_park_handler = &ParkSpinOnGpuWriteback;
   // Not in the ctor, which runs before per-title cvar overrides are applied.
   double ticks_per_us = CalibrateTicksPerUs();
   ticks_per_us_ = ticks_per_us;
@@ -929,8 +1014,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
     XdroidAudioWatch& watch = xdroid_audio_watch;
     if (next->thread_id() ==
         watch.signaler_tid.load(std::memory_order_relaxed)) {
-      const uint64_t ready =
-          watch.producer_ready_tick.exchange(0, std::memory_order_relaxed);
+      const uint64_t ready = watch.producer_ready_tick.exchange(
+          0, std::memory_order_relaxed);
       if (ready) {
         const uint64_t delay = XdroidNowUs() - ready;
         watch.dispatch_delay_us.fetch_add(delay, std::memory_order_relaxed);
@@ -954,7 +1039,75 @@ void GuestScheduler::SwitchTo(XThread* next) {
   // misattributes but still records.
   void* fiber_log = links.profiler_log;
   void* dispatch_log = fiber_log ? Profiler::SwapThreadLog(fiber_log) : nullptr;
+#if XE_PLATFORM_ANDROID
+  // XDroid360 AUD-5: split the audio producer's slices (always on, a few
+  // syscalls per producer slice), and optionally boost its host thread.
+  XdroidAudioWatch& audio_watch = xdroid_audio_watch;
+  const uint32_t audio_producer_tid =
+      audio_watch.signaler_tid.load(std::memory_order_relaxed);
+  const bool is_audio_producer =
+      audio_producer_tid && next->thread_id() == audio_producer_tid;
+  HostThreadSample producer_in;
+  int producer_nice_before = 0;
+  bool producer_nice_set = false;
+  int producer_host_cpu = -1;
+  if (is_audio_producer) {
+    errno = 0;
+    producer_nice_before = getpriority(PRIO_PROCESS, 0);
+    if (errno) {
+      producer_nice_before = 0;
+    }
+    audio_watch.dispatch_nice.store(producer_nice_before,
+                                    std::memory_order_relaxed);
+    const int32_t wanted = cvars::xdroid_audio_producer_nice;
+    if (wanted && wanted != producer_nice_before) {
+      if (!setpriority(PRIO_PROCESS, 0, wanted)) {
+        producer_nice_set = true;
+      } else {
+        static std::atomic<bool> refusal_logged{false};
+        if (!refusal_logged.exchange(true)) {
+          XELOGW("XDroid360: audio producer nice {} refused (errno {})",
+                 wanted, errno);
+        }
+      }
+    }
+    producer_host_cpu = sched_getcpu();
+    producer_in = SampleHostThread();
+  }
+#endif
   next->dispatch_fiber()->SwitchTo();
+#if XE_PLATFORM_ANDROID
+  if (is_audio_producer) {
+    const HostThreadSample out = SampleHostThread();
+    const uint64_t cpu_us = out.cpu_us - producer_in.cpu_us;
+    audio_watch.slices.fetch_add(1, std::memory_order_relaxed);
+    audio_watch.slice_wall_us.fetch_add(out.wall_us - producer_in.wall_us,
+                                        std::memory_order_relaxed);
+    audio_watch.slice_cpu_us.fetch_add(cpu_us, std::memory_order_relaxed);
+    audio_watch.slice_runq_us.fetch_add(out.runq_us - producer_in.runq_us,
+                                        std::memory_order_relaxed);
+    if (producer_host_cpu >= 0 &&
+        producer_host_cpu < XdroidAudioWatch::kHostCpus) {
+      audio_watch.host_cpu_us[producer_host_cpu].fetch_add(
+          cpu_us, std::memory_order_relaxed);
+    }
+    // Read without the lock: a diagnostic. A wake from another thread can
+    // unblock the fiber before this read and count a wait as a yield.
+    if (links.blocked) {
+      audio_watch.slice_end_wait.fetch_add(1, std::memory_order_relaxed);
+    } else if (links.xdroid_yield_kind == 1) {
+      audio_watch.slice_end_preempt.fetch_add(1, std::memory_order_relaxed);
+    } else if (links.xdroid_yield_kind == 2) {
+      audio_watch.slice_end_quantum.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      audio_watch.slice_end_yield.fetch_add(1, std::memory_order_relaxed);
+    }
+    links.xdroid_yield_kind = 0;
+    if (producer_nice_set) {
+      setpriority(PRIO_PROCESS, 0, producer_nice_before);
+    }
+  }
+#endif
   if (fiber_log) {
     Profiler::SwapThreadLog(dispatch_log);
   }
@@ -1066,6 +1219,7 @@ bool GuestScheduler::YieldCurrentThread(bool quantum_end, bool to_lower) {
   // Only a slice actually run out leaves a spinning fiber. A wait or voluntary
   // yield means it can give up the CPU, and a bump that kept its slice did not
   // cost it one.
+  links.xdroid_yield_kind = keep_slice ? 1 : (quantum_end ? 2 : 3);
   if (to_lower) {
     links.unyielded_quanta = 0;
   } else if (!keep_slice) {
@@ -1293,6 +1447,81 @@ void GuestScheduler::IoPoolWorkerLoop() {
   }
 }
 
+bool GuestScheduler::ParkOnGpuWriteback(uint32_t seen_generation) {
+  XThread* self = XThread::GetCurrentFiberThread();
+  if (!self || !started_.load() || t_current_cpu < 0) {
+    return false;
+  }
+  // The same limits as a safepoint preemption (PreemptCurrentFiber), without
+  // its bounded forcing: a declined park just keeps spinning.
+  if (xe::global_critical_region::is_held_by_current_thread()) {
+    return false;
+  }
+  auto* context = self->thread_state()->context();
+  const bool in_user_code =
+      self->user_mode() && self->user_mode()->in_user_code;
+  if (!in_user_code) {
+    auto* kpcr = context->TranslateVirtualGPR<X_KPCR*>(context->r[13]);
+    if (kpcr->current_irql >= 2) {
+      return false;
+    }
+  }
+  if (self->cooperative_wait_object() || self->cooperative_wait_set_count()) {
+    return false;
+  }
+  auto& links = self->scheduler_links();
+  const int cpu_index = t_current_cpu;
+  self->set_cooperative_wait_shape(
+      XThread::CooperativeWaitKind::kGpuWriteback, nullptr, 0);
+  links.wait_gpu_writeback = true;
+  // Counted before the park's epoch check under lock_: a bump either sees the
+  // count or the park sees the new generation (seq_cst on both sides).
+  cpus_[cpu_index].gpu_writeback_waiters.fetch_add(1);
+  gpu_writeback_waiters_.fetch_add(1);
+  BlockCurrentThread(Clock::QueryHostUptimeMillis() + kGpuWritebackBackstopMs,
+                     seen_generation);
+  gpu_writeback_waiters_.fetch_sub(1);
+  cpus_[cpu_index].gpu_writeback_waiters.fetch_sub(1);
+  links.wait_gpu_writeback = false;
+  self->clear_cooperative_wait_shape();
+  return true;
+}
+
+void GuestScheduler::OnGpuWriteback() {
+  GuestScheduler* scheduler =
+      g_writeback_scheduler.load(std::memory_order_acquire);
+  if (scheduler && scheduler->gpu_writeback_waiters_.load()) {
+    scheduler->WakeGpuWritebackWaiters();
+  }
+}
+
+void GuestScheduler::WakeGpuWritebackWaiters() {
+  // WakeAll limited to CPUs with a write-back waiter.
+  {
+    std::lock_guard<std::mutex> lock(lock_);
+    for (int i = 0; i < kMaxCpus; ++i) {
+      Cpu& cpu = cpus_[i];
+      if (!cpu.gpu_writeback_waiters.load(std::memory_order_relaxed) ||
+          !cpu.blocked_head) {
+        continue;
+      }
+      cpu.repoll_now.store(true, std::memory_order_relaxed);
+      // Ask the runner to yield whatever its priority, without a head
+      // requeue for it: the woken spin goes to the head (RereadyBlocked).
+      XThread* running = cpu.current_thread;
+      if (running) {
+        running->thread_state()->context()->preempt_requested = 1;
+      }
+    }
+  }
+  for (int i = 0; i < kMaxCpus; ++i) {
+    if (cpus_[i].gpu_writeback_waiters.load(std::memory_order_relaxed) &&
+        cpus_[i].parked.load() && cpus_[i].ready_event) {
+      cpus_[i].ready_event->Set();
+    }
+  }
+}
+
 void GuestScheduler::WakeAll() {
   if (!started_.load()) {
     return;
@@ -1427,8 +1656,12 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   // Gate only types whose every satisfying transition calls
   // WakeCooperativeWaiters, anything else polls every pass.
   XObject* wait_object = self->cooperative_wait_object();
+  const bool gpu_writeback = self->scheduler_links().wait_gpu_writeback;
   bool gated = false;
-  if (wait_object) {
+  if (gpu_writeback) {
+    // XR-3: every write-back bumps the generation and calls OnGpuWriteback.
+    gated = true;
+  } else if (wait_object) {
     switch (wait_object->type()) {
       case XObject::Type::Event:
       case XObject::Type::Semaphore:
@@ -1464,7 +1697,10 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     if (gated) {
       uint32_t epoch_now = 0;
       bool epoch_gated = false;
-      if (wait_object) {
+      if (gpu_writeback) {
+        epoch_now = xe::threading::GuestGpuWritebackGeneration().Load();
+        epoch_gated = true;
+      } else if (wait_object) {
         epoch_now = wait_object->cooperative_signal_epoch();
         epoch_gated = true;
       } else if (self->cooperative_wait_set_count()) {
@@ -1548,7 +1784,11 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
         // can resolve.
         XObject* obj = t->cooperative_wait_object();
         bool may_have_resolved = false;
-        if (obj) {
+        if (links.wait_gpu_writeback) {
+          may_have_resolved =
+              xe::threading::GuestGpuWritebackGeneration().Load() !=
+              links.wait_epoch;
+        } else if (obj) {
           may_have_resolved =
               obj->cooperative_signal_epoch() != links.wait_epoch;
         } else if (links.wait_gate_count) {
@@ -1582,7 +1822,12 @@ void GuestScheduler::RereadyBlocked(int cpu_index) {
       // KeSetAffinityThread may have moved it while blocked.
       int target = CpuOf(t);
       links.cpu = target;
-      LinkReadyLocked(cpus_[target], t, TakeHeadRequeue(links));
+      // XR-3: a parked spin would still own its CPU had it kept spinning, so
+      // it runs next, ahead of the fiber that used its CPU meanwhile. Queued
+      // behind it instead, AC6's main loop fell behind its render thread
+      // (HUD-1 join repeats 0.06% -> 0.47%, 2026-10-17).
+      const bool spin_wake = links.wait_gpu_writeback;
+      LinkReadyLocked(cpus_[target], t, TakeHeadRequeue(links) || spin_wake);
       if (target != cpu_index) {
         wake_mask |= uint32_t(1) << target;
       }
@@ -1607,6 +1852,8 @@ void GuestScheduler::RunLoop(int cpu_index) {
   t_current_cpu = cpu_index;
   Profiler::ThreadEnter(
       ("GuestScheduler CPU " + std::to_string(cpu_index)).c_str());
+  cpu::sampler::RegisterCurrentThread(
+      kernel_state_->processor(), ("CPU " + std::to_string(cpu_index)).c_str());
   Cpu& cpu = cpus_[cpu_index];
   // Adopt this host thread's stack as this CPU's idle fiber.
   cpu.idle_fiber = xe::threading::Fiber::CreateFromThread();
@@ -1833,6 +2080,8 @@ const char* CooperativeWaitKindName(uint8_t kind) {
       return "delay";
     case XThread::CooperativeWaitKind::kFence:
       return "fence";
+    case XThread::CooperativeWaitKind::kGpuWriteback:
+      return "gpu_writeback";
     default:
       return "none";
   }
@@ -1945,11 +2194,13 @@ void GuestScheduler::WatchdogLoop() {
   // sub-millisecond quantum to the same 1 ms tick, so the setting would stop
   // meaning anything below 1000. The host still adds wakeup slack, so a short
   // quantum is a target rather than a guarantee.
-  uint64_t period_us = cvars::guest_scheduler_quantum_us;
-  if (period_us < kMinWatchdogPeriodUs) {
-    period_us = kMinWatchdogPeriodUs;
-  }
   while (!shutting_down_.load()) {
+    // Read every tick so the quantum is live-switchable (CE-4 arms: a
+    // coarser tick wakes this thread less often).
+    uint64_t period_us = cvars::guest_scheduler_quantum_us;
+    if (period_us < kMinWatchdogPeriodUs) {
+      period_us = kMinWatchdogPeriodUs;
+    }
     if (host_paused_.load()) {
       // Nothing is dispatched while paused; a 1 kHz tick would only cost
       // power and count no-progress ticks. Resume and Shutdown set the event.

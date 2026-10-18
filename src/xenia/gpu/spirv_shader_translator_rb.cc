@@ -13,11 +13,18 @@
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/render_target_cache.h"
 #include "xenia/gpu/spirv_compatibility.h"
 #include "xenia/gpu/xenos_zpd_report.h"
+
+DEFINE_bool(xdroid_shd_bound_noalpha, false,
+            "SHD-1 bound experiment (WRONG with alpha test, diagnostics only): "
+            "translate pixel shaders without the alpha test, alpha to mask and "
+            "the sample mask output.",
+            "GPU");
 
 namespace xe {
 namespace gpu {
@@ -517,6 +524,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       builder_->setBuildPoint(&block_rt_0_alpha_tests_rt_written);
     }
 
+    if (!cvars::xdroid_shd_bound_noalpha) {
     // Alpha test.
     // TODO(Triang3l): Check how alpha test works with NaN on Direct3D 9.
     // Extract the comparison function (less, equal, greater bits).
@@ -627,6 +635,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
 
     // Alpha to coverage.
     FSI_AlphaToMask();
+    }
 
     if (block_rt_0_alpha_tests_rt_written_merge) {
       // Close the render target 0 written check (used by both FSI and FBO).

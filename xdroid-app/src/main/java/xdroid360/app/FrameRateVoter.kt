@@ -14,9 +14,16 @@ import kotlin.math.roundToInt
  *
  * `xdroid_frame_rate_vote = true|false` in files/xdroid/live.toml (LiveFile)
  * switches it live for an on-device A/B (phone.sh liveab).
+ *
+ * DISP-5 (the maintainer 2026-10-16: smoothness and latency over display power):
+ * with highRefresh the vote is the panel's top rate (120) whenever the game
+ * renders, so a frame waits at most ~8 ms for the next refresh instead of
+ * ~17 ms; 30 and 60 FPS still divide it evenly. Live:
+ * `xdroid_display_high_refresh = true|false`.
  */
 class FrameRateVoter {
   @Volatile var enabled = true
+  @Volatile var highRefresh = true
   private var voted = 0f
   private var pending = 0f
   private var pendingCount = 0
@@ -34,7 +41,9 @@ class FrameRateVoter {
         return null
       } else {
         val median = recent.sorted()[2]
-        if (median < 20.0) 0f else median.roundToInt().toFloat()
+        if (median < 20.0) 0f
+        else if (highRefresh) HIGH_REFRESH_HZ
+        else median.roundToInt().toFloat()
       }
     if (target == voted) {
       pendingCount = 0
@@ -49,6 +58,10 @@ class FrameRateVoter {
     voted = target
     pendingCount = 0
     return target
+  }
+
+  companion object {
+    const val HIGH_REFRESH_HZ = 120f
   }
 
   /** A new Surface carries no vote: vote again on the next update. */

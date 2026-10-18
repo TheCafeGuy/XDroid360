@@ -67,6 +67,7 @@
 #include <mutex>
 
 #include "xdroid_ac6_jobs.h"
+#include "xdroid_ac6_timing.h"
 
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
@@ -91,10 +92,16 @@ DEFINE_bool(ac6_cloud_deswizzle_fix, true,
             "XDroid360");
 
 DEFINE_bool(ac6_hud_slot_join, true,
-            "Ace Combat 6 HUD fix: the render thread "
+            "Ace Combat 6 HUD-1 fix (temp, under test): the render thread "
             "picks the HUD vertex set (0x82138048) only after the main loop "
             "advanced the frame counter it uses (0x826E4DD0) since the last "
             "pick, waiting at most ac6_hud_slot_join_us. Live.",
+            "XDroid360");
+DEFINE_bool(ac6_resource_miss_log, true,
+            "Ace Combat 6 forensic (HANGAR-1, temp): log resource handles the "
+            "game fails to resolve (0x8233E958 returning null; the hangar "
+            "crash at 0x82364158 dereferences that null) with their caller, "
+            "and how long until the same handle resolves.",
             "XDroid360");
 DEFINE_int32(ac6_hud_slot_join_us, 8000,
              "Longest wait of ac6_hud_slot_join per HUD set pick. Live.",
@@ -145,6 +152,62 @@ uint64_t HudNowUs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())
                       .count());
+}
+
+// HANGAR-1 (docs/runs/2026-10-12/u2.log): the hangar crashed at 0x82364158
+// on lwz r11, 0(r3) with r3 = 0, the result of the resource resolve
+// 0x8233E958(handle) a few instructions earlier. The resolve returns null
+// when the lookup in the table at 0x828C8080 fails (0x8233E994). Log the
+// handle id and caller on a miss, and the delay until it resolves: a load
+// still in flight (latency race) or an id that never comes back (unloaded).
+constexpr uint32_t kResResolveMiss = 0x8233E994;  // li r3, 0
+constexpr uint32_t kResResolveHit = 0x8233E9B0;   // lhz r11, 0xa(r31)
+constexpr uint32_t kResResolveMissWord = 0x38600000;
+constexpr uint32_t kResResolveHitWord = 0xA17F000A;
+
+struct ResMiss {
+  uint32_t id;
+  uint64_t us;
+};
+std::atomic<uint32_t> g_res_miss_logged{0};
+std::atomic<uint64_t> g_res_misses{0};
+ResMiss g_res_pending[16];
+std::atomic<uint32_t> g_res_pending_next{0};
+
+void ResMissHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
+  if (!cvars::ac6_resource_miss_log) {
+    return;
+  }
+  const uint8_t* membase = ctx->virtual_membase;
+  const uint32_t handle = uint32_t(ctx->r[31]);
+  const uint32_t id = Load32(membase, handle);
+  // The caller's return address: saved at old r1 - 8 = r1 + 0x68.
+  const uint32_t caller = Load32(membase, uint32_t(ctx->r[1]) + 0x68);
+  g_res_misses.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t slot =
+      g_res_pending_next.fetch_add(1, std::memory_order_relaxed) % 16;
+  g_res_pending[slot] = {id, HudNowUs()};
+  if (g_res_miss_logged.fetch_add(1, std::memory_order_relaxed) < 200) {
+    XELOGW(
+        "XDROID-RESMISS: resource {:08X} (handle {:08X}) not resolved for "
+        "caller {:08X} on guest thread {:X}",
+        id, handle, caller, ctx->thread_id);
+  }
+}
+
+void ResHitHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
+  if (!cvars::ac6_resource_miss_log ||
+      !g_res_misses.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint32_t id = Load32(ctx->virtual_membase, uint32_t(ctx->r[31]));
+  for (ResMiss& miss : g_res_pending) {
+    if (miss.us && miss.id == id) {
+      XELOGI("XDROID-RESMISS: resource {:08X} resolved {} ms after its miss",
+             id, (HudNowUs() - miss.us) / 1000);
+      miss.us = 0;
+    }
+  }
 }
 
 // Main loop thread, before the counter store.
@@ -298,6 +361,14 @@ void OnLaunch(xe::Emulator* emulator, uint32_t title_id) {
   // vtables must route vtbl[+0x04] to the dispatcher and vtbl[+0x100] to the
   // known draws.
   const uint8_t* membase = emulator->memory()->virtual_membase();
+  const bool layout_ok = Load32(membase, kVtblX360 + 4) == kEffDispatcher &&
+                         Load32(membase, kVtblAce6 + 4) == kEffDispatcher &&
+                         Load32(membase, kVtblX360 + 0x100) == kEffDrawX360 &&
+                         Load32(membase, kVtblAce6 + 0x100) == kEffDrawAce6;
+  // Same executable as AC6_recomp: its fixed timing addresses apply.
+  if (layout_ok) {
+    InstallAc6Timing(emulator);
+  }
   // HUD set pick (HUD-1): hooked whenever both instruction words match, so
   // the repeat counter runs in every arm; the wait itself is live.
   if (Load32(membase, kHudSetPickLoad) == kHudSetPickLoadWord &&
@@ -314,14 +385,25 @@ void OnLaunch(xe::Emulator* emulator, uint32_t title_id) {
                                      nullptr, nullptr),
         xe::cpu::Processor::GuestHookKind::kInstruction);
     XELOGI("XDroid360: AC6 HUD set pick hooks installed");
+  }
+  if (Load32(membase, kResResolveMiss) == kResResolveMissWord &&
+      Load32(membase, kResResolveHit) == kResResolveHitWord) {
+    xe::cpu::Processor* res_processor = emulator->processor();
+    res_processor->SetGuestHook(
+        kResResolveMiss,
+        res_processor->DefineBuiltin("XDroidAc6ResMiss", ResMissHook, nullptr,
+                                     nullptr),
+        xe::cpu::Processor::GuestHookKind::kInstruction);
+    res_processor->SetGuestHook(
+        kResResolveHit,
+        res_processor->DefineBuiltin("XDroidAc6ResHit", ResHitHook, nullptr,
+                                     nullptr),
+        xe::cpu::Processor::GuestHookKind::kInstruction);
   } else {
     XELOGW("XDroid360: AC6 HUD set pick hooks not installed (code differs)");
   }
   bool effect = cvars::ac6_effect_mode_fix;
-  if (effect && (Load32(membase, kVtblX360 + 4) != kEffDispatcher ||
-                 Load32(membase, kVtblAce6 + 4) != kEffDispatcher ||
-                 Load32(membase, kVtblX360 + 0x100) != kEffDrawX360 ||
-                 Load32(membase, kVtblAce6 + 0x100) != kEffDrawAce6)) {
+  if (effect && !layout_ok) {
     XELOGW(
         "XDroid360: AC6 effect mode fix not applied - executable layout does "
         "not match");

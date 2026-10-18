@@ -179,11 +179,13 @@ void VulkanGpuBreadcrumbs::LogWorkHang() const {
   const volatile uint32_t* work_slots =
       mapping_ + kSlotCount * (sizeof(Slot) / sizeof(uint32_t));
   const uint32_t last = next_work_id_;
-  const uint32_t first = last > kWorkSlotCount ? last - kWorkSlotCount + 1 : 1;
+  const uint32_t first =
+      last > kWorkSlotCount ? last - kWorkSlotCount + 1 : 1;
   uint32_t newest_done = 0;
   uint32_t stuck = 0;
   for (uint32_t work_id = first; work_id <= last; ++work_id) {
-    const volatile uint32_t* slot = work_slots + (work_id % kWorkSlotCount) * 2;
+    const volatile uint32_t* slot =
+        work_slots + (work_id % kWorkSlotCount) * 2;
     const uint32_t issued = slot[0];
     const uint32_t done = slot[1];
     if (done == work_id) {
@@ -226,8 +228,7 @@ void VulkanGpuBreadcrumbs::LogWorkHang() const {
   std::string variants;
   for (const VariantCount& variant : direct_resolve_variants_) {
     if (variant.pipeline_key) {
-      variants +=
-          fmt::format(" {:08X}:{}", variant.pipeline_key, variant.count);
+      variants += fmt::format(" {:08X}:{}", variant.pipeline_key, variant.count);
     }
   }
   if (!variants.empty()) {
@@ -407,7 +408,8 @@ void VulkanGpuBreadcrumbs::LogHang() const {
         "issued up to {})",
         suspect - pass.prologue_seq, pass.draw_count,
         slot.done - pass.prologue_seq,
-        slot.issued >= pass.prologue_seq ? slot.issued - pass.prologue_seq : 0);
+        slot.issued >= pass.prologue_seq ? slot.issued - pass.prologue_seq
+                                         : 0);
   }
   if (suspect) {
     const uint32_t from =
@@ -423,7 +425,8 @@ void VulkanGpuBreadcrumbs::LogHang() const {
   // Passes the CP (or the concurrent binning pipe) already started past the
   // stuck one.
   uint32_t logged = 0;
-  for (uint32_t pass_id = stuck + 1; pass_id <= last && logged < 4; ++pass_id) {
+  for (uint32_t pass_id = stuck + 1; pass_id <= last && logged < 4;
+       ++pass_id) {
     const Slot later = ReadSlot(pass_id);
     if (later.begin != pass_id || later.end == pass_id) {
       continue;
@@ -433,7 +436,8 @@ void VulkanGpuBreadcrumbs::LogHang() const {
         "XDROID-BC: also reached pass {}: sub {} draws {} (seq {}-{}), done "
         "{} issued {}",
         pass_id, later_pass.submission, later_pass.draw_count,
-        later_pass.prologue_seq, later_pass.last_seq, later.done, later.issued);
+        later_pass.prologue_seq, later_pass.last_seq, later.done,
+        later.issued);
     ++logged;
   }
 }

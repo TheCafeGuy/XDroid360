@@ -35,10 +35,10 @@
 
 #if XE_PLATFORM_ANDROID
 #include <fcntl.h>
+#include <cerrno>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #endif
@@ -84,6 +84,8 @@ DEFINE_int32(xdroid_audio_worker_nice, 0,
              "Android's audio class). Applied live by the worker, read back "
              "and logged.",
              "XDroid360");
+
+DECLARE_int32(xdroid_audio_producer_nice);
 
 namespace xe {
 namespace apu {
@@ -412,6 +414,52 @@ void AudioSystem::RunClientCallback(size_t client_index) {
           "us over {} wakes",
           dispatches ? watch.dispatch_delay_us.exchange(0) / dispatches : 0,
           watch.dispatch_delay_max_us.exchange(0), dispatches);
+      // AUD-5: where the producer's render time goes on its host thread.
+      // cpu ~ wall: it is CPU work (slow core or clock); runq large: its
+      // dispatch thread waits for a core; neither: it is off its dispatch
+      // thread between slices (guest ready queue or a wait).
+      {
+        const uint64_t slices = watch.slices.exchange(0);
+        const uint64_t per = signals ? signals : 1;
+        std::string cores;
+        for (int i = 0; i < kernel::XdroidAudioWatch::kHostCpus; ++i) {
+          const uint64_t us = watch.host_cpu_us[i].exchange(0);
+          if (us) {
+            cores += fmt::format(" {}:{}", i, us / per);
+          }
+        }
+        static bool capacities_logged = false;
+        if (!capacities_logged && slices) {
+          capacities_logged = true;
+          std::string capacities;
+          for (int i = 0; i < kernel::XdroidAudioWatch::kHostCpus; ++i) {
+            char path[64];
+            std::snprintf(path, sizeof(path),
+                          "/sys/devices/system/cpu/cpu%d/cpu_capacity", i);
+            if (FILE* file = std::fopen(path, "r")) {
+              int capacity = 0;
+              if (std::fscanf(file, "%d", &capacity) == 1) {
+                capacities += fmt::format(" {}:{}", i, capacity);
+              }
+              std::fclose(file);
+            }
+          }
+          XELOGI("XDroid360: host core capacities:{}", capacities);
+        }
+        XELOGI(
+            "XDroid360: audio producer host split per render: {} slices, wall "
+            "{} us, cpu {} us, host runq {} us; slice ends wait {} preempt {} "
+            "quantum {} yield {}; cpu us per render by host core:{}; dispatch "
+            "nice {} (boost {})",
+            slices, watch.slice_wall_us.exchange(0) / per,
+            watch.slice_cpu_us.exchange(0) / per,
+            watch.slice_runq_us.exchange(0) / per,
+            watch.slice_end_wait.exchange(0),
+            watch.slice_end_preempt.exchange(0),
+            watch.slice_end_quantum.exchange(0),
+            watch.slice_end_yield.exchange(0), cores,
+            watch.dispatch_nice.load(), cvars::xdroid_audio_producer_nice);
+      }
       total_cpu_us = 0;
       total_runq_us = 0;
 #endif

@@ -7,6 +7,10 @@
 
 #include <filesystem>
 
+namespace xe::gpu {
+class GraphicsSystem;
+}  // namespace xe::gpu
+
 namespace xdroid {
 
 // Starts (once per process) a thread that polls `path` and applies the cvars it
@@ -15,6 +19,11 @@ namespace xdroid {
 // cvars whose users read them on every use are applied; other keys are logged
 // as segment markers. Removes a stale file left by a previous session first.
 void StartLiveConfig(const std::filesystem::path& path);
+
+// GPU-BENCH capture: once set, `xdroid_gpu_trace_frames = N` in live.toml
+// streams about N frames into <storage>/traces/ (needs a build with
+// XENIA_ENABLE_GPU_TRACE; the trace writer is compiled out otherwise).
+void SetLiveGraphicsSystem(xe::gpu::GraphicsSystem* graphics_system);
 
 }  // namespace xdroid
 
