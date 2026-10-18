@@ -1,174 +1,35 @@
 name: CI
 
+# XDroid360 ships only an Android APK, built and tested on the maintainer's
+# machine and device, and takes issues rather than pull requests. The desktop
+# builds inherited from xenia (Linux, Windows, macOS, about an hour per run)
+# checked nothing that ships, so CI keeps only the format lint.
 on:
   push:
+    branches: [main]
     paths-ignore:
       - '*.md'
       - 'docs/**'
       - 'LICENSE'
   pull_request:
-    # ready_for_review is what starts the pipeline for a PR that was opened as
-    # a draft, since the build job below skips while it stays one.
-    types: [opened, synchronize, reopened, ready_for_review]
     paths-ignore:
       - '*.md'
       - 'docs/**'
       - 'LICENSE'
   workflow_dispatch:
 
-# No workflow-level `permissions:` block; each job declares its own minimum
-# set explicitly. Workflow-level restrictions can cap job-level overrides in
-# ways that break release creation, so this keeps the release job's
-# `contents: write` intact.
+permissions:
+  contents: read
 
 jobs:
-  # One build job for every ref, each granted `actions: write` so any branch can
-  # populate the sccache cache. Cache writes cover only third_party (stable
-  # across branches), keeping per-branch entries small and isolated. Fork PRs
-  # get a read-only token from GitHub regardless, so sccache self-demotes to
-  # read-only on its startup write probe.
-  build:
-    name: Build
-    # Draft PRs don't need the pipeline. Marking one ready re-triggers it.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.draft == false
-    permissions:
-      contents: read
-      actions: write
-    uses: ./.github/workflows/build.yml
-
-  release:
-    name: Create Release
-    needs: build
-    # Runs on macOS so we can lipo the two per-arch app bundles into a
-    # universal binary here rather than in a separate build job. lipo,
-    # codesign, hdiutil, gh, and 7z are all available on macOS runners.
-    runs-on: macos-26
-    permissions:
-      contents: write
-    if: |
-      github.repository == 'has207/xenia-edge' &&
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/edge'
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: xenia_edge_linux
-          path: linux_artifacts
-
-      - name: Download Windows artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: xenia_edge_windows
-          path: windows_artifacts
-
-      - name: Download macOS arm64 app bundle
-        uses: actions/download-artifact@v8
-        with:
-          name: xenia_edge_macos_arm64_app
-          path: macos_arm64_app
-
-      - name: Download macOS x86_64 app bundle
-        uses: actions/download-artifact@v8
-        with:
-          name: xenia_edge_macos_x86_64_app
-          path: macos_x86_64_app
-
-      - name: Build universal macOS DMG
+      - uses: actions/checkout@v6
+      - name: Setup
         run: |
-          mkdir -p macos_arm64_extracted macos_x86_64_extracted
-          tar -xf macos_arm64_app/Xenia-edge.app.tar -C macos_arm64_extracted
-          tar -xf macos_x86_64_app/Xenia-edge.app.tar -C macos_x86_64_extracted
-
-          arm64_bundle="macos_arm64_extracted/Xenia-edge.app"
-          x86_64_bundle="macos_x86_64_extracted/Xenia-edge.app"
-          arm64_exe="$arm64_bundle/Contents/MacOS/Xenia-edge"
-          x86_64_exe="$x86_64_bundle/Contents/MacOS/Xenia-edge"
-
-          # Only the main executable gets merged; any non-Mach-O drift between
-          # the two Contents/ trees would be silently dropped here, so fail
-          # loudly if the bundles diverge anywhere outside MacOS/Xenia-edge.
-          if ! diff -r --brief \
-              --exclude=Xenia-edge \
-              "$arm64_bundle/Contents" "$x86_64_bundle/Contents"; then
-            echo "::error::arm64 and x86_64 app bundles differ outside the main executable"
-            exit 1
-          fi
-
-          # arm64 bundle becomes the base and we overwrite only its main
-          # Mach-O with the fat one. Write to a separate path then mv — lipo
-          # reads inputs before writing, but overlapping input/output is
-          # fragile.
-          lipo -create "$arm64_exe" "$x86_64_exe" -output Xenia-edge.universal
-          mv Xenia-edge.universal "$arm64_exe"
-
-          info=$(lipo -info "$arm64_exe")
-          echo "$info"
-          if ! echo "$info" | grep -q "arm64" || ! echo "$info" | grep -q "x86_64"; then
-            echo "::error::Universal binary missing an arch: $info"
-            exit 1
-          fi
-
-          # lipo invalidates the linker-applied ad-hoc signature; arm64 will
-          # refuse to launch unsigned, so re-sign ad-hoc. Re-signing replaces
-          # entitlements rather than preserving them, so pass them again or the
-          # universal build ships without the JIT ones the per-arch builds got.
-          codesign --force --sign - \
-            --entitlements xenia.entitlements "$arm64_bundle"
-
-          mkdir -p dmg_contents
-          cp -R "$arm64_bundle" dmg_contents/
-          cp LICENSE dmg_contents/
-          ln -s /Applications dmg_contents/Applications
-
-          hdiutil create -volname "Xenia-edge" \
-            -srcfolder dmg_contents -ov -format UDZO \
-            xenia_edge_macos.dmg
-          rm -rf dmg_contents
-
-      - name: Create Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          # Hoist linux/windows artifacts; macOS DMG is already at top level.
-          cd linux_artifacts
-          # For Linux, just rename the AppImage (no need to zip a single file)
-          mv xenia_edge.AppImage ../xenia_edge_linux.AppImage
-          cd ../windows_artifacts
-          7z a ../xenia_edge_windows.zip * -xr!'*.pdb' -mx9 -bb3
-          cd ..
-
-          # Build release body: commit list since last release + compare URL
-          tag=${GITHUB_SHA::7}
-          prev_tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null || echo "")
-          prev_sha=""
-          if [ -n "$prev_tag" ]; then
-            prev_sha=$(git rev-parse "${prev_tag}^{}" 2>/dev/null || git rev-parse "$prev_tag" 2>/dev/null || echo "")
-          fi
-          {
-            if [ -n "$prev_sha" ]; then
-              echo "### Changes"
-              echo ""
-              git log --format="- %s (\`%h\`)" --abbrev=7 "${prev_sha}..${GITHUB_SHA}" --
-              echo ""
-              echo "**Full changelog**: https://github.com/${GH_REPO}/compare/${prev_tag}...${tag}"
-            else
-              echo "### Changes"
-              echo ""
-              git log --format="- %s (\`%h\`)" --abbrev=7 -1 "${GITHUB_SHA}" --
-            fi
-          } > release_notes.md
-
-          # Create release
-          gh release create $tag \
-            xenia_edge_linux.AppImage xenia_edge_windows.zip \
-            xenia_edge_macos.dmg \
-            --target $GITHUB_SHA -t "xenia_edge" --notes-file release_notes.md
+          pipx install clang-format==21.1.8
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Lint
+        run: ./xenia-build.py lint --all
