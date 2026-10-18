@@ -63,14 +63,12 @@ bool VulkanGpuSanity::enabled() {
 
 void VulkanGpuSanity::CheckDraw(
     const RegisterFile& regs, const Shader& vertex_shader,
-    const Shader* pixel_shader,
-    const IndexBuffer* index_buffer_info,
+    const Shader* pixel_shader, const IndexBuffer* index_buffer_info,
     const std::vector<draw_util::MemExportRange>& memexport_ranges,
     const DrawId& id) {
   const Shader::ConstantRegisterMap& constant_map =
       vertex_shader.constant_register_map();
-  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap);
-       ++i) {
+  for (uint32_t i = 0; i < xe::countof(constant_map.vertex_fetch_bitmap); ++i) {
     uint32_t bits = constant_map.vertex_fetch_bitmap[i];
     uint32_t j;
     while (xe::bit_scan_forward(bits, &j)) {
@@ -140,13 +138,12 @@ void VulkanGpuSanity::CheckDraw(
   }
 }
 
-void VulkanGpuSanity::Drop(const char* reason, int severity,
-                           const DrawId& id) {
-  XdroidEvent("san-drop", severity,
-              Mix(Mix(id.vs_hash, id.ps_hash),
-                  std::hash<std::string_view>()(reason)),
-              "draw dropped: {} VS {:016X} PS {:016X} submission {} draw {}",
-              reason, id.vs_hash, id.ps_hash, id.submission, id.draw_index);
+void VulkanGpuSanity::Drop(const char* reason, int severity, const DrawId& id) {
+  XdroidEvent(
+      "san-drop", severity,
+      Mix(Mix(id.vs_hash, id.ps_hash), std::hash<std::string_view>()(reason)),
+      "draw dropped: {} VS {:016X} PS {:016X} submission {} draw {}", reason,
+      id.vs_hash, id.ps_hash, id.submission, id.draw_index);
 }
 
 void VulkanGpuSanity::NullDescriptor(const char* kind, bool pixel,

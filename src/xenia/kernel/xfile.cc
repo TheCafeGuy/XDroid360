@@ -119,9 +119,8 @@ class LoadProbe {
         "host_io_ms={:.0f} max_req_ms={:.1f} drive_wait_ms={:.0f} "
         "modeled_ms={:.0f} other_ms={:.0f} host_MBps={:.1f} top={}",
         kind, wall_start_ms_, dur_ms, reads_, seeks_, mb, host_ms,
-        double(max_host_us_) / 1000.0, wait_ms,
-        double(modeled_us_) / 1000.0, other_ms,
-        host_ms > 0 ? mb / (host_ms / 1000.0) : 0.0, top);
+        double(max_host_us_) / 1000.0, wait_ms, double(modeled_us_) / 1000.0,
+        other_ms, host_ms > 0 ? mb / (host_ms / 1000.0) : 0.0, top);
   }
 
   std::mutex lock_;

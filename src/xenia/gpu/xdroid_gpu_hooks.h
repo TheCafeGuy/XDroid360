@@ -46,8 +46,7 @@ struct XdroidGpuHooks {
       before_publish{nullptr};
   // CP thread, entering an indirect buffer: a host copy to execute instead of
   // guest memory, or null. |flags| receives XdroidIbFlags.
-  std::atomic<const void* (*)(uint32_t ptr, uint32_t dwords,
-                              uint32_t* flags)>
+  std::atomic<const void* (*)(uint32_t ptr, uint32_t dwords, uint32_t* flags)>
       ib_source{nullptr};
   // CP thread, leaving the indirect buffer entered last.
   std::atomic<void (*)()> ib_end{nullptr};
@@ -63,9 +62,9 @@ struct XdroidGpuHooks {
 
 // Flags of an indirect buffer as the CP executes it (ib_source).
 enum XdroidIbFlags : uint32_t {
-  kXdroidIbKicked = 1,     // found among the buffers seen at kick
-  kXdroidIbSnapshot = 2,   // executed from the copy taken at kick
-  kXdroidIbChanged = 4,    // guest bytes at parse differ from those at kick
+  kXdroidIbKicked = 1,    // found among the buffers seen at kick
+  kXdroidIbSnapshot = 2,  // executed from the copy taken at kick
+  kXdroidIbChanged = 4,   // guest bytes at parse differ from those at kick
 };
 
 XdroidGpuHooks& GetXdroidGpuHooks();

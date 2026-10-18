@@ -162,8 +162,8 @@ class TextureCache {
     uint32_t format = 0;  // xenos::ColorFormat of the copy destination.
     uint32_t endian = 0;  // xenos::Endian128 of the copy destination.
     uint32_t msaa_samples = 0;
-    bool fast = false;    // A kFast* copy shader (a pure bit move).
-    bool direct = false;  // Read the host render targets directly.
+    bool fast = false;      // A kFast* copy shader (a pure bit move).
+    bool direct = false;    // Read the host render targets directly.
     uint32_t resolves = 0;  // Resolves to this page since the last load.
   };
   void CensusNoteResolve(const CensusResolve& resolve);

@@ -10,13 +10,13 @@
 #ifndef XENIA_UI_WINDOWED_APP_CONTEXT_ANDROID_H_
 #define XENIA_UI_WINDOWED_APP_CONTEXT_ANDROID_H_
 
-#include <atomic>
 #include <android/asset_manager.h>
 #include <android/configuration.h>
 #include <android/looper.h>
 #include <android/native_window.h>
 #include <jni.h>
 #include <array>
+#include <atomic>
 #include <memory>
 
 #include "xenia/ui/windowed_app_context.h"

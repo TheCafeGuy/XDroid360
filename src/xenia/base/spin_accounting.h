@@ -62,9 +62,8 @@ inline SpinAccount* ThisThreadSpinAccount() {
   SpinAccount* accounts = SpinAccounts();
   for (size_t i = 0; i < kMaxSpinAccounts; ++i) {
     int32_t slot_tid = accounts[i].tid.load(std::memory_order_acquire);
-    if (slot_tid == 0 &&
-        accounts[i].tid.compare_exchange_strong(slot_tid, tid,
-                                                std::memory_order_acq_rel)) {
+    if (slot_tid == 0 && accounts[i].tid.compare_exchange_strong(
+                             slot_tid, tid, std::memory_order_acq_rel)) {
       slot_tid = tid;
     }
     if (slot_tid == tid) {

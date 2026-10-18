@@ -192,9 +192,8 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data,
         trace_ptr += sizeof(*cmd);
         if (skip_identical_memory_) {
           memory_scratch_.resize(cmd->decoded_length);
-          DecompressMemory(cmd->encoding_format, trace_ptr,
-                           cmd->encoded_length, memory_scratch_.data(),
-                           cmd->decoded_length);
+          DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
+                           memory_scratch_.data(), cmd->decoded_length);
           uint8_t* dest = memory->TranslatePhysical(cmd->base_ptr);
           if (std::memcmp(dest, memory_scratch_.data(), cmd->decoded_length)) {
             std::memcpy(dest, memory_scratch_.data(), cmd->decoded_length);

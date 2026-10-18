@@ -727,8 +727,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
       uint32_t dump_pitch, bool copy_dest_scaled,
       VulkanSharedMemory& shared_memory, VulkanTextureCache& texture_cache,
-      bool link = false, bool link_spliced = false,
-      bool* linked_out = nullptr);
+      bool link = false, bool link_spliced = false, bool* linked_out = nullptr);
 
   // Writes contents of host render targets within rectangles from
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_ - with the plain 1x1

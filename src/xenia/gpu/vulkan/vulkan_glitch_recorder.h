@@ -50,17 +50,16 @@ class VulkanGlitchRecorder {
 
   // Reads back finished thumbnails, scores them, and records the copy of a
   // candidate's frames into the open submission. Writes finished dumps.
-  void Poll(DeferredCommandBuffer& command_buffer, uint64_t completed_submission,
-            uint64_t current_submission, uint64_t frame);
+  void Poll(DeferredCommandBuffer& command_buffer,
+            uint64_t completed_submission, uint64_t current_submission,
+            uint64_t frame);
   // With the guest output image in GENERAL and every write to it made
   // available to transfer reads (the caller's barrier), records its capture.
   void Capture(DeferredCommandBuffer& command_buffer, VkImage guest_output,
                uint32_t width, uint32_t height, uint64_t current_submission,
                uint64_t frame);
   // The last frame flagged as HUD-1 (radar blocks), UINT64_MAX once taken.
-  uint64_t TakeHud1Frame() {
-    return std::exchange(hud1_frame_, UINT64_MAX);
-  }
+  uint64_t TakeHud1Frame() { return std::exchange(hud1_frame_, UINT64_MAX); }
 
  private:
   static constexpr uint32_t kRingSize = 8;

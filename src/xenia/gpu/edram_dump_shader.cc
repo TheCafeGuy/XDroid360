@@ -156,9 +156,9 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
   // TEX-1b: the linear copy of the pixels, the same 16-byte block array.
   spv::Id link_buffer = spv::NoResult;
   if (key.direct_resolve && key.link_scratch) {
-    link_buffer = builder.createVariable(spv::NoPrecision,
-                                         spv::StorageClassUniform, type_dest,
-                                         "xe_resolve_link");
+    link_buffer =
+        builder.createVariable(spv::NoPrecision, spv::StorageClassUniform,
+                               type_dest, "xe_resolve_link");
     builder.addDecoration(link_buffer, spv::DecorationDescriptorSet,
                           options.descriptor_set_link);
     builder.addDecoration(link_buffer, spv::DecorationBinding, 0);
@@ -954,15 +954,13 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
     // For read_as_1x, the source tile is in the render target's own pixels,
     // and the position within it is converted per pixel below.
     uint32_t source_tile_pixels_x =
-        key.read_as_1x
-            ? tile_width >>
-                  uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X)
-            : tile_pixels_x;
+        key.read_as_1x ? tile_width >> uint32_t(key.msaa_samples >=
+                                                xenos::MsaaSamples::k4X)
+                       : tile_pixels_x;
     uint32_t source_tile_pixels_y =
-        key.read_as_1x
-            ? tile_height >>
-                  uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X)
-            : tile_pixels_y;
+        key.read_as_1x ? tile_height >> uint32_t(key.msaa_samples >=
+                                                 xenos::MsaaSamples::k2X)
+                       : tile_pixels_y;
     spv::Id source_tile_origin_x = multiply(
         builder.makeUintConstant(source_tile_pixels_x),
         add(builder.createBinOp(spv::OpUMod, type_uint, source_tile_index,
@@ -973,12 +971,12 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         multiply(builder.makeUintConstant(source_tile_pixels_y),
                  builder.createBinOp(spv::OpUDiv, type_uint, source_tile_index,
                                      source_pitch_tiles));
-    spv::Id source_pixel_x =
-        key.read_as_1x ? source_tile_origin_x
-                       : add(source_tile_origin_x, pixel_in_tile_x);
-    spv::Id source_pixel_y =
-        key.read_as_1x ? source_tile_origin_y
-                       : add(source_tile_origin_y, pixel_in_tile_y);
+    spv::Id source_pixel_x = key.read_as_1x
+                                 ? source_tile_origin_x
+                                 : add(source_tile_origin_x, pixel_in_tile_x);
+    spv::Id source_pixel_y = key.read_as_1x
+                                 ? source_tile_origin_y
+                                 : add(source_tile_origin_y, pixel_in_tile_y);
     if (fill_bias_y != spv::NoResult) {
       source_pixel_y = add(source_pixel_y, fill_bias_y);
     }
@@ -1021,22 +1019,21 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         // k23 starts at sample 2, k01 and k0123 at 0.
         spv::Id first_sample = builder.createTriOp(
             spv::OpSelect, type_uint,
-            builder.createBinOp(
-                spv::OpIEqual, type_bool, sample_select,
-                builder.makeUintConstant(
-                    uint32_t(xenos::CopySampleSelect::k23))),
+            builder.createBinOp(spv::OpIEqual, type_bool, sample_select,
+                                builder.makeUintConstant(
+                                    uint32_t(xenos::CopySampleSelect::k23))),
             builder.makeUintConstant(2), const_uint_0);
         average_sample_ids[0] = first_sample;
-        average_sample_ids[1] = builder.createBinOp(
-            spv::OpBitwiseOr, type_uint, first_sample,
-            builder.makeUintConstant(1));
+        average_sample_ids[1] =
+            builder.createBinOp(spv::OpBitwiseOr, type_uint, first_sample,
+                                builder.makeUintConstant(1));
         average_sample_ids[2] = builder.makeUintConstant(2);
         average_sample_ids[3] = builder.makeUintConstant(3);
       } else {
         average_sample_count = 2;
         for (uint32_t i = 0; i < 2; ++i) {
-          average_sample_ids[i] =
-              builder.makeUintConstant(draw_util::GetD3D10SampleIndexForGuest2xMSAA(
+          average_sample_ids[i] = builder.makeUintConstant(
+              draw_util::GetD3D10SampleIndexForGuest2xMSAA(
                   i, options.msaa_2x_attachments_supported));
         }
       }
@@ -1061,9 +1058,8 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         for (uint32_t i = 0; i < average_sample_count; ++i) {
           spv::Id value = builder.createBinOp(
               spv::OpFMul, type_float,
-              builder.createUnaryOp(
-                  spv::OpConvertUToF, type_float,
-                  extract(sample_packed[i], channel * 8, 8)),
+              builder.createUnaryOp(spv::OpConvertUToF, type_float,
+                                    extract(sample_packed[i], channel * 8, 8)),
               const_unorm8_scale);
           sum = i ? builder.createBinOp(spv::OpFAdd, type_float, sum, value)
                   : value;
@@ -1080,12 +1076,12 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
                 builder.createBinOp(spv::OpFMul, type_float, clamped,
                                     builder.makeFloatConstant(255.0f)),
                 builder.makeFloatConstant(0.5f)));
-        result = channel ? builder.createQuadOp(
-                               spv::OpBitFieldInsert, type_uint, result,
-                               channel_value,
-                               builder.makeUintConstant(channel * 8),
-                               builder.makeUintConstant(8))
-                         : channel_value;
+        result = channel
+                     ? builder.createQuadOp(
+                           spv::OpBitFieldInsert, type_uint, result,
+                           channel_value, builder.makeUintConstant(channel * 8),
+                           builder.makeUintConstant(8))
+                     : channel_value;
       }
       packed[0] = result;
     };
@@ -1120,15 +1116,15 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
         if (key.msaa_samples >= xenos::MsaaSamples::k4X) {
           // sample = ((u >> 1) & 1) | (((v >> 1) & 1) << 1), pixel per axis
           // = ((c >> 2) << 1) | (c & 1).
-          sample_id = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, extract(u, 1, 1),
-              extract(v, 1, 1), const_uint_1, const_uint_1);
-          in_tile_x = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, u, shift_right(u, 2),
-              const_uint_1, builder.makeUintConstant(31));
-          in_tile_y = builder.createQuadOp(
-              spv::OpBitFieldInsert, type_uint, v, shift_right(v, 2),
-              const_uint_1, builder.makeUintConstant(31));
+          sample_id = builder.createQuadOp(spv::OpBitFieldInsert, type_uint,
+                                           extract(u, 1, 1), extract(v, 1, 1),
+                                           const_uint_1, const_uint_1);
+          in_tile_x = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, u,
+                                           shift_right(u, 2), const_uint_1,
+                                           builder.makeUintConstant(31));
+          in_tile_y = builder.createQuadOp(spv::OpBitFieldInsert, type_uint, v,
+                                           shift_right(v, 2), const_uint_1,
+                                           builder.makeUintConstant(31));
         } else {
           // The guest sample in u bit 1, pixel X = (u & ~2) | (v & 2),
           // pixel Y = ((v & ~3) >> 1) | (v & 1).
@@ -1152,8 +1148,7 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
       } else if (key.average_samples) {
         load_average_8888(pixel_x, source_pixel_y, pixel_packed);
       } else {
-        load_and_pack(pixel_x, source_pixel_y, source_sample_id,
-                      pixel_packed);
+        load_and_pack(pixel_x, source_pixel_y, source_sample_id, pixel_packed);
       }
       for (uint32_t j = 0; j < dwords_per_pixel; ++j) {
         run_packed[i * dwords_per_pixel + j] = pixel_packed[j];
@@ -1467,9 +1462,9 @@ std::vector<uint32_t> BuildEdramDumpShaderSpirv(
             spv::OpBitcast, type_int,
             block ? add(link_block_index, builder.makeUintConstant(1))
                   : link_block_index));
-        builder.createStore(
-            block_value, builder.createAccessChain(spv::StorageClassUniform,
-                                                   link_buffer, id_vector_temp));
+        builder.createStore(block_value, builder.createAccessChain(
+                                             spv::StorageClassUniform,
+                                             link_buffer, id_vector_temp));
       }
     }
     if_write.makeEndIf();

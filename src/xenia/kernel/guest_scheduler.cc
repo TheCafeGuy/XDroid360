@@ -103,8 +103,8 @@ HostThreadSample SampleHostThread() {
   sample.wall_us = XdroidNowUs();
   timespec ts;
   if (!clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts)) {
-    sample.cpu_us = uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) /
-                                                          1000ull;
+    sample.cpu_us =
+        uint64_t(ts.tv_sec) * 1000000ull + uint64_t(ts.tv_nsec) / 1000ull;
   }
   if (fd >= 0) {
     char text[96];
@@ -1014,8 +1014,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
     XdroidAudioWatch& watch = xdroid_audio_watch;
     if (next->thread_id() ==
         watch.signaler_tid.load(std::memory_order_relaxed)) {
-      const uint64_t ready = watch.producer_ready_tick.exchange(
-          0, std::memory_order_relaxed);
+      const uint64_t ready =
+          watch.producer_ready_tick.exchange(0, std::memory_order_relaxed);
       if (ready) {
         const uint64_t delay = XdroidNowUs() - ready;
         watch.dispatch_delay_us.fetch_add(delay, std::memory_order_relaxed);
@@ -1066,8 +1066,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
       } else {
         static std::atomic<bool> refusal_logged{false};
         if (!refusal_logged.exchange(true)) {
-          XELOGW("XDroid360: audio producer nice {} refused (errno {})",
-                 wanted, errno);
+          XELOGW("XDroid360: audio producer nice {} refused (errno {})", wanted,
+                 errno);
         }
       }
     }
@@ -1471,8 +1471,8 @@ bool GuestScheduler::ParkOnGpuWriteback(uint32_t seen_generation) {
   }
   auto& links = self->scheduler_links();
   const int cpu_index = t_current_cpu;
-  self->set_cooperative_wait_shape(
-      XThread::CooperativeWaitKind::kGpuWriteback, nullptr, 0);
+  self->set_cooperative_wait_shape(XThread::CooperativeWaitKind::kGpuWriteback,
+                                   nullptr, 0);
   links.wait_gpu_writeback = true;
   // Counted before the park's epoch check under lock_: a bump either sees the
   // count or the park sees the new generation (seq_cst on both sides).

@@ -25,17 +25,19 @@
 
 DECLARE_bool(spirv_fine_derivatives);
 DECLARE_bool(xdroid_shader_sign_spec);
-DEFINE_bool(xdroid_tfetch_implicit_lod, true,
-            "SHD-2: sample 2D textures with automatic LOD (implicit derivatives "
-            "+ the gradient exponent bias as a LOD bias, as cube and 3D already "
-            "do) instead of explicit gradients. Boot only.",
-            "GPU");
+DEFINE_bool(
+    xdroid_tfetch_implicit_lod, true,
+    "SHD-2: sample 2D textures with automatic LOD (implicit derivatives "
+    "+ the gradient exponent bias as a LOD bias, as cube and 3D already "
+    "do) instead of explicit gradients. Boot only.",
+    "GPU");
 DECLARE_bool(xdroid_shader_vfetch_spec);
-DEFINE_int32(xdroid_shd_bound_vendian, -1,
-             "SHD-1 bound experiment (may be WRONG, diagnostics only): if >= 0, "
-             "every vertex fetch uses this endianness instead of the fetch "
-             "constant's, so the swap folds.",
-             "GPU");
+DEFINE_int32(
+    xdroid_shd_bound_vendian, -1,
+    "SHD-1 bound experiment (may be WRONG, diagnostics only): if >= 0, "
+    "every vertex fetch uses this endianness instead of the fetch "
+    "constant's, so the swap folds.",
+    "GPU");
 DEFINE_bool(xdroid_shd_bound_signs, false,
             "SHD-1 bound experiment (WRONG OUTPUT, diagnostics only): treat "
             "every texture component as unsigned at translation time, so the "
@@ -814,10 +816,9 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         instr.dimension == xenos::FetchOpDimension::k2D && is_pixel_shader() &&
         GetSpirvShaderModification().pixel.param_gen_enable &&
         input_fragment_coordinates_ != spv::NoResult) {
-      const std::string& hashes =
-          cvars::deswizzle_identity_ps_hashes.empty()
-              ? title_deswizzle_identity_ps_hashes
-              : cvars::deswizzle_identity_ps_hashes;
+      const std::string& hashes = cvars::deswizzle_identity_ps_hashes.empty()
+                                      ? title_deswizzle_identity_ps_hashes
+                                      : cvars::deswizzle_identity_ps_hashes;
       deswizzle_identity =
           !hashes.empty() &&
           UcodeHashSlotInList(current_shader().ucode_data_hash(),
@@ -1834,8 +1835,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
         spv::Id& spec = spec_texture_swizzled_signs_[word_index];
         if (spec == spv::NoResult) {
           spec = builder_->makeUintConstant(0, true);
-          builder_->addDecoration(spec, spv::DecorationSpecId,
-                                  int(word_index));
+          builder_->addDecoration(spec, spv::DecorationSpecId, int(word_index));
         }
         swizzled_signs_word = spec;
       } else {

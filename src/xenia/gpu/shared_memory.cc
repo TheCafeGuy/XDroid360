@@ -595,8 +595,7 @@ bool SharedMemory::IsRangeSampledZero(uint32_t start, uint32_t length) const {
     return false;
   }
   const uint8_t* data = memory_.TranslatePhysical<const uint8_t*>(start);
-  uint32_t step =
-      std::max(((length - 16) / 31) & ~UINT32_C(15), UINT32_C(16));
+  uint32_t step = std::max(((length - 16) / 31) & ~UINT32_C(15), UINT32_C(16));
   for (uint32_t i = 0; i < 32; ++i) {
     uint32_t offset = std::min(i * step, length - 16);
     uint64_t lo, hi;

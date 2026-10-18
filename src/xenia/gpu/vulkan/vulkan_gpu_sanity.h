@@ -48,8 +48,7 @@ class VulkanGpuSanity {
   // The guest state of a draw about to be recorded.
   static void CheckDraw(
       const RegisterFile& regs, const Shader& vertex_shader,
-      const Shader* pixel_shader,
-      const IndexBuffer* index_buffer,
+      const Shader* pixel_shader, const IndexBuffer* index_buffer,
       const std::vector<draw_util::MemExportRange>& memexport_ranges,
       const DrawId& id);
 

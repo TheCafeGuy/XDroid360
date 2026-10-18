@@ -41,13 +41,12 @@ bool VulkanPrimitiveProcessor::Initialize() {
   // (sal063/AC6_recomp, BSD-3) made VS point-list expansion its default for
   // the same particle and trail glitches. Opt-in here until it is verified on
   // device.
-  const bool gs_expansion =
-      device_properties.geometryShader &&
-      !cvars::vulkan_expand_points_rects_in_vs;
-  if (!InitializeCommon(
-          device_properties.fullDrawIndexUint32, device_properties.triangleFans,
-          false, device_properties.geometryShader, gs_expansion,
-          gs_expansion)) {
+  const bool gs_expansion = device_properties.geometryShader &&
+                            !cvars::vulkan_expand_points_rects_in_vs;
+  if (!InitializeCommon(device_properties.fullDrawIndexUint32,
+                        device_properties.triangleFans, false,
+                        device_properties.geometryShader, gs_expansion,
+                        gs_expansion)) {
     Shutdown();
     return false;
   }
@@ -105,7 +104,8 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
     // been used yet, and builtin_index_buffer_upload_ is written before
     // submitting commands reading it.
 
-    command_processor_.TagPassEnd(VulkanCommandProcessor::PassEndReason::kSubmit);
+    command_processor_.TagPassEnd(
+        VulkanCommandProcessor::PassEndReason::kSubmit);
     command_processor_.EndRenderPass();
 
     DeferredCommandBuffer& command_buffer =

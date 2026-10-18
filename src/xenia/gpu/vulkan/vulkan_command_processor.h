@@ -13,19 +13,19 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <thread>
 #include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <map>
 #include <utility>
 #include <vector>
 
@@ -722,8 +722,9 @@ class VulkanCommandProcessor final : public CommandProcessor {
   VulkanDrawBlackbox draw_blackbox_;
   // GPU-SAN (xdroid_gpu_sanity): the draw about to be recorded, and a drop of
   // it reported as an event.
-  VulkanGpuSanity::DrawId XdroidSanDrawId(const VulkanShader* vertex_shader,
-                                          const VulkanShader* pixel_shader) const;
+  VulkanGpuSanity::DrawId XdroidSanDrawId(
+      const VulkanShader* vertex_shader,
+      const VulkanShader* pixel_shader) const;
   // XR-4 Phase 0: runs of back-to-back mergeable resolves (index = run
   // length, last = that or longer; index 0 counts resolves that are not
   // mergeable).

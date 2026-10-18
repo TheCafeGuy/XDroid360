@@ -57,9 +57,9 @@ X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
     // Page-fault-driven reads of a mapped image (FUSE/SAF on Android) go
     // a page cluster at a time; one WILLNEED queues the whole span instead.
     const size_t map_size = entry_->mmap()->size();
-    const size_t span_end = std::min(
-        map_size, real_offset + real_length +
-                      size_t(cvars::vfs_iso_prefetch_kb) * 1024);
+    const size_t span_end =
+        std::min(map_size, real_offset + real_length +
+                               size_t(cvars::vfs_iso_prefetch_kb) * 1024);
     const size_t page = xe::memory::page_size();
     uint8_t* const base = entry_->mmap()->data();
     const uintptr_t start =

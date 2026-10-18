@@ -83,8 +83,8 @@ struct XdroidAudioWatch {
   // AUD-5: the producer's own slices on its dispatch host thread, from
   // switch-in to switch-out: wall time, host CPU time, host run-queue delay
   // (schedstat), and why each slice ended (wait, preempted, quantum end,
-  // voluntary yield such as a contended spinlock). Thread 18 (AC6's XAudio2 render
-  // thread) never waits on another guest object while it renders, so its
+  // voluntary yield such as a contended spinlock). Thread 18 (AC6's XAudio2
+  // render thread) never waits on another guest object while it renders, so its
   // render time is CPU, host scheduling or yields; this splits them.
   std::atomic<uint64_t> slices{0};
   std::atomic<uint64_t> slice_wall_us{0};

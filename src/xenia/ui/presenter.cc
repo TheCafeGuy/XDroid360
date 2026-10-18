@@ -914,10 +914,10 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
   const bool oem_sharpen = IsOemSharpeningActive();
   // GSR-1: one Snapdragon GSR pass for the whole upscale, replacing the AMD
   // effects (the bilinear stretch below handles any clamp to max_rt).
-  const bool use_gsr =
-      cvars::present_snapdragon_gsr && IsSnapdragonGsrSupported() &&
-      (properties.frontbuffer_width < output_width_clamped ||
-       properties.frontbuffer_height < output_height_clamped);
+  const bool use_gsr = cvars::present_snapdragon_gsr &&
+                       IsSnapdragonGsrSupported() &&
+                       (properties.frontbuffer_width < output_width_clamped ||
+                        properties.frontbuffer_height < output_height_clamped);
   if (use_gsr) {
     assert_true(flow.effect_count < flow.effects.size());
     flow.effect_output_sizes[flow.effect_count] =
@@ -1381,8 +1381,7 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 #endif  // XE_PLATFORM
 }
 
-void Presenter::ApplyPresentResolutionScale(uint32_t& width,
-                                            uint32_t& height) {
+void Presenter::ApplyPresentResolutionScale(uint32_t& width, uint32_t& height) {
 #if XE_PLATFORM_ANDROID
   // The window may report the buffer size of the previous swapchain rather than
   // its own size: never scale an already scaled size again.
@@ -1405,13 +1404,12 @@ void Presenter::ApplyPresentResolutionScale(uint32_t& width,
       uint32_t(std::min(std::max(cvars::present_max_height, 0), 4095));
   const uint32_t short_side = std::min(width, height);
   if (max_height && short_side > max_height) {
-    width = std::max(uint32_t(1),
-                     uint32_t((uint64_t(width) * max_height + short_side / 2) /
+    width = std::max(
+        uint32_t(1),
+        uint32_t((uint64_t(width) * max_height + short_side / 2) / short_side));
+    height = std::max(
+        uint32_t(1), uint32_t((uint64_t(height) * max_height + short_side / 2) /
                               short_side));
-    height = std::max(uint32_t(1),
-                      uint32_t((uint64_t(height) * max_height +
-                                short_side / 2) /
-                               short_side));
   }
   if (in_width != present_scale_last_in_width_ ||
       in_height != present_scale_last_in_height_ ||

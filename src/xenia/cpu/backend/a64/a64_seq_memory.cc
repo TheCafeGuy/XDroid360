@@ -157,8 +157,7 @@ static void GuestSpinPark(void* raw_context, uint64_t guest_pc) {
   // performance hint can leave spinning out of the frame's work. A parked wait
   // sleeps (no CPU) and restarts the window below, so it is never charged.
   thread_local std::chrono::steady_clock::time_point last_charged;
-  if (xe::threading::SpinAccountingEnabled().load(
-          std::memory_order_relaxed)) {
+  if (xe::threading::SpinAccountingEnabled().load(std::memory_order_relaxed)) {
     const auto charge_now = std::chrono::steady_clock::now();
     const auto gap = charge_now - last_charged;
     last_charged = charge_now;
@@ -166,9 +165,8 @@ static void GuestSpinPark(void* raw_context, uint64_t guest_pc) {
       if (xe::threading::SpinAccount* account =
               xe::threading::ThisThreadSpinAccount()) {
         account->spin_ns.fetch_add(
-            uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(gap)
-                    .count()),
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(gap)
+                         .count()),
             std::memory_order_relaxed);
       }
     }
@@ -242,8 +240,7 @@ static void GuestSpinPark(void* raw_context, uint64_t guest_pc) {
     spin_site->parks.fetch_add(1, std::memory_order_relaxed);
   }
   writebacks.WaitFor(
-      generation,
-      std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
+      generation, std::chrono::microseconds(cvars::guest_spin_park_timeout_us));
   // The wait itself must not end the spin window.
   last_hint = std::chrono::steady_clock::now();
   last_charged = last_hint;

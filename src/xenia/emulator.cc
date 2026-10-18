@@ -2288,8 +2288,7 @@ X_STATUS Emulator::PrepareLaunch(const std::filesystem::path& path,
   if (graphics_system_) {
     on_shader_storage_initialization(true);
     graphics_system_->InitializeShaderStorage(
-        cache_root_, title_id_.value(), false,
-        [this, probe_launch_ms]() {
+        cache_root_, title_id_.value(), false, [this, probe_launch_ms]() {
           if (cvars::load_probe) {
             XELOGI("LOADPROBE phase=shader_storage_ready ms={}",
                    Clock::QueryHostUptimeMillis() - probe_launch_ms);

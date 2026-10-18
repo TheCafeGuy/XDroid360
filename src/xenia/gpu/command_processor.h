@@ -25,9 +25,9 @@
 
 #include "xenia/base/math.h"
 #include "xenia/base/ring_buffer.h"
-#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/gpu/register_file.h"
 #include "xenia/gpu/trace_writer.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/gpu/xenos.h"
 #include "xenia/gpu/xenos_zpd_report.h"
 #include "xenia/kernel/xthread.h"

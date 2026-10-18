@@ -949,10 +949,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
     matched = MatchValueAndRef(value & mask, ref, wait_info);
 
     if (!matched && !xdroid_wait_begin_ns) {
-      xdroid_wait_begin_ns = uint64_t(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now().time_since_epoch())
-              .count());
+      xdroid_wait_begin_ns =
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
     }
     if (!matched) {
       // Wait using the duration specified by the guest.

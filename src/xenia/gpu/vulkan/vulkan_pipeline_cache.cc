@@ -29,12 +29,12 @@
 #include "xenia/gpu/draw_util.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/register_file.h"
-#include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/registers.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/spirv_builtin_geometry_shader.h"
 #include "xenia/gpu/spirv_compatibility.h"
 #include "xenia/gpu/spirv_shader_translator.h"
+#include "xenia/gpu/texture_cache.h"
 #include "xenia/gpu/vulkan/vulkan_command_processor.h"
 #include "xenia/gpu/vulkan/vulkan_shader.h"
 #include "xenia/gpu/vulkan/vulkan_shared_memory.h"
@@ -998,8 +998,7 @@ void VulkanPipelineCache::AwaitPipeline(const Pipeline& pipeline) {
   creation_queue_.AwaitCompletion();
 }
 
-void VulkanPipelineCache::GetCreationQueueCounts(size_t& live,
-                                                 size_t& queued) {
+void VulkanPipelineCache::GetCreationQueueCounts(size_t& live, size_t& queued) {
   creation_queue_.GetPendingCounts(live, queued);
 }
 
@@ -1885,8 +1884,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   VkSpecializationInfo vfetch_specialization_info;
   vfetch_specialization_info.mapEntryCount =
       uint32_t(vfetch_specialization_entries.size());
-  vfetch_specialization_info.pMapEntries =
-      vfetch_specialization_entries.data();
+  vfetch_specialization_info.pMapEntries = vfetch_specialization_entries.data();
   vfetch_specialization_info.dataSize = sizeof(vfetch_endian_values);
   vfetch_specialization_info.pData = vfetch_endian_values.data();
   std::array<VkPipelineShaderStageCreateInfo, 5> shader_stages;
@@ -1970,7 +1968,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     }
     shader_stage_vertex.pName = "main";
     shader_stage_vertex.pSpecializationInfo =
-        cvars::xdroid_shader_vfetch_spec && vertex_shader_override == VK_NULL_HANDLE
+        cvars::xdroid_shader_vfetch_spec &&
+                vertex_shader_override == VK_NULL_HANDLE
             ? &vfetch_specialization_info
             : nullptr;
   }
@@ -2492,7 +2491,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   }
   if (result == VK_SUCCESS && capture_stats) {
     LogPipelineStatistics(
-        vulkan_device, pipeline, creation_arguments.vertex_shader->shader().ucode_data_hash(),
+        vulkan_device, pipeline,
+        creation_arguments.vertex_shader->shader().ucode_data_hash(),
         creation_arguments.pixel_shader
             ? creation_arguments.pixel_shader->shader().ucode_data_hash()
             : 0);
@@ -2968,8 +2968,7 @@ void VulkanPipelineCache::InitializeShaderStorage(
 }
 
 void VulkanPipelineCache::WriteVkPipelineCacheLocked() {
-  if (vk_pipeline_cache_ == VK_NULL_HANDLE ||
-      vk_pipeline_cache_path_.empty()) {
+  if (vk_pipeline_cache_ == VK_NULL_HANDLE || vk_pipeline_cache_path_.empty()) {
     return;
   }
   const ui::vulkan::VulkanDevice* const vulkan_device =
@@ -3016,7 +3015,7 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache(bool may_write) {
   constexpr uint32_t kMinNewPipelines = 32;
   constexpr auto kMinInterval = std::chrono::seconds(30);
   if (vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed) + 1 <
-      kMinNewPipelines ||
+          kMinNewPipelines ||
       !may_write) {
     return;
   }

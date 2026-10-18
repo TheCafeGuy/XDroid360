@@ -336,9 +336,10 @@ void VulkanGlitchRecorder::Poll(DeferredCommandBuffer& command_buffer,
     if (hud1) {
       ++hud1_candidates_;
       hud1_frame_ = n;
-      XELOGW("XDROID-HUD1: frame {} radar block {},{} (d(n-1,n)={:.1f} "
-             "d(n,n+1)={:.1f} d(n-1,n+1)={:.1f}), total {}",
-             n, block % 8, block / 8, a, b, c, hud1_candidates_);
+      XELOGW(
+          "XDROID-HUD1: frame {} radar block {},{} (d(n-1,n)={:.1f} "
+          "d(n,n+1)={:.1f} d(n-1,n+1)={:.1f}), total {}",
+          n, block % 8, block / 8, a, b, c, hud1_candidates_);
     }
     // Dumps n-2..n+1: n-2 tells whether frame n repeats n-1 or older content.
     bool frames_in_ring = frame - (n - 2) < kRingSize - 1;
@@ -400,9 +401,9 @@ void VulkanGlitchRecorder::WriteDump() {
   for (uint32_t k = 0; k < kDumpFrames; ++k) {
     const uint8_t* src = dump_mapping_ + size_t(kFrameBytes) * k;
     for (uint32_t y = 0; y < kFrameHeight; ++y) {
-      uint8_t* dst = rgb.data() + (size_t(y) * kFrameWidth * kDumpFrames +
-                                   size_t(k) * kFrameWidth) *
-                                      3;
+      uint8_t* dst =
+          rgb.data() +
+          (size_t(y) * kFrameWidth * kDumpFrames + size_t(k) * kFrameWidth) * 3;
       for (uint32_t x = 0; x < kFrameWidth; ++x) {
         const uint8_t* p = src + (size_t(y) * kFrameWidth + x) * 4;
         dst[x * 3] = p[0];
@@ -461,8 +462,8 @@ void VulkanGlitchRecorder::PollClip(DeferredCommandBuffer& command_buffer,
             ui::vulkan::util::MemoryPurpose::kReadback, clip_buffer_,
             clip_buffer_memory_) ||
         vulkan_device_->functions().vkMapMemory(
-            vulkan_device_->device(), clip_buffer_memory_, 0, VK_WHOLE_SIZE,
-            0, &mapping) != VK_SUCCESS) {
+            vulkan_device_->device(), clip_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
+            &mapping) != VK_SUCCESS) {
       XELOGE("XDROID-CLIP: readback buffer creation failed");
       return;
     }
@@ -479,9 +480,8 @@ void VulkanGlitchRecorder::PollClip(DeferredCommandBuffer& command_buffer,
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.imageSubresource.layerCount = 1;
     copy.imageExtent = {kClipWidth, kClipHeight, 1};
-    command_buffer.CmdVkCopyImageToBuffer(clip_images_[i],
-                                          VK_IMAGE_LAYOUT_GENERAL,
-                                          clip_buffer_, 1, &copy);
+    command_buffer.CmdVkCopyImageToBuffer(
+        clip_images_[i], VK_IMAGE_LAYOUT_GENERAL, clip_buffer_, 1, &copy);
   }
   const uint64_t count = std::min<uint64_t>(timing_count_, kTimingSize);
   clip_timing_.clear();
@@ -557,8 +557,7 @@ void VulkanGlitchRecorder::WriteClip() {
 
 void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
                                    VkImage guest_output, uint32_t width,
-                                   uint32_t height,
-                                   uint64_t current_submission,
+                                   uint32_t height, uint64_t current_submission,
                                    uint64_t frame) {
   if (!initialized_ || !width || !height) {
     return;
@@ -581,8 +580,8 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
       barrier.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
     }
     command_buffer.CmdVkPipelineBarrier(
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-        0, nullptr, 0, nullptr, uint32_t(barriers.size()), barriers.data());
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+        nullptr, 0, nullptr, uint32_t(barriers.size()), barriers.data());
     images_initialized_ = true;
   }
   const uint32_t slot_index = uint32_t(frame % kRingSize);
@@ -594,8 +593,8 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
   blit.dstSubresource = blit.srcSubresource;
   blit.dstOffsets[1] = {int32_t(kFrameWidth), int32_t(kFrameHeight), 1};
   command_buffer.CmdVkBlitImage(guest_output, VK_IMAGE_LAYOUT_GENERAL,
-                                frames_[slot_index], VK_IMAGE_LAYOUT_GENERAL,
-                                1, &blit, VK_FILTER_LINEAR);
+                                frames_[slot_index], VK_IMAGE_LAYOUT_GENERAL, 1,
+                                &blit, VK_FILTER_LINEAR);
   blit.dstOffsets[1] = {int32_t(kThumbWidth), int32_t(kThumbHeight), 1};
   command_buffer.CmdVkBlitImage(guest_output, VK_IMAGE_LAYOUT_GENERAL, thumb_,
                                 VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
@@ -618,10 +617,9 @@ void VulkanGlitchRecorder::Capture(DeferredCommandBuffer& command_buffer,
   if (!(frame & 1)) {
     const uint32_t clip_index = uint32_t((frame >> 1) % kClipFrames);
     blit.dstOffsets[1] = {int32_t(kClipWidth), int32_t(kClipHeight), 1};
-    command_buffer.CmdVkBlitImage(guest_output, VK_IMAGE_LAYOUT_GENERAL,
-                                  clip_images_[clip_index],
-                                  VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                                  VK_FILTER_LINEAR);
+    command_buffer.CmdVkBlitImage(
+        guest_output, VK_IMAGE_LAYOUT_GENERAL, clip_images_[clip_index],
+        VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
     clip_frames_[clip_index] = log_frame;
   }
   Slot& slot = slots_[slot_index];

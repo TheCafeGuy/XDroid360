@@ -399,20 +399,19 @@ void TextureCache::ProbeFirstLoad(Texture& texture) {
   }
 }
 
-void TextureCache::ProbeLoadResult(Texture& texture,
-                                   const char* fail_reason) {
+void TextureCache::ProbeLoadResult(Texture& texture, const char* fail_reason) {
   if (!fail_reason) {
     if (!texture.ever_loaded()) {
       ProbeFirstLoad(texture);
     } else if (texture.probe_.early_invalidation && cvars::xdroid_tex_probe) {
       ++probe_counters_.early_reload;
-      ProbeLog("early_reload", texture.key(),
-               fmt::format("reason=data rewritten by the {} within {} frames "
-                           "of the first load (first use drew stale data)",
-                           (texture.probe_.early_invalidation & 2) ? "GPU"
-                                                                   : "CPU",
-                           probe_frame() - texture.probe_.first_load_frame)
-                   .c_str());
+      ProbeLog(
+          "early_reload", texture.key(),
+          fmt::format("reason=data rewritten by the {} within {} frames "
+                      "of the first load (first use drew stale data)",
+                      (texture.probe_.early_invalidation & 2) ? "GPU" : "CPU",
+                      probe_frame() - texture.probe_.first_load_frame)
+              .c_str());
       texture.probe_.early_invalidation = 0;
     }
     if (cvars::xdroid_tex_probe) {
@@ -578,12 +577,11 @@ void TextureCache::CensusMaybeSummary() {
       "skipped={} kb_per_frame={} cpu_us_per_frame={}",
       frame, frames, census_.size(), total.loads,
       double(total.loads) / double(frames), total.first, total.inval_cpu,
-      total.inval_gpu, total.same, total.skipped,
-      (total.bytes >> 10) / frames,
+      total.inval_gpu, total.same, total.skipped, (total.bytes >> 10) / frames,
       total.ns / 1000 / frames);
   static const char* const kLinkNames[kCensusLinkCount] = {
-      "direct", "edram", "no_record", "not_fast", "offset", "pitch",
-      "height", "format", "endian", "coverage", "mips", "shape"};
+      "direct", "edram",  "no_record", "not_fast", "offset", "pitch",
+      "height", "format", "endian",    "coverage", "mips",   "shape"};
   std::string link_line;
   for (uint32_t i = 0; i < kCensusLinkCount; ++i) {
     link_line += fmt::format(" {}={}/{}kb", kLinkNames[i], census_link_[i],
@@ -1142,8 +1140,7 @@ void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
         uint8_t((invalidated_by_gpu ? 2 : 1) << (argument != 0 ? 2 : 0));
   }
   if (cvars::xdroid_tex_probe && texture.ever_loaded() &&
-      texture.texture_cache().probe_frame() -
-              texture.probe_.first_load_frame <=
+      texture.texture_cache().probe_frame() - texture.probe_.first_load_frame <=
           4) {
     texture.probe_.early_invalidation |= invalidated_by_gpu ? 2 : 1;
   }
@@ -1569,22 +1566,20 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   // Actually load the texture data.
   if (load_base || load_mips) {
     load_fail_reason_ = nullptr;
-    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base,
-                                               load_mips)) {
+    if (!LoadTextureDataFromResidentMemoryImpl(texture, load_base, load_mips)) {
       ProbeLoadResult(texture,
                       load_fail_reason_ ? load_fail_reason_ : "load failed");
       return false;
     }
   }
   if (census) {
-    CensusRecord(
-        texture, census_inval, base_outdated, mips_outdated, census_same,
-        !load_base && !load_mips,
-        uint64_t(load_base ? texture.GetGuestBaseSize() : 0) +
-            (load_mips ? texture.GetGuestMipsSize() : 0),
-        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                     std::chrono::steady_clock::now() - census_start)
-                     .count()));
+    CensusRecord(texture, census_inval, base_outdated, mips_outdated,
+                 census_same, !load_base && !load_mips,
+                 uint64_t(load_base ? texture.GetGuestBaseSize() : 0) +
+                     (load_mips ? texture.GetGuestMipsSize() : 0),
+                 uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - census_start)
+                              .count()));
   }
   ProbeLoadResult(texture, nullptr);
 
@@ -1607,7 +1602,8 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   if (base_outdated) {
     texture.census_.base_hash = base_hash;
     // TEX-1b: one 2D tiled level - what a resolve can write whole.
-    if (load_base && texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+    if (load_base &&
+        texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
         !texture_key.depth_or_array_size_minus_1 && texture_key.tiled &&
         !texture_key.scaled_resolve && !texture_key.mip_max_level &&
         !texture_key.packed_mips) {
