@@ -96,14 +96,21 @@ add_library(xdroid360 SHARED
   xdroid_events.cc
   xdroid_gamepad.cc
   xdroid_gpu_bench.cc
-  xdroid_ib_snapshot.cc
+  xdroid_hle_census.cc
   xdroid_jni.cc
   xdroid_latency.cc
   xdroid_live.cc
+  xdroid_cast.cc
+  xdroid_mirror.cc
+  xdroid_nonfinite.cc
+  xdroid_pad_script.cc
   xdroid_time_coupling.cc
 )
 add_dependencies(xdroid360 main_hook hook_impl)
 target_compile_features(xdroid360 PRIVATE cxx_std_20 c_std_17)
+# As upstream (add_compile_definitions in the root CMakeLists.txt), for the
+# Vulkan headers xdroid_mirror.cc includes.
+target_compile_definitions(xdroid360 PRIVATE VULKAN_HPP_NO_TO_STRING)
 # GPU-BENCH capture builds: our sources must see the trace writer too.
 if(XENIA_ENABLE_GPU_TRACE)
   target_compile_definitions(xdroid360 PRIVATE XE_OPTION_GPU_TRACE=1)
@@ -124,6 +131,8 @@ target_include_directories(xdroid360 PRIVATE
 )
 target_include_directories(xdroid360 SYSTEM PRIVATE
   "${XDROID_ROOT}/third_party"
+  # vulkan_core.h includes "vk_video/..." (xdroid_mirror.cc).
+  "${XDROID_ROOT}/third_party/Vulkan-Headers/include"
 )
 target_link_options(xdroid360 PRIVATE
   # 16 KB pages (Android 15+ devices).
@@ -153,4 +162,6 @@ target_link_libraries(xdroid360 PRIVATE
   aaudio
   android
   log
+  mediandk
+  nativewindow
 )

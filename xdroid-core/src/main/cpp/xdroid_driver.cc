@@ -66,8 +66,8 @@ void ApplyTuDebugFile(const std::string& path) {
     }
     const std::string name = line.substr(0, equals);
     if (name != "TU_DEBUG" && name != "IR3_SHADER_DEBUG" &&
-        name != "FD_MESA_DEBUG" && name != "TU_AUTOTUNE_ALGO" &&
-        name != "TU_AUTOTUNE_FLAGS") {
+        name != "IR3_DEBUG" && name != "FD_MESA_DEBUG" &&
+        name != "TU_AUTOTUNE_ALGO" && name != "TU_AUTOTUNE_FLAGS") {
       XELOGW("XDroid360: {} ignores {}", path, name);
       continue;
     }
@@ -96,8 +96,7 @@ void SelectVulkanDriver(const std::string& driver_path,
   g_driver_path = driver_path;
   g_hook_dir = hook_dir;
   const bool custom = !g_driver_path.empty() && !g_hook_dir.empty();
-  xe::ui::vulkan::SetVulkanLoaderOpener(custom ? &OpenSelectedDriver
-                                                         : nullptr);
+  xe::ui::vulkan::SetVulkanLoaderOpener(custom ? &OpenSelectedDriver : nullptr);
 }
 
 }  // namespace xdroid

@@ -667,11 +667,13 @@ bool VulkanSharedMemory::UploadRanges(
   bool upload_spliced = command_processor_.IsSpliceCandidate(
       VulkanCommandProcessor::kSpliceUploads);
   for (uint32_t i = 0; upload_spliced && i < num_upload_ranges; ++i) {
-    upload_spliced =
-        !WasRangeReadByDraws(upload_page_ranges[i].first << page_size_log2(),
-                             upload_page_ranges[i].second << page_size_log2(),
-                             command_processor_.pass_first_draw_serial(),
-                             command_processor_.draw_serial());
+    if (WasRangeReadByDraws(upload_page_ranges[i].first << page_size_log2(),
+                            upload_page_ranges[i].second << page_size_log2(),
+                            command_processor_.pass_first_draw_serial(),
+                            command_processor_.draw_serial())) {
+      upload_spliced = command_processor_.NoteSpliceConflict();
+      break;
+    }
   }
   upload_spliced =
       upload_spliced &&

@@ -10,10 +10,18 @@
 #include "xenia/kernel/xevent.h"
 
 #include "xenia/base/byte_stream.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/memory.h"
+
+DEFINE_bool(xdroid_pulse_multi_waiters, false,
+            "XDroid360: deliver a pulse of an auto-reset event to a fiber "
+            "polling it inside a cooperative WaitAny (as a set that fiber "
+            "consumes) instead of dropping it. XDROID-PULSE logs the cases "
+            "either way. Live.",
+            "XDroid360");
 
 namespace xe {
 namespace kernel {
@@ -96,6 +104,23 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
   if (!manual_reset_ && waiters_.HasWaiters()) {
     Set(priority_increment, wait);
     return old_signal_state;
+  }
+  // Same for a fiber polling this event inside a WaitAny, which never parks on
+  // waiters_: the host pulse below finds no host waiter and drops the pulse.
+  if (!manual_reset_ && multi_waiters_.load()) {
+    static std::atomic<uint32_t> cases{0};
+    const uint32_t n = cases.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool deliver = cvars::xdroid_pulse_multi_waiters;
+    if (n <= 16 || !(n & (n - 1))) {
+      XELOGW("XDROID-PULSE: auto-reset event {:08X} pulsed with {} WaitAny "
+             "waiter(s), case {}: {}",
+             handle(), multi_waiters_.load(), n,
+             deliver ? "delivered as a set" : "dropped");
+    }
+    if (deliver) {
+      Set(priority_increment, wait);
+      return old_signal_state;
+    }
   }
   if (manual_reset_) {
     // Releases every waiter parked right now. Must precede the wake below.

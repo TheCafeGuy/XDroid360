@@ -601,12 +601,11 @@ class CommandProcessor {
 
   uint32_t counter_ = 0;
 
-  // XDroid360 HUD-1 (temp): the indirect buffers being executed, innermost
-  // last, with their XdroidIbFlags.
+  // XDroid360 draw black box: the indirect buffers being executed, innermost
+  // last.
   struct XdroidIbFrame {
     uint32_t ptr;
     uint32_t dwords;
-    uint32_t flags;
   };
   std::array<XdroidIbFrame, 4> xdroid_ib_stack_{};
   uint32_t xdroid_ib_depth_ = 0;

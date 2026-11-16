@@ -45,6 +45,15 @@
 #include "xenia/cpu/thread_state.h"
 #include "xenia/cpu/xex_module.h"
 
+DEFINE_bool(
+    xdroid_reserve_exclusive, false,
+    "B1: stwcx./stdcx. check the granule generation and the reserved value "
+    "inside one exclusive load/store window of the data, so a store or a "
+    "preemption between the check and the store fails it (ABA-safe for "
+    "untagged lock-free stacks). Falls back to check-then-CAS after a few "
+    "failed exclusive stores. Applies to code emitted after it is set.",
+    "CPU");
+
 DEFINE_int64(a64_max_stackpoints, 65536,
              "Max number of host->guest stack mappings we can record.", "a64");
 
@@ -835,6 +844,64 @@ T ReservedLoadImpl(ppc::PPCContext* context, uint32_t address) {
   return xe::byte_swap(raw);
 }
 
+#if XE_ARCH_ARM64
+// B1 (idea: Xendroid+ (phforner0) 3a76eef78). A check of the generation
+// followed by a CAS on the value leaves a window: preempted between the two,
+// the thread misses pops and pushes that bring the value back (ABA) and
+// publishes a stale successor. Checking both inside the ldaxr/stlxr window
+// of the data closes it: any store to the word or a context switch clears
+// the monitor, the stlxr fails and the next attempt re-reads the generation.
+constexpr uint32_t kReserveExclusiveAttempts = 8;
+constexpr int kExclusiveStored = 0;
+constexpr int kExclusiveMismatch = 1;
+constexpr int kExclusiveRetry = 2;
+
+// One asm block, so no compiler-placed access lands inside the window.
+// Returns kExclusiveStored, kExclusiveMismatch (generation or value changed
+// since lwarx) or kExclusiveRetry (the exclusive store failed).
+#define XDROID_RESERVE_WINDOW_ASM(R)                                   \
+  "ldaxr %" R "[old], [%[data]]\n"                                     \
+  "ldr %w[gen], [%[generation]]\n"                                     \
+  "mov %w[status], #1\n"                                               \
+  "cmp %w[gen], %w[expected_gen]\n"                                    \
+  "b.ne 1f\n"                                                          \
+  "cmp %" R "[old], %" R "[expected]\n"                                \
+  "b.ne 1f\n"                                                          \
+  "stlxr %w[status], %" R "[value], [%[data]]\n"                       \
+  "lsl %w[status], %w[status], #1\n"                                   \
+  "b 2f\n"                                                             \
+  "1: clrex\n"                                                         \
+  "2:\n"
+template <typename T>
+int StoreIfReservationHolds(T* data, T expected, T value,
+                            const std::atomic<uint32_t>* generation,
+                            uint32_t expected_generation) {
+  uint64_t old_value;
+  uint32_t current_generation, status;
+  const uint64_t expected64 = uint64_t(expected);
+  const uint64_t value64 = uint64_t(value);
+  if constexpr (sizeof(T) == sizeof(uint64_t)) {
+    __asm__ volatile(XDROID_RESERVE_WINDOW_ASM("x")
+                     : [old] "=&r"(old_value), [gen] "=&r"(current_generation),
+                       [status] "=&r"(status)
+                     : [data] "r"(data), [generation] "r"(generation),
+                       [expected_gen] "r"(expected_generation),
+                       [expected] "r"(expected64), [value] "r"(value64)
+                     : "cc", "memory");
+  } else {
+    __asm__ volatile(XDROID_RESERVE_WINDOW_ASM("w")
+                     : [old] "=&r"(old_value), [gen] "=&r"(current_generation),
+                       [status] "=&r"(status)
+                     : [data] "r"(data), [generation] "r"(generation),
+                       [expected_gen] "r"(expected_generation),
+                       [expected] "r"(expected64), [value] "r"(value64)
+                     : "cc", "memory");
+  }
+  return int(status);
+}
+#undef XDROID_RESERVE_WINDOW_ASM
+#endif  // XE_ARCH_ARM64
+
 template <typename T>
 uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
                            uint64_t host_address, uint64_t value) {
@@ -850,6 +917,27 @@ uint64_t ReservedStoreImpl(void* raw_context, uint64_t guest_address,
 
   auto& granule =
       ReserveGranule(bctx->reserve_helper_, uint32_t(guest_address));
+
+#if XE_ARCH_ARM64
+  if (cvars::xdroid_reserve_exclusive) {
+    for (uint32_t attempt = 0; attempt < kReserveExclusiveAttempts; ++attempt) {
+      const int status =
+          StoreIfReservationHolds(reinterpret_cast<T*>(uintptr_t(host_address)),
+                                  T(bctx->cached_reserve_value_), T(value),
+                                  &granule, bctx->reserve_generation);
+      if (status == kExclusiveStored) {
+        granule.fetch_add(1, std::memory_order_release);
+        return 1;
+      }
+      if (status == kExclusiveMismatch) {
+        return 0;
+      }
+    }
+    // The monitor kept failing (a core whose monitor the generation load
+    // clears would livelock here): finish with check-then-CAS.
+  }
+#endif  // XE_ARCH_ARM64
+
   // a store to this granule since our lwarx kills the reservation
   if (granule.load(std::memory_order_acquire) != bctx->reserve_generation) {
     return 0;

@@ -77,6 +77,12 @@ androidComponents {
     }
 }
 
+// TV features (src/tv, module :xdroid-tv) stay out of the public build: its
+// export deletes both, and -Pxdroid.notv builds the same tree here. src/notv
+// holds the no-op twin of the Tv seam.
+val tv = file("src/tv").isDirectory && rootProject.file("xdroid-tv").isDirectory &&
+    !providers.gradleProperty("xdroid.notv").isPresent
+
 android {
     namespace = "xdroid360.app"
     compileSdk = 35
@@ -85,12 +91,12 @@ android {
     defaultConfig {
         // One app on the phone: test builds share the release id and key, so
         // each build (test or release) installs over the previous one.
-        // Keep versionCode >= the latest public release (v0.2.0 = 4).
+        // Keep versionCode >= the latest public release (v0.2.0 = 4, v0.2.1 = 5, v0.3.0 = 6).
         applicationId = "io.github.thecafeguy.xdroid360"
         minSdk = 29
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.2.0"
+        versionCode = 6
+        versionName = "0.3.0"
     }
 
     // Release key from ~/.xdroid360/release.properties (never in the repo).
@@ -124,6 +130,20 @@ android {
     packaging {
         jniLibs {
             useLegacyPackaging = true
+        }
+    }
+
+    sourceSets {
+        getByName("main") {
+            if (tv) {
+                java.srcDir("src/tv/java")
+                res.srcDir("src/tv/res")
+            } else {
+                java.srcDir("src/notv/java")
+            }
+        }
+        if (tv) {
+            for (type in listOf("debug", "release")) getByName(type).manifest.srcFile("src/tv/AndroidManifest.xml")
         }
     }
 

@@ -11,6 +11,9 @@
 
 #include <chrono>
 #include <ctime>
+#if XE_PLATFORM_LINUX
+#include <sys/auxv.h>
+#endif  // XE_PLATFORM_LINUX
 
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
@@ -32,6 +35,7 @@
 
 DECLARE_bool(emit_mmio_aware_stores_for_recorded_exception_addresses);
 DECLARE_bool(emit_inline_mmio_checks);
+DECLARE_bool(xdroid_reserve_exclusive);
 
 // XDroid360: guest spin-waits (db16cyc sleds, e.g. AC6's main
 // thread polling for GPU progress) kept a big core 80-90% busy at the 30 FPS
@@ -72,6 +76,14 @@ DEFINE_uint32(guest_spin_park_hints, 32,
 DEFINE_uint32(guest_spin_park_timeout_us, 200,
               "Longest a parked guest spin-wait sleeps without a GPU "
               "write-back.",
+              "CPU");
+
+// XDroid360 PERF-H1: wait in a db16cyc sled for the next GPU write-back with
+// ldaxr + wfe instead of spinning on isb (see DELAY_EXECUTION). Live.
+DEFINE_uint32(guest_spin_wfe, 0,
+              "Guest spin-waits (db16cyc): 0 = isb spin (upstream), 1 = wfe "
+              "until the next GPU write-back (<=100 us event stream). Live; "
+              "needs the ARM timer event stream, else isb.",
               "CPU");
 
 DEFINE_bool(inline_loadclock, false,
@@ -286,6 +298,35 @@ struct DELAY_EXECUTION
             kIsbSy) {
       return;
     }
+    // PERF-H1: guest_spin_wfe != 0 sleeps the core in the sled instead. ldaxr
+    // arms the exclusive monitor on the CE-7 write-back generation, so the
+    // CP's Bump (after its fence store) wakes it within ~1 us; the 10 kHz
+    // timer event stream ends any other wait in <=100 us. A generation the
+    // sled has not seen yet skips the wait. Inline: no host call, no lock.
+#if XE_PLATFORM_LINUX
+    static const bool has_event_stream =
+        (getauxval(AT_HWCAP) & (1 << 2)) != 0;  // HWCAP_EVTSTRM
+    if (has_event_stream) {
+      auto& clear = e.NewCachedLabel();
+      auto& spin = e.NewCachedLabel();
+      e.mov(e.x16, reinterpret_cast<uint64_t>(&cvars::guest_spin_wfe));
+      e.ldr(e.w16, ptr(e.x16));
+      e.cbz(e.w16, spin);
+      e.mov(e.x16, reinterpret_cast<uint64_t>(
+                       xe::threading::GuestGpuWritebackGeneration().Address()));
+      e.ldaxr(e.w16, ptr(e.x16));
+      e.mov(e.x17, reinterpret_cast<uint64_t>(
+                       xe::threading::SpinWfeSeen(SpinSledAddress(i.instr))));
+      e.ldr(e.w15, ptr(e.x17));
+      e.str(e.w16, ptr(e.x17));
+      e.cmp(e.w16, e.w15);
+      e.b(Xbyak_aarch64::NE, clear);
+      e.wfe();
+      e.L(clear);
+      e.clrex(15);  // The guest's next stwcx. must not use this monitor.
+      e.L(spin);
+    }
+#endif  // XE_PLATFORM_LINUX
     e.isb(Xbyak_aarch64::SY);
   }
 };
@@ -1433,6 +1474,8 @@ EMITTER_OPCODE_TABLE(OPCODE_STORE_MMIO, STORE_MMIO_I32);
 // their state, so a reservation taken by either can be completed by the other.
 // Only x22-x28 and v4-v31 hold guest values, so x0-x17 are free scratch here.
 static constexpr uint32_t kReserveFlagBit = 1u << kA64BackendHasReserveBit;
+// Failed exclusive stores before B1 falls back to check-then-CAS.
+static constexpr uint32_t kReserveExclusiveAttempts = 8;
 
 static constexpr uint32_t BackendCtxOffset(size_t offset) {
   return static_cast<uint32_t>(offset);
@@ -1537,6 +1580,70 @@ static void EmitReservedStore(A64Emitter& e, const I8Op& dest,
   e.b(NE, fail);
 
   EmitGranuleAddress(e, guest_address, e.x11, e.w13);
+
+  if (cvars::xdroid_reserve_exclusive) {
+    // B1, as StoreIfReservationHolds in a64_backend.cc: the generation and
+    // the value are checked inside the exclusive window of the data, so a
+    // store or a preemption after the check fails the stlxr instead of
+    // letting an ABA'd value through. After a few failed exclusive stores,
+    // fall through to check-then-CAS below. Idea: Xendroid+ (phforner0)
+    // 3a76eef78.
+    auto& mismatch =
+        e.AddToTail([dest_idx, &done](A64Emitter& e, Xbyak_aarch64::Label&) {
+          e.clrex(15);
+          e.mov(WReg(dest_idx), 0);
+          e.b(done);
+        });
+    auto& exclusive_retry = e.NewCachedLabel();
+    auto& exclusive_stored = e.NewCachedLabel();
+    auto& check_then_cas = e.NewCachedLabel();
+    e.ldr(e.w15, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext,
+                                                     reserve_generation))));
+    e.ldr(e.x16, ptr(bctx, BackendCtxOffset(offsetof(A64BackendContext,
+                                                     cached_reserve_value_))));
+    e.mov(e.w4, kReserveExclusiveAttempts);
+    e.L(exclusive_retry);
+    if (bit64) {
+      e.ldaxr(e.x14, ptr(e.x1));
+    } else {
+      e.ldaxr(e.w14, ptr(e.x1));
+    }
+    e.ldr(e.w5, ptr(e.x11));
+    e.cmp(e.w5, e.w15);
+    e.b(NE, mismatch);
+    if (bit64) {
+      e.cmp(e.x14, e.x16);
+      e.b(NE, mismatch);
+      e.stlxr(e.w13, e.x2, ptr(e.x1));
+    } else {
+      e.cmp(e.w14, e.w16);
+      e.b(NE, mismatch);
+      e.stlxr(e.w13, e.w2, ptr(e.x1));
+    }
+    e.cbz(e.w13, exclusive_stored);
+    e.subs(e.w4, e.w4, 1);
+    e.b(NE, exclusive_retry);
+    e.b(check_then_cas);
+
+    // the store landed, so kill other reservations on this granule
+    e.L(exclusive_stored);
+    if (e.IsFeatureEnabled(kA64EmitLSE)) {
+      e.mov(e.w17, 1);
+      e.staddl(e.w17, ptr(e.x11));
+    } else {
+      auto& bump_retry = e.NewCachedLabel();
+      e.L(bump_retry);
+      e.ldxr(e.w14, ptr(e.x11));
+      e.add(e.w14, e.w14, 1);
+      e.stlxr(e.w13, e.w14, ptr(e.x11));
+      e.cbnz(e.w13, bump_retry);
+    }
+    e.mov(dest, 1);
+    e.b(done);
+
+    e.L(check_then_cas);
+  }
+
   // a store to this granule since our lwarx kills the reservation
   e.ldar(e.w14, ptr(e.x11));
   e.ldr(e.w15, ptr(bctx, BackendCtxOffset(

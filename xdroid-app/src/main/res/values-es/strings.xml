@@ -11,6 +11,7 @@
     <string name="tab_diag">Diagnóstico</string>
     <string name="resume">Reanudar</string>
     <string name="report_glitch">Reportar glitch</string>
+    <string name="pc_mirror">Espejo a PC (experimental)</string>
     <string name="exit_game">Salir del juego</string>
     <string name="exit_title">¿Salir del juego?</string>
     <string name="exit_message">Se pierde el progreso desde el último guardado.</string>
@@ -19,6 +20,7 @@
     <string name="perf_title">Rendimiento</string>
     <string name="stats_overlay">Mostrar estadísticas</string>
     <string name="detailed_stats">Estadísticas detalladas</string>
+    <string name="battery_stats">Batería en estadísticas (celu, control)</string>
     <string name="fast_forward">Avance rápido</string>
     <string name="hint_fast_forward">También con el botón ▶▶ en pantalla (oculto por defecto; se muestra desde el editor).</string>
     <string name="tone_mapping">Tone mapping AMOLED</string>
@@ -28,7 +30,7 @@
     <string name="opt_menu_pause">Pausar con este menú abierto</string>
     <string name="hint_menu_pause">El juego se detiene detrás del menú y sigue al cerrarlo.</string>
     <string name="diag_info">Versión %1$s · título %2$s</string>
-    <string name="menu_help">Abrir este menú: ≡ en pantalla, Home/Guía, Back o Select+Start del control, o mantener ⚑. En el menú: la cruceta mueve, A elige, B vuelve, LB/RB cambian de pestaña. Gesto atrás: volver a la biblioteca.</string>
+    <string name="menu_help">Abrir este menú: ≡ en pantalla, Back del control (Home/Guía con Diagnostics apagado; encendido marca un fallo), o mantener ⚑. En el menú: la cruceta mueve, A elige, B vuelve, LB/RB cambian de pestaña. Gesto atrás: volver a la biblioteca.</string>
 
     <!-- Controles -->
     <string name="sec_touch">Controles táctiles</string>

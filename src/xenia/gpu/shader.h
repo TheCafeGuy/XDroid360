@@ -913,6 +913,14 @@ class Shader {
 
   // Whether the shader contains subroutine calls (cond_call).
   bool uses_subroutine_calls() const { return uses_subroutine_calls_; }
+  // SHD-2: every jump goes forward, there are no loops or calls, and the
+  // [jump, target) ranges nest, so the control flow is a tree of ifs.
+  bool has_only_nested_forward_jumps() const {
+    return has_only_nested_forward_jumps_;
+  }
+  // Every jump goes forward and there are no loops or calls (ranges may
+  // overlap).
+  bool has_only_forward_jumps() const { return has_only_forward_jumps_; }
 
   // c# registers used as the addend in MAD operations to eA.
   const std::set<uint32_t>& memexport_stream_constants() const {
@@ -1084,6 +1092,8 @@ class Shader {
   uint32_t writes_color_targets_ = 0b0000;
   bool uses_register_dynamic_addressing_ = false;
   bool kills_pixels_ = false;
+  bool has_only_nested_forward_jumps_ = false;
+  bool has_only_forward_jumps_ = false;
   bool uses_texture_fetch_instruction_results_ = false;
   bool writes_depth_ = false;
 

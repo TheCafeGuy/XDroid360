@@ -419,6 +419,11 @@ bool Presenter::RefreshGuestOutput(
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
   writable_properties.frontbuffer_height = frontbuffer_height;
+  if (frontbuffer_height >
+      guest_output_height_floor_.load(std::memory_order_relaxed)) {
+    guest_output_height_floor_.store(frontbuffer_height,
+                                     std::memory_order_relaxed);
+  }
   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
   writable_properties.is_8bpc = false;
@@ -1399,6 +1404,13 @@ void Presenter::ApplyPresentResolutionScale(uint32_t& width, uint32_t& height) {
   if (percent < 100) {
     width = std::max(uint32_t(1), (width * percent + 50) / 100);
     height = std::max(uint32_t(1), (height * percent + 50) / 100);
+    const uint32_t in_short = std::min(in_width, in_height);
+    const uint32_t floor_side = std::min(
+        guest_output_height_floor_.load(std::memory_order_relaxed), in_short);
+    if (std::min(width, height) < floor_side) {
+      width = (in_width * floor_side + in_short / 2) / in_short;
+      height = (in_height * floor_side + in_short / 2) / in_short;
+    }
   }
   const uint32_t max_height =
       uint32_t(std::min(std::max(cvars::present_max_height, 0), 4095));

@@ -63,7 +63,7 @@ class XDroidApp : public xe::ui::WindowedApp {
       xe::ui::WindowedAppContext& app_context);
 
   // The live instance (UI thread creates and destroys it), or null.
-  static XDroidApp* Get() { return instance_; }
+  static XDroidApp* Get() { return instance_.load(std::memory_order_acquire); }
 
   bool OnInitialize() override;
 
@@ -89,7 +89,7 @@ class XDroidApp : public xe::ui::WindowedApp {
   size_t PauseEmulation();
   size_t ResumeEmulation();
 
-  static XDroidApp* instance_;
+  static std::atomic<XDroidApp*> instance_;
 
   BootParams params_;
   std::unique_ptr<xe::ui::AndroidWindow> window_;

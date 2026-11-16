@@ -19,6 +19,9 @@ void InstallLatencyMeter();
 
 // Any thread that changes the pad state.
 void LatNoteInputChange();
+// Guest thread, XInputGetState before it samples the pad: LAT-3 may hold
+// the first read after each VdSwap (xdroid_jit_frame).
+void LatJitBeforeInputRead();
 // Guest thread, XInputGetState returning |packet|.
 void LatNoteInputRead(uint32_t packet);
 // Guest thread, at every VdSwap.

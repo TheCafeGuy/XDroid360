@@ -137,14 +137,16 @@ void VulkanGpuBreadcrumbs::OnWorkBegin(DeferredCommandBuffer& command_buffer,
   if (work.detail_count) {
     std::memcpy(work.detail, detail, sizeof(uint32_t) * work.detail_count);
   }
-  if (kind == WorkKind::kDirectResolve && work.detail_count) {
-    // Linear probe on the pipeline key, which is never 0 for a direct resolve
-    // (its direct_resolve bit is set); a full table drops new keys.
+  if ((kind == WorkKind::kDirectResolve || kind == WorkKind::kDump) &&
+      work.detail_count) {
+    // Linear probe on the pipeline key; a slot is empty while its count is 0
+    // (a 1x k_8_8_8_8 color dump key is 0). A full table drops new keys.
+    VariantCount* table = kind == WorkKind::kDump ? dump_variants_
+                                                  : direct_resolve_variants_;
     const uint32_t key = work.detail[0];
     for (uint32_t i = 0; i < kVariantCountSlots; ++i) {
-      VariantCount& variant =
-          direct_resolve_variants_[(key + i) % kVariantCountSlots];
-      if (variant.pipeline_key == key || !variant.pipeline_key) {
+      VariantCount& variant = table[(key + i) % kVariantCountSlots];
+      if (variant.pipeline_key == key || !variant.count) {
         variant.pipeline_key = key;
         ++variant.count;
         break;
@@ -223,17 +225,20 @@ void VulkanGpuBreadcrumbs::LogWorkHang() const {
   if (stuck) {
     log_work("STUCK", stuck);
   }
-  std::string variants;
-  for (const VariantCount& variant : direct_resolve_variants_) {
-    if (variant.pipeline_key) {
-      variants +=
-          fmt::format(" {:08X}:{}", variant.pipeline_key, variant.count);
+  auto log_variants = [](const char* what, const VariantCount* table) {
+    std::string variants;
+    for (uint32_t i = 0; i < kVariantCountSlots; ++i) {
+      if (table[i].count) {
+        variants +=
+            fmt::format(" {:08X}:{}", table[i].pipeline_key, table[i].count);
+      }
     }
-  }
-  if (!variants.empty()) {
-    XELOGE("XDROID-BC: direct resolve dispatches per pipeline key:{}",
-           variants);
-  }
+    if (!variants.empty()) {
+      XELOGE("XDROID-BC: {} dispatches per pipeline key:{}", what, variants);
+    }
+  };
+  log_variants("direct resolve", direct_resolve_variants_);
+  log_variants("render target dump", dump_variants_);
 }
 
 void VulkanGpuBreadcrumbs::OnRenderPassBegin(

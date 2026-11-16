@@ -51,6 +51,9 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
   // Gather the upper bound of the control flow instructions, and label
   // addresses, which are needed for disassembly.
   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
+  // SHD-2: [jump, target) ranges, and whether anything else makes a label.
+  std::vector<std::pair<uint32_t, uint32_t>> jump_ranges;
+  bool non_jump_labels = false;
   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
     ControlFlowInstruction cf_ab[2];
     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
@@ -73,15 +76,49 @@ void Shader::AnalyzeUcode(StringBuffer& ucode_disasm_buffer) {
           break;
         case ControlFlowOpcode::kCondJmp:
           label_addresses_.insert(cf.cond_jmp.address());
+          jump_ranges.emplace_back(i * 2 + j, cf.cond_jmp.address());
           break;
         case ControlFlowOpcode::kLoopStart:
           label_addresses_.insert(cf.loop_start.address());
+          non_jump_labels = true;
           break;
         case ControlFlowOpcode::kLoopEnd:
           label_addresses_.insert(cf.loop_end.address());
+          non_jump_labels = true;
           break;
         default:
           break;
+      }
+    }
+  }
+
+  has_only_forward_jumps_ =
+      !jump_ranges.empty() && !non_jump_labels && !uses_subroutine_calls_;
+  for (const auto& range : jump_ranges) {
+    if (range.second <= range.first) {
+      has_only_forward_jumps_ = false;
+    }
+  }
+  has_only_nested_forward_jumps_ =
+      !jump_ranges.empty() && !non_jump_labels && !uses_subroutine_calls_;
+  for (size_t m = 0; m < jump_ranges.size() && has_only_nested_forward_jumps_;
+       ++m) {
+    const auto& range_m = jump_ranges[m];
+    if (range_m.second <= range_m.first) {
+      has_only_nested_forward_jumps_ = false;
+      break;
+    }
+    for (size_t n = 0; n < m; ++n) {
+      const auto& range_n = jump_ranges[n];
+      const bool disjoint =
+          range_m.second <= range_n.first || range_n.second <= range_m.first;
+      const bool m_in_n =
+          range_m.first >= range_n.first && range_m.second <= range_n.second;
+      const bool n_in_m =
+          range_n.first >= range_m.first && range_n.second <= range_m.second;
+      if (!disjoint && !m_in_n && !n_in_m) {
+        has_only_nested_forward_jumps_ = false;
+        break;
       }
     }
   }
@@ -950,6 +987,7 @@ void ShaderTranslator::TranslateExecInstructions(
     } else {
       auto& op = *reinterpret_cast<const AluInstruction*>(op_ptr);
       ParsedAluInstruction alu_instr;
+      current_alu_address_ = instr_offset;
       ParseAluInstruction(op, current_shader().type(), alu_instr);
       ProcessAluInstruction(alu_instr, eM_potentially_written_before);
       if (alu_instr.vector_and_constant_result.storage_target ==

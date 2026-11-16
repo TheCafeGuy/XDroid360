@@ -87,12 +87,33 @@ DEFINE_bool(xdroid_tex_probe, false,
             "stand-ins for textured draws), plus a summary every 300 frames. "
             "Live.",
             "GPU");
+DEFINE_uint32(
+    xdroid_tex_link_mips, 5,
+    "TEX-1c: xdroid_tex_link for mip chains the game renders level by level. "
+    "Bit 0: a resolve that writes one whole mip level is copied into every "
+    "host texture holding that level. Bit 1: texture keys that differ only in "
+    "the last mip level share the host texture with the most levels, and the "
+    "sampler clamps the level instead. Bit 2: a texture a resolve was "
+    "copied into returns to its sampled layout right after the copy, so "
+    "its next sampling does not end the open pass. Bit 3 (diagnostic): a "
+    "resolve from one 1x render target in the textures' own format is "
+    "copied image to image, without the dump dispatch, so guest memory "
+    "keeps stale bytes. Bit 4: a resolve that writes part of a level-0 "
+    "base, such as one half of it, is linked into that rectangle. Live: "
+    "read once per frame.",
+    "GPU");
 DEFINE_bool(xdroid_tex_census, false,
             "TEX-1 census: per texture key, count the loads (first, base, "
             "mips), what invalidated them (CPU or GPU write), whether the "
             "reloaded guest bytes were identical, bytes and CPU time; every "
             "300 frames log XDROID-TEXCENSUS totals and the top 12 keys. Live.",
             "GPU");
+DEFINE_uint32(xdroid_tex_reload_skip, 0,
+              "Reload bound: skip the load of a texture that only a GPU write "
+              "(a resolve) invalidated, bit 0 for keys with mips, bit 1 for "
+              "keys without, so a bench shows what those reloads cost. Breaks "
+              "the image. Diagnostics only.",
+              "GPU");
 DEFINE_bool(xdroid_tex_skip_same, false,
             "TEX-1a: when a CPU write invalidated a texture but its guest "
             "bytes hash the same as at its last load, keep the host texture "
@@ -342,6 +363,14 @@ void TextureCache::BeginFrame() {
   // is requested again.
   ResetTextureBindings();
   unloaded_null_slots_ = 0;
+  uint32_t link_mips = cvars::xdroid_tex_link_mips;
+  if (link_mips != link_mips_) {
+    // Only bits 1 (link) and 2 (chain levels) change the chains.
+    if ((link_mips ^ link_mips_) & 3) {
+      chain_max_levels_.clear();
+    }
+    link_mips_ = link_mips;
+  }
   probe_frame_.fetch_add(1, std::memory_order_relaxed);
   if (cvars::xdroid_tex_probe) {
     ProbeMaybeSummary();
@@ -451,17 +480,83 @@ void TextureCache::ProbeMaybeSummary() {
   probe_counters_ = ProbeCounters();
 }
 
-bool TextureCache::CompleteResolveLink(Texture& texture) {
-  // The resolve's watch callback has just marked the base outdated (and
-  // dropped the watch); the copy recorded before it made the image current.
+bool TextureCache::CompleteResolveLink(Texture& texture, bool mips) {
+  // The resolve's watch callback has just marked the base (or the mips)
+  // outdated and dropped the watch; the copy recorded before it made the
+  // level current. A CPU write to another mip level between BeginResolveLink
+  // and here is not told apart from the resolve's own invalidation (accepted:
+  // these are levels the game renders, not ones it writes).
   auto global_lock = global_critical_region_.Acquire();
-  if (!texture.MakeUpToDateAndWatch(global_lock)) {
+  if (!texture.MakeUpToDateAndWatch(global_lock, !mips, mips)) {
     return false;
   }
   // The bytes are GPU-written: no hash for TEX-1a to match against.
-  texture.census_.base_hash = 0;
-  texture.census_.inval = 0;
+  if (mips) {
+    texture.census_.mips_hash = 0;
+    texture.census_.inval &= uint8_t(~0xC);
+  } else {
+    texture.census_.base_hash = 0;
+    texture.census_.inval &= uint8_t(~0x3);
+  }
+  texture.probe_.last_load_frame = probe_frame();
+  texture.probe_.last_load_kind = 2;
   return true;
+}
+
+void TextureCache::UpdateLinkCandidates(Texture& texture, bool add) {
+  const TextureKey& key = texture.key();
+  const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+  // A base inside a packed mip tail (packed_level 0) is not a whole level.
+  if (!key.IsResolveLinkShape() || !layout.packed_level) {
+    return;
+  }
+  // Levels past packed_level share its tile: only the first is a candidate.
+  uint32_t level_last =
+      key.mip_page ? std::min(layout.max_level, layout.packed_level) : 0;
+  for (uint32_t level = key.base_page ? 0 : 1; level <= level_last; ++level) {
+    uint32_t address = level ? (uint32_t(key.mip_page) << 12) +
+                                   layout.mip_offsets_bytes[level]
+                             : uint32_t(key.base_page) << 12;
+    if (address & 0xFFF) {
+      continue;
+    }
+    if (add) {
+      link_candidates_.emplace(address >> 12, LinkCandidate{&texture, level});
+      continue;
+    }
+    auto range = link_candidates_.equal_range(address >> 12);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second.texture == &texture) {
+        link_candidates_.erase(it);
+        break;
+      }
+    }
+  }
+}
+
+TextureCache::XdroidLoadState TextureCache::XdroidGetLoadState(
+    uint32_t fetch_constant_index) const {
+  XdroidLoadState state;
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  const Texture* texture = !binding          ? nullptr
+                           : binding->texture ? binding->texture
+                                              : binding->texture_signed;
+  if (!texture) {
+    return state;
+  }
+  state.bound = true;
+  state.kind = texture->probe_.last_load_kind;
+  state.flags = uint8_t(
+      uint32_t(texture->base_outdated_lockless()) |
+      uint32_t(texture->mips_outdated_lockless()) << 1 |
+      uint32_t(shared_memory().IsRangeAnyGpuWritten(
+          uint32_t(texture->key().base_page) << 12,
+          texture->GetGuestBaseSize()))
+          << 2 |
+      uint32_t(texture->key().scaled_resolve) << 3);
+  state.age = uint32_t(probe_frame() - texture->probe_.last_load_frame);
+  state.base_hash = texture->census_.base_hash;
+  return state;
 }
 
 void TextureCache::CensusNoteResolve(const CensusResolve& resolve) {
@@ -747,6 +842,21 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
         binding.Reset();
         continue;
       }
+      if ((link_mips_ & 2) && binding.key.mip_page &&
+          binding.key.IsResolveLinkShape() &&
+          FormatInfo::Get(binding.key.format)->type ==
+              FormatType::kResolvable) {
+        // TEX-1c: one host texture per mip chain. The game samples a chain it
+        // renders level by level through fetch constants that differ only in
+        // the last level; each would be a texture of its own, reloaded on
+        // every resolve into the chain. The sampler clamps to the level the
+        // fetch constant names.
+        TextureKey chain_key = binding.key;
+        chain_key.mip_max_level = 0;
+        uint8_t& chain_max = chain_max_levels_[chain_key];
+        chain_max = std::max(chain_max, uint8_t(binding.key.mip_max_level));
+        binding.key.mip_max_level = chain_max;
+      }
       uint32_t old_host_swizzle = binding.host_swizzle;
       binding.host_swizzle =
           GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
@@ -1024,11 +1134,7 @@ TextureCache::Texture::Texture(TextureCache& texture_cache,
 }
 
 TextureCache::Texture::~Texture() {
-  auto link_it = texture_cache_.link_candidates_.find(key_.base_page);
-  if (link_it != texture_cache_.link_candidates_.end() &&
-      link_it->second == this) {
-    texture_cache_.link_candidates_.erase(link_it);
-  }
+  texture_cache_.UpdateLinkCandidates(*this, false);
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -1054,10 +1160,10 @@ TextureCache::Texture::~Texture() {
 }
 
 bool TextureCache::Texture::MakeUpToDateAndWatch(
-    const global_unique_lock_type& global_lock) {
+    const global_unique_lock_type& global_lock, bool base, bool mips) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
-  const bool watch_base = base_outdated_;
-  const bool watch_mips = mips_outdated_;
+  const bool watch_base = base && base_outdated_;
+  const bool watch_mips = mips && mips_outdated_;
   assert_true(global_lock.owns_lock());
   if (watch_base &&
       !shared_memory.IsRangeValid(
@@ -1135,7 +1241,7 @@ void TextureCache::WatchCallback(const global_unique_lock_type& global_lock,
                                  bool invalidated_by_gpu) {
   Texture& texture = *static_cast<Texture*>(context);
   texture.WatchCallback(global_lock, argument != 0);
-  if (cvars::xdroid_tex_census) {
+  if (cvars::xdroid_tex_census || cvars::xdroid_tex_reload_skip) {
     texture.census_.inval |=
         uint8_t((invalidated_by_gpu ? 2 : 1) << (argument != 0 ? 2 : 0));
   }
@@ -1220,6 +1326,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture =
         textures_.emplace(key, std::move(new_texture)).first->second.get();
+    UpdateLinkCandidates(*texture, true);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
@@ -1425,6 +1532,11 @@ void TextureCache::LoadTexturesData(Texture** textures, uint32_t n_textures) {
       continue;
     }
     ProbeLoadResult(texture, nullptr);
+    // TEX-1a: loaded without hashing, so the hashes of the last single load
+    // no longer describe the image. Kept, they let xdroid_tex_skip_same skip
+    // the reload when the guest writes those older bytes back.
+    texture.census_.base_hash = 0;
+    texture.census_.mips_hash = 0;
 
     // reque for makeuptodatandwatch
     textures[i] = &texture;
@@ -1562,6 +1674,13 @@ bool TextureCache::LoadTextureData(Texture& texture) {
       (!base_outdated || base_same) && (!mips_outdated || mips_same);
   bool load_base = base_outdated && !(skip_same && base_same);
   bool load_mips = mips_outdated && !(skip_same && mips_same);
+  if (texture.ever_loaded() &&
+      (cvars::xdroid_tex_reload_skip &
+       (texture_key.mip_max_level || texture_key.packed_mips ? 1 : 2))) {
+    // Invalidated by GPU writes alone: base bits 0-1, mips bits 2-3.
+    load_base = load_base && (census_inval & 0x3) != 2;
+    load_mips = load_mips && (census_inval & 0xC) != 8;
+  }
 
   // Actually load the texture data.
   if (load_base || load_mips) {
@@ -1601,18 +1720,12 @@ bool TextureCache::LoadTextureData(Texture& texture) {
   }
   if (base_outdated) {
     texture.census_.base_hash = base_hash;
-    // TEX-1b: one 2D tiled level - what a resolve can write whole.
-    if (load_base &&
-        texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
-        !texture_key.depth_or_array_size_minus_1 && texture_key.tiled &&
-        !texture_key.scaled_resolve && !texture_key.mip_max_level &&
-        !texture_key.packed_mips) {
-      link_candidates_[texture_key.base_page] = &texture;
-    }
   }
   if (mips_outdated) {
     texture.census_.mips_hash = mips_hash;
   }
+  texture.probe_.last_load_frame = probe_frame();
+  texture.probe_.last_load_kind = 1;
 
   texture.LogAction("Loaded");
 

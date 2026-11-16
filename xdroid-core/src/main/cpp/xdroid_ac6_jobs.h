@@ -91,7 +91,13 @@ void Ac6SwapLagHistogram(uint64_t out[4]);
 // xdroid_vdswap_wait_cp totals: waits that caught up, timeouts, waited us.
 void Ac6SwapWaitStats(uint64_t out[3]);
 // xdroid_cp_defer_to_swap (H1) totals: waits that saw the swap, timeouts, us.
+// Timeouts include holds released for a waiting HUD pick
+// (xdroid_cp_defer_yield_hud).
 void Ac6CpDeferStats(uint64_t out[3]);
+// Guest VdSwap calls since launch.
+uint64_t Ac6GuestSwaps();
+// True while the H1 hold keeps the CP from executing a kick.
+bool Ac6CpDeferHolding();
 
 // Forensic (HUD-1, temp): xdroid_ac6_jobs_trace.cc.
 void InstallAc6JobTracer();

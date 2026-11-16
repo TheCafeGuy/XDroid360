@@ -13,6 +13,9 @@
 // Make sure vulkan.h is included from third_party (rather than from the system
 // include directory) before vk_mem_alloc.h.
 
+#include <atomic>
+#include <cstdint>
+
 #include "xenia/ui/vulkan/vulkan_device.h"
 
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
@@ -28,6 +31,11 @@
 namespace xe {
 namespace ui {
 namespace vulkan {
+
+// XDroid360 XDROID-LAZY texmem: called after each vkAllocateMemory done by
+// VMA, with its wall time and size. Any allocating thread; lock-free.
+extern std::atomic<void (*)(uint64_t ns, uint64_t bytes)>
+    xdroid_vma_allocate_note;
 
 VmaAllocator CreateVmaAllocator(const VulkanDevice* vulkan_device,
                                 bool externally_synchronized);

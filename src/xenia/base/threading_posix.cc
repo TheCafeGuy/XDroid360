@@ -68,6 +68,14 @@ DEFINE_bool(wfe_precise_sleep, false,
             "CPU");
 #endif
 
+#include "xenia/base/cvar.h"
+DEFINE_uint32(xdroid_wait_block_contended, 1,
+              "XDroid360 G5-3: a multi-object wait that finds a handle locked "
+              "sleeps on that lock instead of yielding, and signals wake "
+              "multi-waiters after unlocking. 0 = old spin-yield path (a woken "
+              "higher-priority waiter could starve the signaler ~100 ms). Live.",
+              "CPU");
+
 #if XE_PLATFORM_LINUX
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension
 #define XE_HAS_SIGEV_THREAD_ID 1
@@ -520,7 +528,7 @@ class PosixConditionBase {
   // The shared condvar is a notify_all, so poking it for an object nobody
   // multi-waits on wakes every parked thread to re-check handles it does not
   // care about.
-  void NotifyAll() {
+  void NotifyAll(std::unique_lock<std::mutex>* unlock_first = nullptr) {
     // bionic's pthread_cond_broadcast issues the futex syscall even with no
     // sleeper. Under the cooperative scheduler guest waits are fibers, so
     // nearly every signal is uncontended and paid a syscall for nothing.
@@ -529,6 +537,15 @@ class PosixConditionBase {
       cond_.notify_all();
     }
     if (multi_wait_refs_.load(std::memory_order_acquire) != 0) {
+      // G5-3: a waiter woken while mutex_ is still held fails its try_lock
+      // and, when it outranks the signaler on the same core, can starve it
+      // for ~100 ms. Unlocking first is safe: the waiter loads the
+      // generation before its locked pass, so either that pass sees the
+      // signal or its park sees the bump. Nothing of `this` is touched after
+      // the unlock (the generation is global), so a waiter may free it.
+      if (unlock_first && cvars::xdroid_wait_block_contended) {
+        unlock_first->unlock();
+      }
       PokeMultiWaiters();
     }
   }
@@ -595,6 +612,7 @@ class PosixConditionBase {
       std::vector<std::unique_lock<std::mutex>> locks;
       locks.reserve(handles.size());
       bool all_locked = true;
+      PosixConditionBase* contended = nullptr;
 
       for (size_t i = 0; i < handles.size(); ++i) {
 #if XE_PLATFORM_MAC || XE_PLATFORM_ANDROID
@@ -602,6 +620,7 @@ class PosixConditionBase {
         std::unique_lock<std::mutex> lk(handles[i]->mutex_, std::try_to_lock);
         if (!lk.owns_lock()) {
           all_locked = false;
+          contended = handles[i];
           break;
         }
         locks.emplace_back(std::move(lk));
@@ -625,7 +644,19 @@ class PosixConditionBase {
       // If we couldn't acquire all locks, release what we have and retry.
       if (!all_locked) {
         locks.clear();
-        std::this_thread::yield();
+        // G5-3: CFS ignores sched_yield from a higher-priority waiter that
+        // preempted the holder on its core (nice -16 audio worker vs a nice
+        // -10 guest thread: ~100 ms stalls). Sleep on the contended lock
+        // instead, holding none of ours, so the holder runs and the pass
+        // retries once it unlocks. Holders never wait while holding mutex_,
+        // and the old spin waited for the same unlock, so no new wait edge.
+        // 0 ms polls (guest fibers) keep the yield.
+        if (contended && timeout.count() > 0 &&
+            cvars::xdroid_wait_block_contended) {
+          std::lock_guard<std::mutex> park(contended->mutex_);
+        } else {
+          std::this_thread::yield();
+        }
         continue;
       }
 
@@ -734,7 +765,7 @@ class PosixCondition<Event> : public PosixConditionBase {
   bool Signal() override {
     auto lock = std::unique_lock(mutex_);
     signal_ = true;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 
@@ -772,7 +803,7 @@ class PosixCondition<Semaphore> final : public PosixConditionBase {
       *out_previous_count = count_;
     }
     count_ += release_count;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 
@@ -804,7 +835,7 @@ class PosixCondition<Mutant> final : public PosixConditionBase {
       --count_;
       // Free to be acquired by another thread
       if (count_ == 0) {
-        NotifyAll();
+        NotifyAll(&lock);
       }
       return true;
     }
@@ -836,9 +867,9 @@ class PosixCondition<Timer> final : public PosixConditionBase {
   ~PosixCondition() override { Cancel(); }
 
   bool Signal() override {
-    std::lock_guard lock(mutex_);
+    auto lock = std::unique_lock(mutex_);
     signal_ = true;
-    NotifyAll();
+    NotifyAll(&lock);
     return true;
   }
 

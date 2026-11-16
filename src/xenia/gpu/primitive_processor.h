@@ -751,6 +751,7 @@ class PrimitiveProcessor {
   bool convert_triangle_fans_to_lists_ = false;
   bool convert_line_loops_to_strips_ = false;
   bool convert_quad_lists_to_triangle_lists_ = false;
+  bool quad_lists_supported_ = true;
   bool convert_triangle_strips_to_lists_ = false;
   bool expand_point_sprites_in_vs_ = false;
   bool expand_rectangle_lists_in_vs_ = false;

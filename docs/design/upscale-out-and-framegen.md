@@ -1,6 +1,6 @@
 # Output upscaling (720p -> 1080p/1440p) and frame interpolation to 60
 
-Date: 2026-10-14. The maintainer's direction: no rendering below 720p; upscale the native 720p output to
+Date: 2026-10-14. the maintainer's direction: no rendering below 720p; upscale the native 720p output to
 1080p/1440p, and interpolate to 60 when native 60 (AC6 timing hooks, design/ac6-60fps.md) is not worth it.
 Code/analysis only. Builds on docs/design/upscaling-fsr.md (UPS-1).
 

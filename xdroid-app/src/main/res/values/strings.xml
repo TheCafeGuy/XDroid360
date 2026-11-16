@@ -11,6 +11,7 @@
     <string name="tab_diag">Diagnostics</string>
     <string name="resume">Resume</string>
     <string name="report_glitch">Report glitch</string>
+    <string name="pc_mirror">PC mirror (experimental)</string>
     <string name="exit_game">Exit game</string>
     <string name="exit_title">Exit game?</string>
     <string name="exit_message">Progress since the last save will be lost.</string>
@@ -19,6 +20,7 @@
     <string name="perf_title">Performance</string>
     <string name="stats_overlay">Show stats overlay</string>
     <string name="detailed_stats">Detailed stats</string>
+    <string name="battery_stats">Battery in stats (phone, controller)</string>
     <string name="fast_forward">Fast forward</string>
     <string name="hint_fast_forward">Also on the on-screen ▶▶ button (hidden by default; show it in the layout editor).</string>
     <string name="tone_mapping">AMOLED tone mapping</string>
@@ -28,7 +30,7 @@
     <string name="opt_menu_pause">Pause while this menu is open</string>
     <string name="hint_menu_pause">The game stops behind the menu and resumes when it closes.</string>
     <string name="diag_info">Version %1$s · title %2$s</string>
-    <string name="menu_help">Open this menu: on-screen ≡, controller Home/Guide, Back or Select+Start, or hold ⚑. In the menu: D-pad moves, A picks, B goes back, LB/RB switch tabs. Swipe back: exit to the library.</string>
+    <string name="menu_help">Open this menu: on-screen ≡, controller Back (Home/Guide with Diagnostics off; with it on, Home/Guide marks a glitch), or hold ⚑. In the menu: D-pad moves, A picks, B goes back, LB/RB switch tabs. Swipe back: exit to the library.</string>
 
     <!-- Controls -->
     <string name="sec_touch">Touch controls</string>

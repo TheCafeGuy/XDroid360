@@ -446,6 +446,13 @@ static void XdroidAudioWaitBegin(KernelState* kernel_state,
                            std::memory_order_relaxed);
   }
   watch.wait_start_us.store(XdroidNowUs(), std::memory_order_release);
+  // AUDIO-H4: the producer state census below takes the scheduler lock
+  // (GetThreadByID + XdroidThreadState) on every worker wait; only the
+  // diagnostics report and the boost arm need it. Signaler discovery above
+  // stays on for the nice arm too.
+  if (!XdroidAudioForensics() && !cvars::xdroid_audio_producer_boost) {
+    return;
+  }
   const uint32_t tid = watch.signaler_tid.load(std::memory_order_relaxed);
   if (!tid || !GuestScheduler::enabled()) {
     watch.producer_state[3].fetch_add(1, std::memory_order_relaxed);
@@ -826,6 +833,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects,
                     : XThread::CooperativeWaitKind::kMultiAll,
           handle_ids, count, gateable_set ? objects : nullptr);
     }
+    XEventMultiWaitScope multi_waiters(wait_type ? objects : nullptr, count);
     return CooperativeWait(
         scheduler, self, kthread, nullptr, alertable != 0, deadline_ms,
         [&](bool parked) -> std::optional<X_STATUS> {

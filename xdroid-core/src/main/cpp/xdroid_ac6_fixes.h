@@ -17,6 +17,9 @@ namespace xdroid {
 // emulator is set up, before a title is launched.
 void InstallAc6Fixes(xe::Emulator* emulator);
 
+// True while the render thread's HUD pick waits for the main loop (HUD-1).
+bool Ac6HudJoinWaiting();
+
 }  // namespace xdroid
 
 #endif  // XDROID_AC6_FIXES_H_

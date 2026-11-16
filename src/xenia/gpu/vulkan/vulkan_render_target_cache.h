@@ -11,9 +11,12 @@
 #define XENIA_GPU_VULKAN_VULKAN_RENDER_TARGET_CACHE_H_
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -38,6 +41,40 @@ class VulkanCommandProcessor;
 
 class VulkanRenderTargetCache final : public RenderTargetCache {
  public:
+  // A3 census (xdroid_xfer_census): ownership transfers per frame, and how
+  // many of them the draw that needs them could overwrite whole. The state
+  // check covers the write mask, blending, alpha test, alpha to coverage,
+  // pixel kill and depth/stencil; coverage is not checked, so "rect" (the draw
+  // is a rectangle or quad list) is only the likely full-coverage subset.
+  struct XferCensus {
+    uint64_t transfers = 0;
+    uint64_t tiles = 0;
+    uint64_t overwrite = 0;
+    uint64_t overwrite_tiles = 0;
+    uint64_t overwrite_rect = 0;
+    uint64_t overwrite_rect_tiles = 0;
+    uint64_t depth_stencil_on = 0;
+    uint64_t skipped = 0;
+    uint64_t skipped_tiles = 0;
+    uint64_t not_covered = 0;
+  };
+  XferCensus xfer_census_;
+  // Transfers by (source key, destination key) without the base and pitch:
+  // count and tiles, for the census.
+  std::map<uint64_t, std::pair<uint64_t, uint64_t>> xfer_census_pairs_;
+  std::string TakeTransferPairCensus(double frames);
+  DrawExtentEstimator& census_draw_extent_estimator() {
+    return draw_extent_estimator();
+  }
+  // Set by the command processor right before Update.
+  xenos::PrimitiveType census_prim_type_ = xenos::PrimitiveType::kNone;
+  bool census_pixel_kill_ = false;
+  // 0 = no pixel shader, 1 = no texture fetches, 2 = fetches textures.
+  uint32_t census_ps_kind_ = 0;
+  // 1x -> 4x transfers by the needing draw: [ps kind][color bound].
+  uint64_t census_up4x_[3][2] = {};
+  uint64_t census_up4x_tiles_[3][2] = {};
+
   union RenderPassKey {
     struct {
       // If emulating 2x as 4x, this is still 2x for simplicity of using this
@@ -110,6 +147,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   bool Initialize(uint32_t shared_memory_binding_count);
   void Shutdown(bool from_destructor = false);
   void ClearCache() override;
+  // G2 stall: the dump and ownership transfer pipelines are created on the
+  // command processor thread when first needed, at menu and mission
+  // transitions (XDROID-LAZY dump + xfer 64-81 ms per transition), and were
+  // recompiled by the driver on every launch. They go through a small
+  // VkPipelineCache of their own, persisted next to the title's one; only this
+  // thread touches it, so the large shared cache's save lock never blocks it.
+  void InitializeShaderStorage(const std::filesystem::path& cache_root);
+  // Command processor thread, per stats window: writes the cache once its
+  // creations have been quiet for 10 seconds and its contents changed.
+  void MaybeSaveLazyPipelineCache();
 
   void CompletedSubmissionUpdated();
   void EndSubmission();
@@ -136,6 +183,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
                reg::RB_COPY_DEST_INFO* copy_dest_info_out = nullptr,
                bool* written_scaled_out = nullptr);
 
+  void CensusTransfers(reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask);
+  // A4: drops the color transfers the current draw rewrites whole (state
+  // predicate plus a CPU-proven rectangle cover). Returns the transfer lists
+  // to perform: last_update_transfers() or a filtered copy.
+  const std::vector<Transfer>* SkipOverwrittenTransfers(
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      uint32_t normalized_color_mask, const Shader& vertex_shader);
+  std::array<std::vector<Transfer>, 1 + xenos::kMaxColorRenderTargets>
+      xfer_skip_transfers_;
   bool Update(bool is_rasterization_done,
               reg::RB_DEPTHCONTROL normalized_depth_control,
               uint32_t normalized_color_mask,
@@ -212,6 +269,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   }
   bool gamma_render_target_as_unorm16() const {
     return gamma_render_target_as_unorm16_;
+  }
+
+  // XDroid360 GSR2: the depth target of the last Update (null if none).
+  bool GetLastUpdateDepth(VkImage& image, VkImageView& view_depth_color,
+                          VkSampleCountFlagBits& samples) const {
+    const RenderTarget* rt = last_update_bound_rts_[0];
+    if (!rt) {
+      return false;
+    }
+    const VulkanRenderTarget* vrt = static_cast<const VulkanRenderTarget*>(rt);
+    image = vrt->image();
+    view_depth_color = vrt->view_depth_color();
+    const xenos::MsaaSamples msaa = rt->key().msaa_samples;
+    samples = msaa == xenos::MsaaSamples::k1X ? VK_SAMPLE_COUNT_1_BIT
+              : msaa == xenos::MsaaSamples::k2X && msaa_2x_attachments_supported_
+                  ? VK_SAMPLE_COUNT_2_BIT
+                  : VK_SAMPLE_COUNT_4_BIT;
+    return true;
   }
 
   bool msaa_2x_attachments_supported() const {
@@ -791,6 +866,18 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // buffer. VK_NULL_HANDLE if failed to create.
   std::unordered_map<EdramDumpShaderKey, VkPipeline, EdramDumpShaderKey::Hasher>
       dump_pipelines_;
+
+  // See InitializeShaderStorage. UseLazyPipelineCache marks it for saving.
+  VkPipelineCache UseLazyPipelineCache() {
+    lazy_pipeline_cache_dirty_ = lazy_pipeline_cache_ != VK_NULL_HANDLE;
+    lazy_pipeline_cache_used_ = std::chrono::steady_clock::now();
+    return lazy_pipeline_cache_;
+  }
+  VkPipelineCache lazy_pipeline_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path lazy_pipeline_cache_path_;
+  size_t lazy_pipeline_cache_saved_size_ = 0;
+  bool lazy_pipeline_cache_dirty_ = false;
+  std::chrono::steady_clock::time_point lazy_pipeline_cache_used_;
 
   // Temporary storage for Resolve.
   std::vector<Transfer> clear_transfers_[2];

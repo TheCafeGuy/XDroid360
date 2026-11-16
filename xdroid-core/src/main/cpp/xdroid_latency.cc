@@ -5,12 +5,15 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/threading.h"
 #include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/ui/xdroid_ui_hooks.h"
+#include "xdroid_mirror.h"
 
 DEFINE_int32(xdroid_lat_trace, 0,
              "LAT-1: log the timeline of the next N presented frames "
@@ -18,10 +21,29 @@ DEFINE_int32(xdroid_lat_trace, 0,
              "previous VdSwap). Live.",
              "XDroid360");
 
+DEFINE_int32(xdroid_lat_trace_every, 4500,
+             "LAT-2: start a 30-frame XDROID-LATF trace every N presents "
+             "(0 = off), so every run shows where a frame's time goes. Live.",
+             "XDroid360");
+
 DEFINE_bool(xdroid_lat_meter, true,
             "LAT-1: run the latency meter (pad, kick, CP and present hooks). "
             "Live.",
             "XDroid360");
+
+DEFINE_int32(xdroid_jit_frame, 2,
+             "LAT-3: hold the guest's first XInputGetState after each VdSwap "
+             "so its next frame reaches the command processor just in time "
+             "(input sampled later, same FPS). The hold follows the measured "
+             "slack: 1 = CP start minus guest swap, 2 = also the CP's own "
+             "vblank waits in that frame. 0 = off. Live.",
+             "XDroid360");
+DEFINE_int32(xdroid_jit_frame_margin_us, 6000,
+             "LAT-3: slack xdroid_jit_frame keeps before the CP would wait for "
+             "the guest. Live.",
+             "XDroid360");
+DEFINE_int32(xdroid_jit_frame_max_us, 20000,
+             "LAT-3: longest hold of xdroid_jit_frame. Live.", "XDroid360");
 
 namespace xdroid {
 
@@ -51,6 +73,17 @@ std::atomic<uint64_t> g_cp_wait_ns[kRing] = {};
 std::atomic<uint32_t> g_cp_wait_addr[kRing] = {};
 std::atomic<uint64_t> g_cp_wait_longest_ns[kRing] = {};
 uint64_t g_cp_wait_total_last = 0;
+
+// LAT-3: current hold, and slack stats per XDROID-LAT window (CP thread
+// writes, present thread reads and resets).
+std::atomic<uint32_t> g_jit_delay_us{0};
+std::atomic<uint64_t> g_jit_slack_sum_us{0};
+std::atomic<uint32_t> g_jit_slack_n{0};
+std::atomic<uint32_t> g_jit_slack_min_us{UINT32_MAX};
+// Who reads the pad and who swaps, and pad reads per window.
+std::atomic<uint32_t> g_read_tid{0};
+std::atomic<uint32_t> g_swap_tid{0};
+std::atomic<uint32_t> g_reads{0};
 
 // Earliest pad change not yet returned to the guest (0 = none).
 std::atomic<uint64_t> g_input_ns{0};
@@ -82,6 +115,49 @@ void Percentiles(std::vector<uint32_t>& v, double& p50, double& p95) {
   p95 = v[std::min(v.size() - 1, v.size() * 95 / 100)] / 1000.0;
 }
 
+// CP thread, at swap |swap| (its start, guest swap and waits are recorded).
+// Lowers the hold at once when the guest came too late, raises it by an
+// eighth of the spare slack otherwise (after 8 calm frames).
+void JitUpdate(uint64_t swap, uint64_t cp_wait_ns) {
+  const int mode = cvars::xdroid_jit_frame;
+  if (mode <= 0) {
+    g_jit_delay_us.store(0, std::memory_order_relaxed);
+    return;
+  }
+  const uint32_t i = swap % kRing;
+  const uint64_t guest_ns = g_guest_swap_ns[i].load(std::memory_order_acquire);
+  const uint64_t start_ns = g_cp_start_ns[i].load(std::memory_order_relaxed);
+  if (g_guest_swaps.load(std::memory_order_acquire) < swap || !guest_ns ||
+      !start_ns) {
+    return;
+  }
+  int64_t slack =
+      start_ns > guest_ns ? int64_t((start_ns - guest_ns) / 1000) : 0;
+  if (mode >= 2) {
+    slack += int64_t(cp_wait_ns / 1000);
+  }
+  g_jit_slack_sum_us.fetch_add(uint64_t(slack), std::memory_order_relaxed);
+  g_jit_slack_n.fetch_add(1, std::memory_order_relaxed);
+  uint32_t low = g_jit_slack_min_us.load(std::memory_order_relaxed);
+  while (uint32_t(slack) < low &&
+         !g_jit_slack_min_us.compare_exchange_weak(low, uint32_t(slack))) {
+  }
+  static uint32_t hold = 0;
+  const int64_t margin = std::max(cvars::xdroid_jit_frame_margin_us, 0);
+  int64_t delay = g_jit_delay_us.load(std::memory_order_relaxed);
+  if (slack < margin) {
+    delay -= margin - slack;
+    hold = 8;
+  } else if (hold) {
+    --hold;
+  } else {
+    delay += std::min<int64_t>((slack - margin) / 8, 1000);
+  }
+  delay = std::clamp<int64_t>(delay, 0,
+                              std::max(cvars::xdroid_jit_frame_max_us, 0));
+  g_jit_delay_us.store(uint32_t(delay), std::memory_order_relaxed);
+}
+
 void OnCpSwap() {
   if (!cvars::xdroid_lat_meter) {
     return;
@@ -93,6 +169,7 @@ void OnCpSwap() {
   uint64_t total = hooks.cp_wait_ns.load(std::memory_order_relaxed);
   g_cp_wait_ns[swap % kRing].store(total - g_cp_wait_total_last,
                                    std::memory_order_relaxed);
+  JitUpdate(swap, total - g_cp_wait_total_last);
   g_cp_wait_total_last = total;
   g_cp_wait_addr[swap % kRing].store(
       hooks.cp_wait_longest_addr.load(std::memory_order_relaxed),
@@ -107,6 +184,7 @@ double Ms(uint64_t ns, uint64_t base) {
 }
 
 void OnPresent() {
+  MirrorOnPresent();
   if (!cvars::xdroid_lat_meter) {
     return;
   }
@@ -126,6 +204,12 @@ void OnPresent() {
     if (guest_ns && cp_ns >= guest_ns) {
       g_swap_to_cp_us.push_back(Us(cp_ns - guest_ns));
     }
+  }
+  static uint32_t presents_since_trace = 0;
+  if (cvars::xdroid_lat_trace_every > 0 && cvars::xdroid_lat_trace <= 0 &&
+      ++presents_since_trace >= uint32_t(cvars::xdroid_lat_trace_every)) {
+    presents_since_trace = 0;
+    cvars::xdroid_lat_trace = 30;
   }
   if (cvars::xdroid_lat_trace > 0 && swap > 1 &&
       g_guest_swaps.load(std::memory_order_acquire) >= swap) {
@@ -163,12 +247,25 @@ void OnPresent() {
   Percentiles(g_cp_to_present_us, cp50, cp95);
   Percentiles(g_input_to_read_us, ir50, ir95);
   Percentiles(g_input_to_present_us, ip50, ip95);
+  const uint32_t slack_n = g_jit_slack_n.exchange(0, std::memory_order_relaxed);
+  const uint64_t slack_sum =
+      g_jit_slack_sum_us.exchange(0, std::memory_order_relaxed);
+  const uint32_t slack_min =
+      g_jit_slack_min_us.exchange(UINT32_MAX, std::memory_order_relaxed);
   XELOGI(
       "XDROID-LAT: swap->cp p50 {:.1f} p95 {:.1f} ms | cp->present p50 {:.1f} "
       "p95 {:.1f} ms | inputs {} input->read p50 {:.1f} p95 {:.1f} ms "
-      "input->present p50 {:.1f} p95 {:.1f} ms",
+      "input->present p50 {:.1f} p95 {:.1f} ms | jit {} hold {:.1f} ms slack "
+      "mean {:.1f} min {:.1f} ms | pad reads/frame {:.1f} tid read {:X} swap "
+      "{:X}",
       sc50, sc95, cp50, cp95, g_input_to_present_us.size(), ir50, ir95, ip50,
-      ip95);
+      ip95, cvars::xdroid_jit_frame,
+      g_jit_delay_us.load(std::memory_order_relaxed) / 1000.0,
+      slack_n ? slack_sum / 1000.0 / slack_n : -1.0,
+      slack_n ? slack_min / 1000.0 : -1.0,
+      g_reads.exchange(0, std::memory_order_relaxed) / double(kWindow),
+      g_read_tid.load(std::memory_order_relaxed),
+      g_swap_tid.load(std::memory_order_relaxed));
   g_presents = 0;
   g_swap_to_cp_us.clear();
   g_cp_to_present_us.clear();
@@ -196,6 +293,27 @@ void LatNoteInputChange() {
                                      std::memory_order_acq_rel);
 }
 
+void LatJitBeforeInputRead() {
+  g_reads.fetch_add(1, std::memory_order_relaxed);
+  g_read_tid.store(xe::threading::current_thread_id(),
+                   std::memory_order_relaxed);
+  // The hold follows swaps the meter counts.
+  if (cvars::xdroid_jit_frame <= 0 || !cvars::xdroid_lat_meter) {
+    return;
+  }
+  static std::atomic<uint64_t> held_swap{UINT64_MAX};
+  const uint64_t swaps = g_guest_swaps.load(std::memory_order_acquire);
+  if (held_swap.exchange(swaps, std::memory_order_relaxed) == swaps) {
+    return;
+  }
+  const uint32_t delay = std::min<uint32_t>(
+      g_jit_delay_us.load(std::memory_order_relaxed),
+      uint32_t(std::max(cvars::xdroid_jit_frame_max_us, 0)));
+  if (delay >= 200) {
+    std::this_thread::sleep_for(std::chrono::microseconds(delay));
+  }
+}
+
 void LatNoteInputRead(uint32_t packet) {
   if (!cvars::xdroid_lat_meter) {
     return;
@@ -218,6 +336,8 @@ void LatNoteGuestSwap() {
   if (!cvars::xdroid_lat_meter) {
     return;
   }
+  g_swap_tid.store(xe::threading::current_thread_id(),
+                   std::memory_order_relaxed);
   uint64_t swap = g_guest_swaps.fetch_add(1, std::memory_order_relaxed) + 1;
   g_guest_swap_ns[swap % kRing].store(NowNs(), std::memory_order_release);
   uint32_t next = (swap + 1) % kRing;

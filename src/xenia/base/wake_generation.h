@@ -36,6 +36,10 @@ class WakeGeneration {
  public:
   uint32_t Load() const { return value_.load(std::memory_order_acquire); }
 
+  // PERF-H1: the counter word itself, for JIT code that waits on it with an
+  // exclusive load and wfe (a Bump store wakes it).
+  const void* Address() const { return &value_; }
+
   void Bump() {
     // seq_cst on both sides (here, and the waiter's registration before its
     // re-check) so that either the waiter sees the new value or this sees the

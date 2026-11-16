@@ -14,6 +14,7 @@
 
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/math.h"
 #include "xenia/base/xxhash.h"
 #include "xenia/memory.h"
 
@@ -46,6 +47,8 @@ VulkanDrawBlackbox::Record* VulkanDrawBlackbox::Begin(uint64_t frame) {
     slot.frame = frame;
     slot.count = 0;
     slot.dropped = 0;
+    slot.constants.clear();
+    rows_known_.fill(0);
     if (slot.records.size() < kMaxDrawsPerFrame) {
       slot.records.resize(kMaxDrawsPerFrame);
     }
@@ -60,6 +63,35 @@ VulkanDrawBlackbox::Record* VulkanDrawBlackbox::Begin(uint64_t frame) {
   record.draw = slot.count + slot.dropped;
   ++slot.count;
   return &record;
+}
+
+void VulkanDrawBlackbox::AddConstants(Record& record, const uint32_t* rows,
+                                      const uint64_t* bitmap, uint32_t base) {
+  std::vector<uint32_t>& constants =
+      frames_[record.frame % kRingFrames].constants;
+  if (!record.constant_count) {
+    record.constant_begin = uint32_t(constants.size());
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint64_t bits = bitmap[i];
+    uint32_t bit;
+    while (xe::bit_scan_forward(bits, &bit)) {
+      bits &= bits - 1;
+      const uint32_t row = base + i * 64 + bit;
+      const uint32_t* value = rows + (row - base) * 4;
+      uint32_t* known = &rows_[row * 4];
+      const uint64_t known_bit = uint64_t(1) << (row & 63);
+      if ((rows_known_[row >> 6] & known_bit) &&
+          !std::memcmp(known, value, 4 * sizeof(uint32_t))) {
+        continue;
+      }
+      rows_known_[row >> 6] |= known_bit;
+      std::memcpy(known, value, 4 * sizeof(uint32_t));
+      constants.push_back(row);
+      constants.insert(constants.end(), value, value + 4);
+      ++record.constant_count;
+    }
+  }
 }
 
 void VulkanDrawBlackbox::OnFrameEnd(const Memory& memory, uint64_t frame) {
@@ -108,7 +140,7 @@ void VulkanDrawBlackbox::Dump(const std::filesystem::path& dir, uint64_t n) {
       continue;
     }
     text += fmt::format("# frame {}{}: {} draws recorded, {} dropped\n", f,
-                        f == n ? " (HUD-1)" : "", slot.count, slot.dropped);
+                        f == n ? " (event)" : "", slot.count, slot.dropped);
     for (uint32_t i = 0; i < slot.count; ++i) {
       const Record& record = slot.records[i];
       text += fmt::format("f{} d{} vs={:016X} ps={:016X} prim={} count={}",
@@ -124,16 +156,27 @@ void VulkanDrawBlackbox::Dump(const std::filesystem::path& dir, uint64_t n) {
       }
       for (uint32_t j = 0; j < std::min<uint32_t>(record.ib_depth, 3); ++j) {
         const auto& ib = record.ib_chain[j];
-        text +=
-            fmt::format(" ib{}={:08X}+{:X}{}{}{}", j + 1, ib[0], ib[1],
-                        ib[2] & 1 ? "" : " notkicked", ib[2] & 2 ? " copy" : "",
-                        ib[2] & 4 ? " CHANGED_SINCE_KICK" : "");
+        text += fmt::format(" ib{}={:08X}+{:X}", j + 1, ib[0], ib[1]);
       }
       for (uint32_t j = 0; j < record.texture_count; ++j) {
         const auto& fetch = record.texture_fetch[j];
         text += fmt::format(" t{}={:08X}.{:08X}.{:08X}.{:08X}.{:08X}.{:08X}",
                             record.texture_slot[j], fetch[0], fetch[1],
                             fetch[2], fetch[3], fetch[4], fetch[5]);
+        // k: 0 never loaded, 1 from guest memory, 2 resolve link; a: frames
+        // since; f: bit 0 base outdated, 1 mips outdated, 2 GPU-written bytes
+        // in the base range, 3 scaled resolve; h: hash of the loaded base.
+        const TextureCache::XdroidLoadState& state = record.texture_state[j];
+        text += state.bound
+                    ? fmt::format(" load=k{}a{}f{:X}h{:016X}", state.kind,
+                                  state.age, state.flags, state.base_hash)
+                    : " load=none";
+      }
+      for (uint32_t j = 0; j < record.constant_count; ++j) {
+        const uint32_t* entry = &slot.constants[record.constant_begin + j * 5];
+        text += fmt::format(" {}{}={:08X}.{:08X}.{:08X}.{:08X}",
+                            entry[0] < 256 ? 'c' : 'p', entry[0] & 255,
+                            entry[1], entry[2], entry[3], entry[4]);
       }
       text += '\n';
     }

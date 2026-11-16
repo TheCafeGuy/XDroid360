@@ -8,9 +8,9 @@
 namespace xdroid {
 
 // After config::SetupConfig: if the config predates the current tested
-// defaults, sets them and saves the file. Fresh installs and upgrades get
-// the values the target device was validated with; a change the user makes
-// afterwards sticks.
+// defaults, sets the ones changed since its version and saves the file.
+// Fresh installs get every value the target device was validated with;
+// upgrades keep every other value the user changed.
 void ApplyTestedDefaults();
 
 // Forces the diagnostic cvars on or off per xdroid_diagnostics, every boot,

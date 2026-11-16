@@ -1,0 +1,397 @@
+From 267e55982fee643f349e084f31f56bf44fcb7801 Mon Sep 17 00:00:00 2001
+From: Brian Degenhardt <bmd@bmdhacks.com>
+Date: Thu, 22 Oct 2026 23:26:56 -0700
+Subject: [PATCH] tu: restore the a7xx RB clear/buffer/CCU registers when
+ switching back into a command buffer
+
+On an Adreno 722 under KGSL, the CP switches to a higher priority context
+(SurfaceFlinger's GLES composition, in the app) inside the bins of a GMEM
+render pass, not at the end of a bin, so the bin restore preamble that
+rewrites RB_CLEAR_TARGET, RB_BUFFER_CNTL and RB_CCU_CACHE_CNTL never runs, and
+the CP's own restore leaves them as the other context set them. With
+RB_CLEAR_TARGET in sysmem mode, the GMEM clears in the rest of the pass go to
+the attachment in memory instead of the tile, and the pass comes out with its
+earlier bins black or stale and only its last bin correct.
+
+Every write of the three registers on a7xx now also writes the value to
+tu6_global, and a switch-back amble (CP_SET_AMBLE PREAMBLE_AMBLE_TYPE, which
+the CP runs on every switch back into a command buffer) writes them back.
+Command buffers that track preemption latency get the restore in front of
+their own switch-back amble. Reading the registers in a switch-away amble
+instead does not work on the Adreno 722: CP_REG_TO_MEM returns 0 for all
+three there.
+
+Measured on a Retroid Pocket Duo with a Burnout 3 GS dump replayed while a
+GLES client at high EGL priority draws 120 times a second: the replay
+differed from the sysmem reference in 47 to 71 of 80 frames with the
+BANDWIDTH + TUNE_SMALL default and 7 to 25 with TU_DEBUG=gmem; with this
+change, 0 in both. An experiment build counted 23 to 44 runs of a
+switch-back amble per replay and none of the bin restore preamble.
+
+Ported by hand to Mesa 7a1fc756809 for XDroid360 from bmdhacks/armsx2-turnip
+267e559 (Brian Degenhardt, MIT): raw CP_MEM_TO_REG packets instead of
+cs->mem_to_reg, and store_3d_blit restores RB_BUFFER_CNTL with
+CP_SCRATCH_TO_REG here, so its copy is saved to a fourth slot and
+copied back with CP_MEM_TO_MEM (the value is not known when recording). TU_DEBUG=nopreemptrestore turns it off (read at
+device creation), for A/B on one build.
+---
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 47a2fc6..9380027 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -1895,7 +1895,7 @@ r3d_setup(struct tu_cmd_buffer *cmd,
+       tu_cs_emit_regs(cs, RB_CNTL(CHIP, .buffers_location = BUFFERS_IN_SYSMEM));
+ 
+       if (CHIP >= A7XX) {
+-         tu_cs_emit_regs(cs, RB_BUFFER_CNTL(CHIP,
++         struct tu_reg_value buffer_cntl = RB_BUFFER_CNTL(CHIP,
+             .z_sysmem = true,
+             .s_sysmem = true,
+             .rt0_sysmem = true,
+@@ -1906,7 +1906,11 @@ r3d_setup(struct tu_cmd_buffer *cmd,
+             .rt5_sysmem = true,
+             .rt6_sysmem = true,
+             .rt7_sysmem = true,
+-         ));
++         );
++         if (CHIP == A7XX)
++            tu7_rb_shadow_write(cs, TU7_RB_SHADOW_BUFFER_CNTL, (uint32_t) buffer_cntl.value);
++         tu_cs_emit_pkt4(cs, buffer_cntl.reg, 1);
++         tu_cs_emit(cs, (uint32_t) buffer_cntl.value);
+       }
+    }
+ 
+@@ -4183,8 +4187,8 @@ clear_image_event_blit(struct tu_cmd_buffer *cmd,
+ 
+    struct tu_cs *cs = &cmd->cs;
+ 
+-   tu_cs_emit_regs(cs,
+-                   RB_CLEAR_TARGET(A7XX, .clear_mode = CLEAR_MODE_SYSMEM));
++   tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_CLEAR_TARGET,
++                            RB_CLEAR_TARGET(A7XX, .clear_mode = CLEAR_MODE_SYSMEM));
+ 
+    tu_cs_emit_pkt4(cs, REG_A6XX_RB_RESOLVE_CNTL_0, 1);
+    tu_cs_emit(cs, 0);
+@@ -5916,6 +5920,12 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
+       tu_cs_emit(cs, CP_REG_TO_SCRATCH_0_REG(RB_BUFFER_CNTL(CHIP).reg) |
+                      CP_REG_TO_SCRATCH_0_SCRATCH(1) |
+                      CP_REG_TO_SCRATCH_0_CNT(1 - 1));
++      /* Its preemption copy too: r3d_setup overwrites it, and the value is
++       * not known when recording.
++       */
++      if (CHIP == A7XX)
++         tu7_rb_shadow_copy(cs, TU7_RB_SHADOW_SAVED_BUFFER_CNTL,
++                            TU7_RB_SHADOW_BUFFER_CNTL);
+    }
+ 
+    r3d_setup<CHIP>(cmd, cs, src_format, dst_format, VK_IMAGE_ASPECT_COLOR_BIT,
+@@ -5964,6 +5974,9 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
+                   CP_SCRATCH_TO_REG_0_CNT(1 - 1));
+ 
+    if (CHIP >= A7XX) {
++      if (CHIP == A7XX)
++         tu7_rb_shadow_copy(cs, TU7_RB_SHADOW_BUFFER_CNTL,
++                            TU7_RB_SHADOW_SAVED_BUFFER_CNTL);
+       tu_cs_emit_pkt7(cs, CP_SCRATCH_TO_REG, 1);
+       tu_cs_emit(cs, CP_SCRATCH_TO_REG_0_REG(RB_BUFFER_CNTL(CHIP).reg) |
+                         CP_SCRATCH_TO_REG_0_SCRATCH(1) |
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index c7b0709..da40f1f 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -675,14 +675,15 @@ emit_rb_ccu_cntl(struct tu_cs *cs, struct tu_device *dev, bool gmem)
+          .color_offset = cfg->color_ccu_offset,
+       ));
+    } else if (CHIP == A7XX) {
+-      tu_cs_emit_regs(cs, RB_CCU_CACHE_CNTL(CHIP,
+-         .depth_offset_hi = depth_offset_hi,
+-         .color_offset_hi = color_offset_hi,
+-         .depth_cache_size = CCU_CACHE_SIZE_FULL,
+-         .depth_offset = depth_offset,
+-         .color_cache_size = color_cache_size,
+-         .color_offset = color_offset
+-      ));
++      tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_CCU_CACHE_CNTL,
++         RB_CCU_CACHE_CNTL(A7XX,
++            .depth_offset_hi = depth_offset_hi,
++            .color_offset_hi = color_offset_hi,
++            .depth_cache_size = CCU_CACHE_SIZE_FULL,
++            .depth_offset = depth_offset,
++            .color_cache_size = color_cache_size,
++            .color_offset = color_offset
++         ));
+    } else if (CHIP == A6XX) {
+       tu_cs_emit_regs(cs, RB_CCU_CNTL(CHIP,
+          .gmem_fast_clear_disable =
+@@ -1538,8 +1539,15 @@ template <chip CHIP>
+ static void
+ tu7_emit_tile_render_begin_regs(struct tu_cs *cs)
+ {
+-   tu_cs_emit_regs(cs, RB_BUFFER_CNTL(CHIP, 0x0));
+-   tu_cs_emit_regs(cs, RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_GMEM));
++   if (CHIP == A7XX) {
++      tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_BUFFER_CNTL,
++                               RB_BUFFER_CNTL(A7XX, 0x0));
++      tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_CLEAR_TARGET,
++                               RB_CLEAR_TARGET(A7XX, .clear_mode = CLEAR_MODE_GMEM));
++   } else {
++      tu_cs_emit_regs(cs, RB_BUFFER_CNTL(CHIP, 0x0));
++      tu_cs_emit_regs(cs, RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_GMEM));
++   }
+ }
+ 
+ /* Set always-identical registers used specifically for sysmem */
+@@ -1547,7 +1555,7 @@ template <chip CHIP>
+ static void
+ tu7_emit_sysmem_render_begin_regs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+ {
+-   tu_cs_emit_regs(cs, RB_BUFFER_CNTL(CHIP,
++   struct tu_reg_value buffer_cntl = RB_BUFFER_CNTL(CHIP,
+       .z_sysmem = true,
+       .s_sysmem = true,
+       .rt0_sysmem = true,
+@@ -1558,9 +1566,19 @@ tu7_emit_sysmem_render_begin_regs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       .rt5_sysmem = true,
+       .rt6_sysmem = true,
+       .rt7_sysmem = true,
+-   ));
++   );
++   struct tu_reg_value clear_target =
++      RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_SYSMEM);
+ 
+-   tu_cs_emit_regs(cs, RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_SYSMEM));
++   if (CHIP == A7XX) {
++      tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_BUFFER_CNTL, buffer_cntl);
++      tu7_emit_shadowed_rb_reg(cs, TU7_RB_SHADOW_CLEAR_TARGET, clear_target);
++   } else {
++      tu_cs_emit_pkt4(cs, buffer_cntl.reg, 1);
++      tu_cs_emit(cs, (uint32_t) buffer_cntl.value);
++      tu_cs_emit_pkt4(cs, clear_target.reg, 1);
++      tu_cs_emit(cs, (uint32_t) clear_target.value);
++   }
+ }
+ 
+ template <chip CHIP>
+@@ -2372,10 +2390,51 @@ tu_emit_bin_preamble(struct tu_device *dev, struct tu_cs *cs, bool bv)
+    }
+ }
+ 
++/* The a7xx switch-back amble: write back RB_CLEAR_TARGET, RB_BUFFER_CNTL and
++ * RB_CCU_CACHE_CNTL from the copies kept by tu7_emit_shadowed_rb_reg().
++ *
++ * The CP does not restore these registers when it switches back to this
++ * context in the middle of a command buffer. tu_emit_bin_preamble() rewrites
++ * them, but only after a switch at the end of a bin. Under KGSL the CP also
++ * switches to a higher priority context, such as SurfaceFlinger's GLES
++ * composition, inside the bins of a GMEM render pass, and the other context's
++ * values stay in these registers. RB_CLEAR_TARGET left in sysmem mode sends
++ * the GMEM clears in the rest of the pass to memory instead of the tile: the
++ * earlier bins come out black or stale. This amble runs on every switch back
++ * into a command buffer, at any point, in GMEM and sysmem rendering alike.
++ *
++ * The copies are written from the command stream instead of being read from
++ * the registers on the way out: on the Adreno 722, CP_REG_TO_MEM in the
++ * switch-away amble reads all three as 0.
++ */
++static void
++tu7_emit_rb_regs_restore(struct tu_device *dev, struct tu_cs *cs)
++{
++   /* In tu7_rb_shadow_slot order. */
++   const uint32_t regs[] = {
++      RB_CLEAR_TARGET(A7XX).reg,
++      RB_BUFFER_CNTL(A7XX).reg,
++      RB_CCU_CACHE_CNTL(A7XX).reg,
++   };
++   uint64_t va = dev->global_bo->iova + gb_offset(preempt_rb_regs);
++
++   for (uint32_t i = 0; i < ARRAY_SIZE(regs); i++) {
++      tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
++      tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(regs[i]) | CP_MEM_TO_REG_0_CNT(1));
++      tu_cs_emit_qw(cs, va + 4 * i);
++   }
++}
++
+ VkResult
+ tu_init_bin_preamble(struct tu_device *device)
+ {
+    struct tu_cs preamble_cs;
++
++   /* XDroid360 (ARMSX2 267e559): TU_DEBUG=nopreemptrestore turns off the
++    * a7xx RB register shadow and restore, for A/B on one build.
++    */
++   device->rb_regs_shadow = device->physical_device->info->chip == 7 &&
++                            !TU_DEBUG(NO_PREEMPT_RESTORE);
+    VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 256, &preamble_cs);
+    if (result != VK_SUCCESS)
+       return vk_startup_errorf(device->instance, result, "bin restore");
+@@ -2404,12 +2463,27 @@ tu_init_bin_preamble(struct tu_device *device)
+       device->switch_away_amble_entry = tu_cs_end_sub_stream(&device->sub_cs, &preamble_cs);
+    }
+ 
++   const uint32_t rb_regs_size = 32;
++   if (device->rb_regs_shadow) {
++      result = tu_cs_begin_sub_stream(&device->sub_cs, rb_regs_size, &preamble_cs);
++      if (result != VK_SUCCESS)
++         return vk_startup_errorf(device->instance, result, "switch back amble");
++
++      tu7_emit_rb_regs_restore(device, &preamble_cs);
++      device->rb_regs_restore_entry = tu_cs_end_sub_stream(&device->sub_cs, &preamble_cs);
++   }
++
+    uint32_t switch_back_size = device->autotune->get_switch_back_amble_size();
+    if (switch_back_size > 0) {
+-      result = tu_cs_begin_sub_stream(&device->sub_cs, switch_back_size, &preamble_cs);
++      result = tu_cs_begin_sub_stream(&device->sub_cs,
++                                      switch_back_size +
++                                         (device->rb_regs_shadow ? rb_regs_size : 0),
++                                      &preamble_cs);
+       if (result != VK_SUCCESS)
+          return vk_startup_errorf(device->instance, result, "switch back amble");
+ 
++      if (device->rb_regs_shadow)
++         tu7_emit_rb_regs_restore(device, &preamble_cs);
+       device->autotune->emit_switch_back_amble(&preamble_cs);
+       device->switch_back_amble_entry = tu_cs_end_sub_stream(&device->sub_cs, &preamble_cs);
+    }
+@@ -2539,10 +2613,13 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+                             (1u << TU_PREDICATE_VTX_STATS_NOT_RUNNING));
+    }
+ 
+-   if (dev->switch_back_amble_entry.size > 0 && track_preempt_latency) {
++   const struct tu_cs_entry *back =
++      dev->switch_back_amble_entry.size > 0 && track_preempt_latency ?
++      &dev->switch_back_amble_entry : &dev->rb_regs_restore_entry;
++   if (back->size > 0) {
+       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
+-      tu_cs_emit_qw(cs, dev->switch_back_amble_entry.bo->iova + dev->switch_back_amble_entry.offset);
+-      tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(dev->switch_back_amble_entry.size / sizeof(uint32_t)) |
++      tu_cs_emit_qw(cs, back->bo->iova + back->offset);
++      tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(back->size / sizeof(uint32_t)) |
+                         CP_SET_AMBLE_2_TYPE(PREAMBLE_AMBLE_TYPE));
+    } else {
+       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 17bebeb..1988020 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -964,6 +964,64 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
+ 
+ VkResult tu_init_bin_preamble(struct tu_device *device);
+ 
++/* a7xx registers that the switch-back amble restores, and their slots in
++ * tu6_global::preempt_rb_regs. See tu7_emit_rb_regs_restore().
++ */
++enum tu7_rb_shadow_slot {
++   TU7_RB_SHADOW_CLEAR_TARGET,
++   TU7_RB_SHADOW_BUFFER_CNTL,
++   TU7_RB_SHADOW_CCU_CACHE_CNTL,
++   /* Not restored: store_3d_blit keeps the RB_BUFFER_CNTL copy here. */
++   TU7_RB_SHADOW_SAVED_BUFFER_CNTL,
++};
++
++/* Record the value about to be written to a shadowed register. It goes
++ * before the register write, so that a switch between the two writes
++ * restores the new value and the register write then repeats it. BR only:
++ * BV can run ahead of BR into a later render pass.
++ */
++static inline void
++tu7_rb_shadow_write(struct tu_cs *cs, enum tu7_rb_shadow_slot slot,
++                    uint32_t value)
++{
++   if (!cs->device->rb_regs_shadow)
++      return;
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
++                          CP_COND_REG_EXEC_0_BR);
++   tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
++   tu_cs_emit_qw(cs, cs->device->global_bo->iova +
++                     gb_offset(preempt_rb_regs) + 4 * slot);
++   tu_cs_emit(cs, value);
++   tu_cond_exec_end(cs);
++}
++
++/* Write a shadowed register and its copy. */
++static inline void
++tu7_emit_shadowed_rb_reg(struct tu_cs *cs, enum tu7_rb_shadow_slot slot,
++                         struct tu_reg_value reg)
++{
++   tu7_rb_shadow_write(cs, slot, (uint32_t) reg.value);
++   tu_cs_emit_pkt4(cs, reg.reg, 1);
++   tu_cs_emit(cs, (uint32_t) reg.value);
++}
++
++/* Copy one slot to another, BR only like the writes. */
++static inline void
++tu7_rb_shadow_copy(struct tu_cs *cs, enum tu7_rb_shadow_slot dst,
++                   enum tu7_rb_shadow_slot src)
++{
++   if (!cs->device->rb_regs_shadow)
++      return;
++   uint64_t va = cs->device->global_bo->iova + gb_offset(preempt_rb_regs);
++   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
++                          CP_COND_REG_EXEC_0_BR);
++   tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
++   tu_cs_emit(cs, CP_MEM_TO_MEM_0_WAIT_FOR_MEM_WRITES);
++   tu_cs_emit_qw(cs, va + 4 * dst);
++   tu_cs_emit_qw(cs, va + 4 * src);
++   tu_cond_exec_end(cs);
++}
++
+ template <chip CHIP>
+ void tu_init_hw_rp(struct tu_cs *cs);
+ 
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index d32a7d8..f250dba 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -280,6 +280,12 @@ struct tu6_global
+    uint64_t preemption_latency_cmp_scratch;
+    uint64_t zero_64b;
+ 
++   /* a7xx: the last values this device wrote to RB_CLEAR_TARGET,
++    * RB_BUFFER_CNTL and RB_CCU_CACHE_CNTL, which the switch-back amble writes
++    * back (see tu7_emit_rb_regs_restore()). Indexed by tu7_rb_shadow_slot.
++    */
++   uint32_t preempt_rb_regs[4];
++
+    struct bcolor_entry bcolor_builtin[TU_BORDER_COLOR_BUILTIN];
+    struct bcolor_entry bcolor[];
+ };
+@@ -434,6 +440,14 @@ struct tu_device
+    struct tu_cs_entry bin_preamble_entry, bin_preamble_bv_entry;
+ 
+    struct tu_cs_entry switch_away_amble_entry, switch_back_amble_entry;
++   /* a7xx: tu7_emit_rb_regs_restore() alone, the switch-back amble of
++    * command buffers that do not track preemption latency.
++    */
++   struct tu_cs_entry rb_regs_restore_entry;
++   /* XDroid360: a7xx RB register shadow and restore on; false with
++    * TU_DEBUG=nopreemptrestore. Set once, at device creation.
++    */
++   bool rb_regs_shadow;
+ 
+    struct tu_bo *vis_stream_bo;
+    mtx_t vis_stream_mtx;
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 6107564..3c2a883 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -58,6 +58,7 @@ static const struct debug_control tu_debug_options[] = {
+    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
+    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
+    { "oldbindlessinv", TU_DEBUG_OLD_BINDLESS_INVALIDATE },
++   { "nopreemptrestore", TU_DEBUG_NO_PREEMPT_RESTORE },
+    { NULL, 0 }
+ };
+ 
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index 9dbfc1a..ea2750e 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -76,6 +76,7 @@ enum tu_debug_flags : uint64_t
+    TU_DEBUG_FORCE_CONCURRENT_BINNING = BITFIELD64_BIT(36),
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
+    TU_DEBUG_OLD_BINDLESS_INVALIDATE  = BITFIELD64_BIT(38),
++   TU_DEBUG_NO_PREEMPT_RESTORE       = BITFIELD64_BIT(39),
+ };
+ 
+ struct tu_env {

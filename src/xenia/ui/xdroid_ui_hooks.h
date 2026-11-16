@@ -10,6 +10,10 @@ namespace ui {
 // vkQueuePresentKHR. Set once by xdroid-core.
 extern std::atomic<void (*)()> g_xdroid_on_present;
 
+// XDroid360 MIRROR-1: while set, the paint skips the guest output and the
+// screen stays black under the UI. Presents and guest output captures go on.
+extern std::atomic<bool> g_xdroid_blank_local;
+
 }  // namespace ui
 }  // namespace xe
 

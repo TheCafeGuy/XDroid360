@@ -90,7 +90,19 @@ DECLARE_bool(spirv_disable_rounding_mode_rte);
 DECLARE_bool(precise_interpolation);
 
 DECLARE_bool(xdroid_shader_sign_spec);
+DEFINE_string(xdroid_shader_ir_dump, "",
+              "SHD-2: pixel shader hashes (16 hex digits, any separator) whose "
+              "pipelines log the driver's internal representations (NIR, "
+              "ir3 disassembly) as XDROID-IR lines.",
+              "GPU");
+DECLARE_bool(xdroid_shader_exp_spec);
+DECLARE_bool(xdroid_shader_iscale_spec);
 DECLARE_bool(xdroid_shader_vfetch_spec);
+DEFINE_bool(xdroid_flat_ps, false,
+            "SHD-2 bound: every guest pixel shader is replaced by a flat grey "
+            "one, so a bench shows what pixel shading costs in total. Breaks "
+            "the image. Diagnostics only; set before the title starts.",
+            "GPU");
 DEFINE_bool(xdroid_shader_stats, false,
             "SHD-1: capture driver statistics (instructions, registers, waves) "
             "for every real pipeline and log XDROID-SHSTAT lines. Changes the "
@@ -102,6 +114,9 @@ namespace gpu {
 namespace vulkan {
 
 namespace {
+// XDroid360: set on the thread that records draws (ConfigurePipeline), which
+// must never write the VkPipelineCache itself.
+thread_local bool t_is_draw_thread = false;
 // SHD-1: one XDROID-SHSTAT line per pipeline stage with every driver
 // statistic, keyed by the guest shader hashes for joining with draw counts.
 void LogPipelineStatistics(const ui::vulkan::VulkanDevice* vulkan_device,
@@ -167,6 +182,73 @@ void LogPipelineStatistics(const ui::vulkan::VulkanDevice* vulkan_device,
     }
     XELOGI("XDROID-SHSTAT VS {:016X} PS {:016X} stage={}{}", vs_hash, ps_hash,
            executables[i].name, line);
+  }
+}
+
+// SHD-2 P0: the driver's internal representations (NIR, ir3 disassembly) of
+// one pipeline, as XDROID-IR lines, for the pixel shaders listed in
+// xdroid_shader_ir_dump.
+void LogPipelineInternalRepresentations(
+    const ui::vulkan::VulkanDevice* vulkan_device, VkPipeline pipeline,
+    uint64_t vs_hash, uint64_t ps_hash) {
+  auto get_properties = vulkan_device->get_pipeline_executable_properties_khr();
+  auto get_representations =
+      vulkan_device->get_pipeline_executable_internal_representations_khr();
+  if (!get_properties || !get_representations) {
+    return;
+  }
+  VkDevice device = vulkan_device->device();
+  VkPipelineInfoKHR pipeline_info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+  pipeline_info.pipeline = pipeline;
+  uint32_t executable_count = 0;
+  if (get_properties(device, &pipeline_info, &executable_count, nullptr) !=
+      VK_SUCCESS) {
+    return;
+  }
+  std::vector<VkPipelineExecutablePropertiesKHR> executables(
+      executable_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
+  get_properties(device, &pipeline_info, &executable_count, executables.data());
+  for (uint32_t i = 0; i < executable_count; ++i) {
+    VkPipelineExecutableInfoKHR executable_info = {
+        VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+    executable_info.pipeline = pipeline;
+    executable_info.executableIndex = i;
+    uint32_t count = 0;
+    if (get_representations(device, &executable_info, &count, nullptr) !=
+            VK_SUCCESS ||
+        !count) {
+      continue;
+    }
+    std::vector<VkPipelineExecutableInternalRepresentationKHR> reps(
+        count,
+        {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
+    if (get_representations(device, &executable_info, &count, reps.data()) !=
+        VK_SUCCESS) {
+      continue;
+    }
+    std::vector<std::vector<char>> texts(count);
+    for (uint32_t j = 0; j < count; ++j) {
+      texts[j].resize(reps[j].dataSize + 1, 0);
+      reps[j].pData = texts[j].data();
+    }
+    get_representations(device, &executable_info, &count, reps.data());
+    for (uint32_t j = 0; j < count; ++j) {
+      if (!reps[j].isText) {
+        continue;
+      }
+      const char* text = texts[j].data();
+      size_t line_start = 0, length = std::strlen(text);
+      while (line_start < length) {
+        size_t line_end = line_start;
+        while (line_end < length && text[line_end] != '\n') {
+          ++line_end;
+        }
+        XELOGI("XDROID-IR {:016X}/{:016X} {} {}: {}", vs_hash, ps_hash,
+               executables[i].name, reps[j].name,
+               std::string_view(text + line_start, line_end - line_start));
+        line_start = line_end + 1;
+      }
+    }
   }
 }
 }  // namespace
@@ -712,6 +794,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  t_is_draw_thread = true;
+
   PipelineDescription description;
   if (!GetCurrentStateDescription(
           vertex_shader, pixel_shader, primitive_processing_result,
@@ -945,7 +1029,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   return true;
 }
 
-void VulkanPipelineCache::EndSubmission() {
+void VulkanPipelineCache::RequestStorageFlush() {
   if (shader_storage_file_flush_needed_ ||
       pipeline_storage_file_flush_needed_) {
     storage_writer_.RequestFlush(shader_storage_file_flush_needed_,
@@ -953,6 +1037,10 @@ void VulkanPipelineCache::EndSubmission() {
     shader_storage_file_flush_needed_ = false;
     pipeline_storage_file_flush_needed_ = false;
   }
+}
+
+void VulkanPipelineCache::EndSubmission() {
+  RequestStorageFlush();
 
   if (creation_queue_.has_threads()) {
     if (startup_loading_) {
@@ -1389,6 +1477,17 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           uint32_t(TextureCache::SwizzledSignsFromFetchConstant(
               regs.GetTextureFetch(fetch_constant)))
           << (8 * (fetch_constant & 3));
+      if (cvars::xdroid_shader_iscale_spec &&
+          TextureCache::IntegerScaleUsedByFetchConstant(
+              regs.GetTextureFetch(fetch_constant))) {
+        description_out.ps_texture_integer_scale_used |= uint32_t(1)
+                                                         << fetch_constant;
+      }
+      if (cvars::xdroid_shader_exp_spec &&
+          regs.GetTextureFetch(fetch_constant).exp_adjust) {
+        description_out.ps_texture_exp_adjust_nonzero |= uint32_t(1)
+                                                         << fetch_constant;
+      }
     }
   }
 
@@ -1989,8 +2088,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   }
   // SHD-1c: texture sign words as fragment specialization constants (SpecId
   // = word index); entries the shader does not declare are ignored.
-  std::array<VkSpecializationMapEntry, 8> sign_specialization_entries;
-  for (uint32_t i = 0; i < 8; ++i) {
+  // Entry 8: the nonzero exponent adjustment mask, the next word.
+  static_assert(offsetof(PipelineDescription, ps_texture_exp_adjust_nonzero) ==
+                offsetof(PipelineDescription, ps_texture_swizzled_signs) +
+                    sizeof(uint32_t) * 8);
+  static_assert(offsetof(PipelineDescription, ps_texture_integer_scale_used) ==
+                offsetof(PipelineDescription, ps_texture_swizzled_signs) +
+                    sizeof(uint32_t) * 9);
+  std::array<VkSpecializationMapEntry, 10> sign_specialization_entries;
+  for (uint32_t i = 0; i < 10; ++i) {
     sign_specialization_entries[i].constantID = i;
     sign_specialization_entries[i].offset = uint32_t(sizeof(uint32_t) * i);
     sign_specialization_entries[i].size = sizeof(uint32_t);
@@ -1999,7 +2105,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   sign_specialization_info.mapEntryCount =
       uint32_t(sign_specialization_entries.size());
   sign_specialization_info.pMapEntries = sign_specialization_entries.data();
-  sign_specialization_info.dataSize = sizeof(uint32_t) * 8;
+  sign_specialization_info.dataSize = sizeof(uint32_t) * 10;
   sign_specialization_info.pData =
       creation_arguments.pipeline->first.ps_texture_swizzled_signs;
   // Fragment shader.
@@ -2021,11 +2127,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
     if (!creation_arguments.pixel_shader->is_valid()) {
       return false;
     }
-    if (cvars::xdroid_shader_sign_spec) {
-      shader_stage_fragment.pSpecializationInfo = &sign_specialization_info;
+    if (cvars::xdroid_flat_ps &&
+        placeholder_color_pixel_shader_ != VK_NULL_HANDLE) {
+      shader_stage_fragment.module = placeholder_color_pixel_shader_;
+    } else {
+      if (cvars::xdroid_shader_sign_spec) {
+        shader_stage_fragment.pSpecializationInfo = &sign_specialization_info;
+      }
+      shader_stage_fragment.module =
+          creation_arguments.pixel_shader->GetOrCreateShaderModule();
     }
-    shader_stage_fragment.module =
-        creation_arguments.pixel_shader->GetOrCreateShaderModule();
     if (shader_stage_fragment.module == VK_NULL_HANDLE) {
       return false;
     }
@@ -2441,8 +2552,20 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
   const bool capture_stats =
       cvars::xdroid_shader_stats && !creating_placeholder &&
       vulkan_device->extensions().ext_KHR_pipeline_executable_properties;
+  bool capture_ir = false;
+  if (!creating_placeholder && creation_arguments.pixel_shader &&
+      !cvars::xdroid_shader_ir_dump.empty() &&
+      vulkan_device->extensions().ext_KHR_pipeline_executable_properties) {
+    capture_ir =
+        cvars::xdroid_shader_ir_dump.find(fmt::format(
+            "{:016X}",
+            creation_arguments.pixel_shader->shader().ucode_data_hash())) !=
+        std::string::npos;
+  }
   pipeline_create_info.flags =
-      capture_stats ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
+      (capture_stats ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) |
+      (capture_ir ? VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR
+                  : 0);
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();
   pipeline_create_info.pVertexInputState = &vertex_input_state;
@@ -2488,6 +2611,12 @@ bool VulkanPipelineCache::EnsurePipelineCreated(
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - pso_create_start)
             .count());
+  }
+  if (result == VK_SUCCESS && capture_ir) {
+    LogPipelineInternalRepresentations(
+        vulkan_device, pipeline,
+        creation_arguments.vertex_shader->shader().ucode_data_hash(),
+        creation_arguments.pixel_shader->shader().ucode_data_hash());
   }
   if (result == VK_SUCCESS && capture_stats) {
     LogPipelineStatistics(
@@ -3014,9 +3143,13 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache(bool may_write) {
   // at most every 30 seconds.
   constexpr uint32_t kMinNewPipelines = 32;
   constexpr auto kMinInterval = std::chrono::seconds(30);
+  // A pipeline created synchronously on the draw thread counts, but the save
+  // waits for a creation thread: vkGetPipelineCacheData copies ~20 MB under
+  // the driver's cache lock (the maintainer's mission 2026-10-19: a 200 ms frame when
+  // the draw thread saved).
   if (vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed) + 1 <
           kMinNewPipelines ||
-      !may_write) {
+      !may_write || t_is_draw_thread) {
     return;
   }
   // Never make a creation thread wait for another one's save.

@@ -87,25 +87,15 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
   if (count != 0) {
     RingBuffer old_reader = reader_;
 
-    // XDroid360 HUD-1 F1 (temp): execute the copy taken at kick if any.
-    uint32_t xdroid_flags = 0;
-    const void* xdroid_source = nullptr;
-    auto xdroid_ib_source =
-        GetXdroidGpuHooks().ib_source.load(std::memory_order_acquire);
-    if (xdroid_ib_source) {
-      xdroid_source = xdroid_ib_source(ptr, count, &xdroid_flags);
-    }
+    // XDroid360 draw black box: the indirect buffers being executed.
     if (xdroid_ib_depth_ < xdroid_ib_stack_.size()) {
-      xdroid_ib_stack_[xdroid_ib_depth_] = {ptr, count, xdroid_flags};
+      xdroid_ib_stack_[xdroid_ib_depth_] = {ptr, count};
     }
     ++xdroid_ib_depth_;
 
     // Execute commands!
-    new (&reader_) RingBuffer(
-        xdroid_source
-            ? const_cast<uint8_t*>(static_cast<const uint8_t*>(xdroid_source))
-            : memory_->TranslatePhysical(ptr),
-        count * sizeof(uint32_t));
+    new (&reader_) RingBuffer(memory_->TranslatePhysical(ptr),
+                              count * sizeof(uint32_t));
     reader_.set_write_offset(count * sizeof(uint32_t));
     // prefetch the wraparound range
     // it likely is already in L3 cache, but in a zen system it may be another
@@ -124,12 +114,6 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
     } while (reader_.read_count());
 
     --xdroid_ib_depth_;
-    if (xdroid_ib_source) {
-      if (auto xdroid_ib_end =
-              GetXdroidGpuHooks().ib_end.load(std::memory_order_acquire)) {
-        xdroid_ib_end();
-      }
-    }
 
     trace_writer_.WriteIndirectBufferEnd();
     reader_ = old_reader;
@@ -995,6 +979,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
         xdroid_wait_begin_ns;
     XdroidGpuHooks& hooks = GetXdroidGpuHooks();
     hooks.cp_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+    XdroidLazyNote(XdroidLazyKind::kWait, waited);
     if (waited > hooks.cp_wait_longest_ns.load(std::memory_order_relaxed)) {
       hooks.cp_wait_longest_ns.store(waited, std::memory_order_relaxed);
       hooks.cp_wait_longest_addr.store(

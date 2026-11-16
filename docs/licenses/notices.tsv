@@ -45,3 +45,4 @@ microprofile	Profiler hooks	Public domain (Unlicense)	docs/licenses/microprofile
 miniaudio	Audio helpers	Public domain (Unlicense) or MIT-0	third_party/miniaudio/LICENSE
 Android Jetpack (AndroidX, Compose), Kotlin standard library, kotlinx.coroutines	App user interface	Apache-2.0	third_party/Vulkan-Headers/LICENSES/Apache-2.0.txt
 Snapdragon Game Super Resolution 1	Optional upscaling shader for the final image (present_snapdragon_gsr)	BSD-3-Clause	docs/licenses/snapdragon-gsr-LICENSE.txt
+Snapdragon Game Super Resolution 2	Temporal upscaler for the final image (gsr2), ported from sgsr/v2 2-pass compute	BSD-3-Clause	docs/licenses/snapdragon-gsr-LICENSE.txt

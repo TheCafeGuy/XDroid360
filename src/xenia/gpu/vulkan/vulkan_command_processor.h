@@ -41,6 +41,7 @@
 #include "xenia/gpu/vulkan/deferred_command_buffer.h"
 #include "xenia/gpu/vulkan/vulkan_draw_blackbox.h"
 #include "xenia/gpu/vulkan/vulkan_glitch_recorder.h"
+#include "xenia/gpu/vulkan/vulkan_gsr2.h"
 #include "xenia/gpu/vulkan/vulkan_gpu_breadcrumbs.h"
 #include "xenia/gpu/vulkan/vulkan_gpu_sanity.h"
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
@@ -284,6 +285,10 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // An image written by spliced work, so its later barriers may join the
   // segment too.
   void NoteSplicedImage(VkImage image);
+  // An upload that must not run before the pass: an earlier draw of the pass
+  // read one of its pages. Counted for the frame stats; true only under the
+  // A/B bit that keeps the old (wrong) splice.
+  bool NoteSpliceConflict();
 
   // STAB-S1: every GPU hang of 2026-10-11 stopped between render passes with
   // the shader processor busy, so compute dispatches get breadcrumbs too.
@@ -718,6 +723,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // Per-draw GPU markers locating a GPU hang (vulkan_gpu_breadcrumbs).
   VulkanGpuBreadcrumbs gpu_breadcrumbs_;
   VulkanGlitchRecorder glitch_recorder_;
+  VulkanGsr2 gsr2_;
+  bool gsr2_on_ = false;
   // HUD-1 per-draw state ring (xdroid_draw_blackbox, temp).
   VulkanDrawBlackbox draw_blackbox_;
   // GPU-SAN (xdroid_gpu_sanity): the draw about to be recorded, and a drop of
@@ -844,6 +851,30 @@ class VulkanCommandProcessor final : public CommandProcessor {
   // MSAA-1X: draws per guest sample count (index = xenos::MsaaSamples) and
   // draws/resolves turned into 1x by gpu_force_msaa_1x.
   std::array<uint64_t, 4> msaa_draws_total_ = {};
+  // A9 samples-as-pixels draws, and the guard rewriting the registers of one
+  // draw.
+  uint64_t samples_as_pixels_total_ = 0;
+  uint64_t samples_as_pixels_window_start_ = 0;
+  class XdroidSamplesAsPixels {
+   public:
+    explicit XdroidSamplesAsPixels(VulkanCommandProcessor& processor)
+        : processor_(processor) {}
+    ~XdroidSamplesAsPixels();
+    void Begin(xenos::PrimitiveType prim_type, const Shader* pixel_shader);
+
+   private:
+    VulkanCommandProcessor& processor_;
+    std::pair<uint32_t, uint32_t> saved_[11];
+    uint32_t saved_count_ = 0;
+  };
+  friend class XdroidSamplesAsPixels;
+  // A3 census (xdroid_xfer_census), per stats window.
+  uint64_t census_draws_ = 0;
+  uint64_t census_a2c_draws_ = 0;
+  uint64_t census_point_draws_ = 0;
+  uint64_t census_rect_draws_ = 0;
+  uint64_t census_quad_draws_ = 0;
+  std::unordered_map<uint64_t, uint64_t> census_resolves_;
   // TILE-1 bound: predicated tile index of the current draw (-1 = untiled).
   uint64_t xdroid_tile_last_select_ = ~uint64_t(0);
   int32_t xdroid_tile_index_ = -1;
@@ -946,8 +977,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
   std::vector<VkImage> splice_images_;
   // Spliced operations (texture loads, uploads, resolves, Enter-time barrier
   // batches), for the frame stats line.
-  std::array<uint64_t, 4> splice_ops_total_ = {};
-  std::array<uint64_t, 4> splice_ops_window_start_ = {};
+  std::array<uint64_t, 5> splice_ops_total_ = {};
+  std::array<uint64_t, 5> splice_ops_window_start_ = {};
   void OpenSpliceSegment(
       const VulkanRenderTargetCache::Framebuffer* framebuffer);
   void CloseSpliceSegment();

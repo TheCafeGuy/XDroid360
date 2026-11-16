@@ -72,16 +72,18 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <memory>
 #include <thread>
 #include <vector>
 
-#include "xdroid_ib_snapshot.h"
+#include "xdroid_ac6_fixes.h"
 #include "xdroid_latency.h"
 #include "xdroid_time_coupling.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
+#include "xenia/base/mutex.h"
 #include "xenia/cpu/ppc/ppc_context.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
@@ -90,6 +92,7 @@
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
+#include "xenia/kernel/xthread.h"
 #include "xenia/memory.h"
 
 DEFINE_bool(ac6_storage_submit_order_fix, true,
@@ -105,6 +108,16 @@ DEFINE_bool(ac6_job_start_order, false,
 DEFINE_int32(ac6_job_start_wait_us, 2000,
              "Ace Combat 6: longest wait of ac6_job_start_order per Submit.",
              "XDroid360");
+DEFINE_uint32(xdroid_write_probe_first, 0,
+              "Forensic (XDROID-WRITER): with xdroid_write_probe_last, a guest "
+              "physical address range. Every 600 swaps the AC6 job hooks "
+              "report who made the first write to its pages after each "
+              "upload: thread, pool job function, return address, and the "
+              "time since the last swap. 0 = off. Live.",
+              "XDroid360");
+DEFINE_uint32(xdroid_write_probe_last, 0,
+              "Last address of the xdroid_write_probe_first range. Live.",
+              "XDroid360");
 DEFINE_bool(xdroid_cp_wait_jobs, false,
             "Ace Combat 6 (HUD-1 arm C+): the command processor waits for the "
             "pool jobs submitted before each kick to end before executing it "
@@ -135,11 +148,17 @@ DEFINE_bool(xdroid_cp_defer_to_swap, true,
 DEFINE_int32(xdroid_cp_defer_to_swap_us, 20000,
              "Longest wait of xdroid_cp_defer_to_swap per frame. Live.",
              "XDroid360");
+DEFINE_bool(xdroid_cp_defer_yield_hud, false,
+            "xdroid_cp_defer_to_swap (H1) releases its hold while the AC6 HUD "
+            "pick waits for the main loop (HUD-H3 cycle: render waits on "
+            "main, main on the CP, CP on render's VdSwap). Live.",
+            "XDroid360");
 
 namespace xdroid {
 namespace {
 
 constexpr uint32_t kPoolSubmit = 0x821D4A78;
+constexpr uint32_t kEffectDispatcher = 0x822B3248;  // effect manager vtbl[1]
 constexpr uint32_t kWorkerCall = 0x821D4F7C;    // bctrl job->vtbl[1]
 constexpr uint32_t kWorkerReturn = 0x821D4F80;
 constexpr uint32_t kBctrl = 0x4E800421;
@@ -182,6 +201,12 @@ Ac6JobClass g_classes[kAc6MaxClasses];
 constexpr uint32_t kThreadSlots = 1024;
 std::atomic<uint32_t> g_thread_submit[kThreadSlots];
 std::atomic<uint32_t> g_thread_running[kThreadSlots];
+// Forensics: the jobs that write effect vertex data (effect manager update and
+// draw, and the cloud job the draw starts) running right now, by thread slot
+// and in total.
+constexpr uint32_t kCloudJob = 0x822AF840;
+std::atomic<uint8_t> g_thread_writer[kThreadSlots];
+std::atomic<int32_t> g_effect_writers{0};
 
 std::atomic<bool> g_storage_logged[kStorageSiteCount];
 std::atomic<uint64_t> g_storage_engaged{0};
@@ -216,6 +241,8 @@ std::atomic<uint64_t> g_swap_wait[3];
 std::atomic<uint64_t> g_defer_wait[3];
 uint32_t g_defer_frame = UINT32_MAX;
 bool g_defer_gave_up = false;
+// True while the H1 hold waits (read by the HUD join's timeout log).
+std::atomic<bool> g_defer_holding{false};
 
 std::atomic<void (*)(const Ac6JobRecord&, uint64_t)> g_on_start{nullptr};
 std::atomic<void (*)(uint32_t)> g_on_glitch{nullptr};
@@ -324,10 +351,10 @@ void AfterSubmit(const Site& site, xe::cpu::ppc::PPCContext* ctx) {
     record->snap_state.compare_exchange_strong(state, 2,
                                                std::memory_order_acq_rel);
   }
+  Ac6JobClass& job_class = g_classes[record->cls];
   if (!cvars::ac6_job_start_order || site.after_storage) {
     return;
   }
-  Ac6JobClass& job_class = g_classes[record->cls];
   if (job_class.storage.load(std::memory_order_relaxed) ||
       job_class.no_start_wait.load(std::memory_order_relaxed)) {
     return;
@@ -426,6 +453,10 @@ void WorkerStartHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
   const uint64_t now = Ac6NowUs();
   record->start_us.store(now, std::memory_order_release);
   g_thread_running[ThreadSlot(ctx)].store(seq, std::memory_order_relaxed);
+  if (record->fn == kEffectDispatcher || record->fn == kCloudJob) {
+    g_thread_writer[ThreadSlot(ctx)].store(1, std::memory_order_relaxed);
+    g_effect_writers.fetch_add(1, std::memory_order_release);
+  }
   if (record->snap_state.exchange(3, std::memory_order_acq_rel) == 2) {
     uint64_t mask = 0;
     const uint8_t* current = g_membase + job;
@@ -453,6 +484,9 @@ void WorkerStartHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
 
 // Worker, right after the job returned.
 void WorkerEndHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
+  if (g_thread_writer[ThreadSlot(ctx)].exchange(0, std::memory_order_relaxed)) {
+    g_effect_writers.fetch_sub(1, std::memory_order_release);
+  }
   const uint32_t seq = g_thread_running[ThreadSlot(ctx)].exchange(
       0, std::memory_order_relaxed);
   Ac6JobRecord* record = seq ? RecordFor(seq) : nullptr;
@@ -471,6 +505,68 @@ void WorkerEndHook(xe::cpu::ppc::PPCContext* ctx, void*, void*) {
       ewma ? uint32_t(int64_t(ewma) + (int64_t(duration) - ewma) / 8)
            : duration,
       std::memory_order_relaxed);
+}
+
+// XDROID-WRITER: who first writes the probed range after each upload. Filled
+// on the writing guest thread under the global lock (the write watch holds
+// it), reported and cleared at the swap under the same lock.
+struct WriterEntry {
+  uint32_t thread_id, fn, lr, count, min_us, max_us;
+  uint64_t sum_us;
+};
+WriterEntry g_writers[12];
+std::atomic<uint64_t> g_last_swap_us{0};
+
+void OnGuestWrite(uint32_t address) {
+  if (address < cvars::xdroid_write_probe_first ||
+      address > cvars::xdroid_write_probe_last) {
+    return;
+  }
+  uint32_t thread_id = 0, fn = 0, lr = 0;
+  if (xe::kernel::XThread* thread = xe::kernel::XThread::GetCurrentThread()) {
+    const xe::cpu::ppc::PPCContext* ctx = thread->thread_state()->context();
+    thread_id = thread->thread_id();
+    lr = uint32_t(ctx->lr);
+    const uint32_t seq =
+        g_thread_running[ThreadSlot(ctx)].load(std::memory_order_relaxed);
+    if (const Ac6JobRecord* record = seq ? RecordFor(seq) : nullptr) {
+      fn = record->fn;
+    }
+  }
+  const uint32_t since = uint32_t(std::min<uint64_t>(
+      Ac6NowUs() - g_last_swap_us.load(std::memory_order_relaxed), 1000000));
+  WriterEntry* entry = nullptr;
+  for (WriterEntry& candidate : g_writers) {
+    if (!candidate.count || (candidate.thread_id == thread_id &&
+                             candidate.fn == fn && candidate.lr == lr)) {
+      entry = &candidate;
+      break;
+    }
+  }
+  if (!entry) {
+    entry = &g_writers[std::size(g_writers) - 1];  // Overflow: shared.
+    entry->thread_id = entry->fn = entry->lr = UINT32_MAX;
+  } else if (!entry->count) {
+    *entry = {thread_id, fn, lr, 0, UINT32_MAX, 0, 0};
+  }
+  ++entry->count;
+  entry->min_us = std::min(entry->min_us, since);
+  entry->max_us = std::max(entry->max_us, since);
+  entry->sum_us += since;
+}
+
+void ReportWriters() {
+  auto global_lock = xe::global_critical_region::Acquire();
+  for (WriterEntry& entry : g_writers) {
+    if (entry.count) {
+      XELOGI(
+          "XDROID-WRITER thread {:X} job fn {:08X} lr {:08X}: {} first writes "
+          "in 600 swaps, {}..{} us after the swap (mean {})",
+          entry.thread_id, entry.fn, entry.lr, entry.count, entry.min_us,
+          entry.max_us, entry.sum_us / entry.count);
+    }
+    entry = {};
+  }
 }
 
 void OnKick(uint32_t write_ptr) {
@@ -498,12 +594,22 @@ void BeforeExecute(uint32_t write_ptr) {
       const uint64_t begin = Ac6NowUs();
       const uint64_t deadline =
           begin + uint64_t(std::max(cvars::xdroid_cp_defer_to_swap_us, 0));
+      // HUD-H3 cycle breaker: the render thread's HUD pick waits on main,
+      // main may wait on this CP, and this hold waits on render's VdSwap.
+      // Checked only in the loop, so a yield takes the timeout path: it
+      // latches g_defer_gave_up for the frame (the hold cannot re-form) and
+      // counts in the H1 timeout bucket g_defer_wait[1].
+      const auto yield_hud = [] {
+        return cvars::xdroid_cp_defer_yield_hud && Ac6HudJoinWaiting();
+      };
       bool seen;
-      while (!(seen = g_guest_swaps.load(std::memory_order_acquire) >
-                      processed) &&
-             Ac6NowUs() < deadline) {
+      g_defer_holding.store(true, std::memory_order_relaxed);
+      while (
+          !(seen = g_guest_swaps.load(std::memory_order_acquire) > processed) &&
+          Ac6NowUs() < deadline && !yield_hud()) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
       }
+      g_defer_holding.store(false, std::memory_order_relaxed);
       g_defer_gave_up = !seen;
       g_defer_wait[seen ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
       g_defer_wait[2].fetch_add(Ac6NowUs() - begin, std::memory_order_relaxed);
@@ -587,6 +693,22 @@ void OnGuestSwap() {
   TimeCouplingOnGuestSwap();
   LatNoteGuestSwap();
   const uint64_t swaps = g_guest_swaps.fetch_add(1, std::memory_order_relaxed);
+  // Forensics: was an effect writer job inside its data when the frame was
+  // handed over, and who writes the probed range.
+  static std::atomic<uint32_t> swaps_with_writers{0};
+  if (g_effect_writers.load(std::memory_order_acquire) > 0) {
+    swaps_with_writers.fetch_add(1, std::memory_order_relaxed);
+  }
+  g_last_swap_us.store(Ac6NowUs(), std::memory_order_relaxed);
+  if (swaps && !(swaps % 600)) {
+    XELOGI(
+        "XDROID-JOBS: an effect writer job was running at the swap in {} of "
+        "the last 600 swaps",
+        swaps_with_writers.exchange(0, std::memory_order_relaxed));
+    if (cvars::xdroid_write_probe_first) {
+      ReportWriters();
+    }
+  }
   uint64_t processed = xe::logging::GetFrameNumber();
   uint64_t lag = swaps > processed ? swaps - processed : 0;
   g_swap_lag[std::min<uint64_t>(lag, 3)].fetch_add(1,
@@ -653,6 +775,14 @@ void Ac6CpDeferStats(uint64_t out[3]) {
   for (int i = 0; i < 3; ++i) {
     out[i] = g_defer_wait[i].load(std::memory_order_relaxed);
   }
+}
+
+uint64_t Ac6GuestSwaps() {
+  return g_guest_swaps.load(std::memory_order_relaxed);
+}
+
+bool Ac6CpDeferHolding() {
+  return g_defer_holding.load(std::memory_order_relaxed);
 }
 
 void Ac6SwapWaitStats(uint64_t out[3]) {
@@ -787,9 +917,9 @@ bool InstallAc6Jobs(xe::Emulator* emulator) {
   xe::gpu::XdroidGpuHooks& gpu_hooks = xe::gpu::GetXdroidGpuHooks();
   gpu_hooks.on_kick.store(OnKick, std::memory_order_release);
   gpu_hooks.before_execute.store(BeforeExecute, std::memory_order_release);
+  gpu_hooks.on_guest_write.store(OnGuestWrite, std::memory_order_release);
   gpu_hooks.on_guest_swap.store(OnGuestSwap, std::memory_order_release);
   gpu_hooks.on_glitch.store(OnGlitch, std::memory_order_release);
-  InstallIbSnapshotHooks();
   XELOGI(
       "XDroid360: AC6 job hooks installed ({} Submit call sites, {} hooked "
       "addresses, code {:08X}-{:08X})",

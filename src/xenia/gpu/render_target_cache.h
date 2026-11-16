@@ -745,6 +745,10 @@ class RenderTargetCache {
                     const std::vector<Transfer>* render_target_transfers,
                     const Transfer::Rectangle* resolve_clear_rectangle) const;
 
+  DrawExtentEstimator& draw_extent_estimator() {
+    return draw_extent_estimator_;
+  }
+
  private:
   const RegisterFile& register_file_;
   TraceWriter* trace_writer_;

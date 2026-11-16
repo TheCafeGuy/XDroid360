@@ -197,12 +197,14 @@ VkPipeline CreateComputePipeline(
     const VulkanDevice* vulkan_device, VkPipelineLayout layout,
     VkShaderModule shader,
     const VkSpecializationInfo* specialization_info = nullptr,
-    const char* entry_point = "main", uint32_t required_subgroup_size = 0);
+    const char* entry_point = "main", uint32_t required_subgroup_size = 0,
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE);
 VkPipeline CreateComputePipeline(
     const VulkanDevice* vulkan_device, VkPipelineLayout layout,
     const uint32_t* shader_code, size_t shader_code_size_bytes,
     const VkSpecializationInfo* specialization_info = nullptr,
-    const char* entry_point = "main", uint32_t required_subgroup_size = 0);
+    const char* entry_point = "main", uint32_t required_subgroup_size = 0,
+    VkPipelineCache pipeline_cache = VK_NULL_HANDLE);
 
 }  // namespace util
 }  // namespace vulkan

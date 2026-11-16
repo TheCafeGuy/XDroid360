@@ -231,7 +231,8 @@ VkPipeline CreateComputePipeline(
     const VulkanDevice* const vulkan_device, const VkPipelineLayout layout,
     const VkShaderModule shader,
     const VkSpecializationInfo* const specialization_info,
-    const char* const entry_point, const uint32_t required_subgroup_size) {
+    const char* const entry_point, const uint32_t required_subgroup_size,
+    const VkPipelineCache pipeline_cache) {
   VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_info = {};
   subgroup_size_info.sType =
       VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
@@ -263,7 +264,7 @@ VkPipeline CreateComputePipeline(
 
   VkPipeline pipeline;
   if (vulkan_device->functions().vkCreateComputePipelines(
-          vulkan_device->device(), VK_NULL_HANDLE, 1, &pipeline_create_info,
+          vulkan_device->device(), pipeline_cache, 1, &pipeline_create_info,
           nullptr, &pipeline) != VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
@@ -274,15 +275,16 @@ VkPipeline CreateComputePipeline(
     const VulkanDevice* const vulkan_device, VkPipelineLayout layout,
     const uint32_t* shader_code, size_t shader_code_size_bytes,
     const VkSpecializationInfo* specialization_info, const char* entry_point,
-    const uint32_t required_subgroup_size) {
+    const uint32_t required_subgroup_size,
+    const VkPipelineCache pipeline_cache) {
   const VkShaderModule shader =
       CreateShaderModule(vulkan_device, shader_code, shader_code_size_bytes);
   if (shader == VK_NULL_HANDLE) {
     return VK_NULL_HANDLE;
   }
-  const VkPipeline pipeline =
-      CreateComputePipeline(vulkan_device, layout, shader, specialization_info,
-                            entry_point, required_subgroup_size);
+  const VkPipeline pipeline = CreateComputePipeline(
+      vulkan_device, layout, shader, specialization_info, entry_point,
+      required_subgroup_size, pipeline_cache);
   vulkan_device->functions().vkDestroyShaderModule(vulkan_device->device(),
                                                    shader, nullptr);
   return pipeline;

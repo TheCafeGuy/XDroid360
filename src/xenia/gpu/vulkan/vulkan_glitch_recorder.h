@@ -5,9 +5,10 @@
  * Every swap the final guest output (after the gamma ramp) is blitted into a
  * ring of small frames on the GPU and into a 64x36 thumbnail that is read back.
  * A frame whose thumbnail differs from both neighbours while the neighbours
- * agree with each other is a one-frame glitch candidate; the three frames
- * around it are copied out of the ring and written as PPM files to
- * <storage>/glitch/, with an XDROID-GLITCH log line carrying the frame number.
+ * agree with each other is a one-frame glitch candidate, logged as an
+ * XDROID-GLITCH line with class=BLACK|HUD1|POP. For BLACK, HUD1 and
+ * XDROID-CLOUDBLK hits the frames around it are copied out of the ring and
+ * written as PPM files to <storage>/glitch/.
  *
  * MC-1 mark clip: every second frame also goes into a 6 s ring of smaller
  * frames, and every frame's swap time into a timing ring. On a user mark
@@ -123,6 +124,9 @@ class VulkanGlitchRecorder {
   uint64_t candidates_ = 0;
   uint64_t hud1_candidates_ = 0;
   uint64_t hud1_frame_ = UINT64_MAX;
+  uint64_t cloud_black_ = 0;
+  uint64_t black_events_ = 0;
+  uint64_t last_black_frame_ = UINT64_MAX;
 
   // Mark clip.
   std::array<VkImage, kClipFrames> clip_images_{};

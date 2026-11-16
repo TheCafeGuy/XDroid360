@@ -67,4 +67,4 @@ Thermal input: Android thermal status/headroom lives in Java (`PowerManager`), w
 |---|---|---|
 | UPS-1 verify | Arms 60 s each, same flight route: `100/bilinear`, `50/bilinear`, `50/fsr`. Read `Present stats`, `Frame stats` (fps, gpu_busy), glitch log. Check HUD text sharpness, touch overlay alignment, and that the scale log line appears once per change (no compounding) | PC |
 | MSAA-1X | Implemented off by default (`gpu_force_msaa_1x`), see docs/design/msaa-1x.md | PC runs |
-| Sub-1x | Only if MSAA-1X is not enough; needs the maintainer's approval (architecture change) | The maintainer decides |
+| Sub-1x | Only if MSAA-1X is not enough; needs the maintainer's approval (architecture change) | the maintainer decides |

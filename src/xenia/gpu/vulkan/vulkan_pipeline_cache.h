@@ -142,6 +142,9 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
   void ShutdownShaderStorage();
 
   void EndSubmission();
+  // XDroid360: the flush request part of EndSubmission, without its wait for
+  // queued pipelines; the command processor calls it every submission.
+  void RequestStorageFlush();
   bool IsCreatingPipelines();
   // Waits for any pipeline creation needed by the current draw path to finish
   // before state is consumed. This was added so strict ZPD query paths stop
@@ -336,6 +339,13 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
     // fetch constant, 4 per word, others zero), specialization constants of
     // the pixel shader when xdroid_shader_sign_spec is on.
     uint32_t ps_texture_swizzled_signs[8];
+    // Fetch constants (bit per index) of the pixel shader's textures with a
+    // nonzero result exponent adjustment; specialization constant 8, right
+    // after the sign words. Filled when xdroid_shader_exp_spec is on.
+    uint32_t ps_texture_exp_adjust_nonzero;
+    // SHD-2: fetch constants (bit per index) whose texture needs the integer
+    // num_format scaling; specialization constant 9.
+    uint32_t ps_texture_integer_scale_used;
     // SHD-1e: endianness (2 bits, 16 per word) of the vertex shader's vertex
     // fetch constants, specialization constants 64+ of the vertex shader.
     uint32_t vs_vfetch_endian[6];
@@ -360,7 +370,7 @@ class VulkanPipelineCache : public GuestSpirvShaderCache::Host {
       }
     };
 
-    static constexpr uint32_t kVersion = 0x20261017;
+    static constexpr uint32_t kVersion = 0x20261019;
   });
 
   // Pipeline storage constants.

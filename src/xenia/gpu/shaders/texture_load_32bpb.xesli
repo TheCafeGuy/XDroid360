@@ -14,6 +14,39 @@ XE_TEXTURE_LOAD_ENTRY(16)
   // 1 thread = 8 blocks passed through an externally provided
   // uint4 transformation function (XE_TEXTURE_LOAD_32BPB_TRANSFORM).
   XeTextureLoadInfo load_info = XeTextureLoadGetInfo(pass_push_consts_xe);
+#ifdef XE_TEXTURE_LOAD_32BPB_COALESCED
+  // A5 (idea: Xendroid+ (phforner0) d5d830945): the 4 threads along X of a
+  // group take 4-block chunks 4t and 16 + 4t of their 32 blocks instead of 8
+  // contiguous blocks each, so each 16-byte load and store of the group covers
+  // 64 contiguous bytes. A chunk is written exactly when the 8-block run
+  // containing it would be in the plain shader: chunk x < size rounded up to 8.
+  uint3_xe thread_id = in_global_thread_id_xe;
+  dont_flatten_xe
+  if (thread_id.y >= load_info.size_blocks.y) {
+    return;
+  }
+  uint chunk_limit_x = (load_info.size_blocks.x + 7u) & ~7u;
+  uint chunk_x = ((thread_id.x >> 2u) << 5u) + ((thread_id.x & 3u) << 2u);
+  for (uint half_xe = 0u; half_xe < 2u; ++half_xe) {
+    uint3_xe chunk_index = uint3_xe(chunk_x + (half_xe << 4u), thread_id.yz);
+    if (chunk_index.x < chunk_limit_x) {
+      uint chunk_offset_host =
+          load_info.host_offset +
+          uint(XeTextureHostLinearOffset(int3_xe(chunk_index),
+                                         load_info.host_pitch,
+                                         load_info.size_blocks.y, 4u));
+      uint chunk_offset_guest =
+          XeTextureLoadSourceAddress(load_info, chunk_index, 2u);
+      uint4_xe chunk_blocks = XeEndianSwap32(
+          byte_buffer_align16_load16_xe(xe_texture_load_source,
+                                        chunk_offset_guest),
+          load_info.endian_32);
+      byte_buffer_align16_store16_xe(
+          xe_texture_load_dest, chunk_offset_host,
+          XE_TEXTURE_LOAD_32BPB_TRANSFORM(chunk_blocks));
+    }
+  }
+#else
   uint3_xe block_index = in_global_thread_id_xe << uint3_xe(3u, 0u, 0u);
   dont_flatten_xe
   if (any(greater_than_equal_xe(block_index.xy, load_info.size_blocks.xy))) {
@@ -38,5 +71,6 @@ XE_TEXTURE_LOAD_ENTRY(16)
       load_info.endian_32);
   byte_buffer_align16_store16_xe(xe_texture_load_dest, block_offset_host,
                                  XE_TEXTURE_LOAD_32BPB_TRANSFORM(guest_blocks));
+#endif  // XE_TEXTURE_LOAD_32BPB_COALESCED
 }
 entry_code_end_compute_xe

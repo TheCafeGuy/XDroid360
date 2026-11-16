@@ -5,6 +5,8 @@
 #ifndef XDROID_ADPF_H_
 #define XDROID_ADPF_H_
 
+#include <filesystem>
+
 namespace xe {
 class Emulator;
 }  // namespace xe
@@ -13,8 +15,9 @@ namespace xdroid {
 
 // Starts (once per process) the thread that runs the native performance hint
 // sessions and samples the thermal headroom. Idle (one wake per second) while
-// xdroid_adpf is 0.
-void StartAdpf();
+// xdroid_adpf is 0. `storage_root` holds the adpf_exclude file read by the
+// app's PerfHint.kt (AUDIO-H1).
+void StartAdpf(const std::filesystem::path& storage_root);
 
 // The emulator whose kernel resolves the guest audio producer's dispatch
 // thread (xdroid_adpf_audio_guest_tid); null before it is destroyed. Blocks

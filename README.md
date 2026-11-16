@@ -76,6 +76,15 @@ Expect bugs, crashes and missing features. See [Known issues](#known-issues).
   bug reports easier.
 - **In-game glitch report**: tap the ⚑ flag to mark the moment a glitch happens.
 
+### PC mirror (experimental)
+- **Play on a Windows PC over the USB cable**, with sound. The phone encodes the game picture and our
+  own viewer shows it; the phone screen goes black and its speaker mutes while the viewer is
+  connected.
+- Turn on **PC mirror (experimental)** in the in-game menu and start `xdroid-viewer.exe` on the PC,
+  in either order. The viewer is an optional download in each release (unsigned, SHA-256 in the
+  release notes); its full source is in `xdroid-viewer/` if you prefer to build it.
+- Needs USB debugging on the phone and Google's platform-tools (`adb`) on the PC.
+
 ## Planned
 
 On the way, roughly in this order:
@@ -94,6 +103,7 @@ On the way, roughly in this order:
   665, 680 class) are not supported.
 - Vulkan. Adreno 7xx with a Turnip driver is the tested path.
 - Your own legally dumped games (`.iso`, `.xex`, `.zar`). None are provided.
+- PC mirror only: a Windows 10 or 11 PC, a USB cable, USB debugging on the phone and `adb` on the PC.
 
 ## Install
 
@@ -107,6 +117,9 @@ On the way, roughly in this order:
 - Audio can crackle when the phone is hot.
 - The hangar in Ace Combat 6 can crash when you scroll the aircraft list very fast.
 - Some textures can appear late or be missing.
+- Ace Combat 6 can start without music (about 2 of 36 starts). Restart the game if the title screen
+  is silent.
+- The PC mirror is experimental: short stalls and tearing are possible.
 
 To report a problem, open an issue with your phone model, Android version, the game and what you saw.
 A screenshot or a short video helps.

@@ -11,6 +11,7 @@
 #define VMA_IMPLEMENTATION
 #include "xenia/ui/vulkan/vulkan_mem_alloc.h"
 
+#include <chrono>
 #include <cstring>
 
 #include "xenia/base/logging.h"
@@ -18,6 +19,28 @@
 namespace xe {
 namespace ui {
 namespace vulkan {
+
+std::atomic<void (*)(uint64_t ns, uint64_t bytes)> xdroid_vma_allocate_note{
+    nullptr};
+
+namespace {
+std::atomic<PFN_vkAllocateMemory> xdroid_vma_allocate_memory{nullptr};
+
+VKAPI_ATTR VkResult VKAPI_CALL XdroidVmaAllocateMemory(
+    VkDevice device, const VkMemoryAllocateInfo* allocate_info,
+    const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+  const auto begin = std::chrono::steady_clock::now();
+  const VkResult result = xdroid_vma_allocate_memory.load(
+      std::memory_order_relaxed)(device, allocate_info, allocator, memory);
+  if (auto note = xdroid_vma_allocate_note.load(std::memory_order_acquire)) {
+    note(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - begin)
+                      .count()),
+         allocate_info->allocationSize);
+  }
+  return result;
+}
+}  // namespace
 
 VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
                                 const bool externally_synchronized) {
@@ -37,7 +60,9 @@ VmaAllocator CreateVmaAllocator(const VulkanDevice* const vulkan_device,
       ifn.vkGetPhysicalDeviceProperties;
   vma_vulkan_functions.vkGetPhysicalDeviceMemoryProperties =
       ifn.vkGetPhysicalDeviceMemoryProperties;
-  vma_vulkan_functions.vkAllocateMemory = dfn.vkAllocateMemory;
+  xdroid_vma_allocate_memory.store(dfn.vkAllocateMemory,
+                                   std::memory_order_relaxed);
+  vma_vulkan_functions.vkAllocateMemory = XdroidVmaAllocateMemory;
   vma_vulkan_functions.vkFreeMemory = dfn.vkFreeMemory;
   vma_vulkan_functions.vkMapMemory = dfn.vkMapMemory;
   vma_vulkan_functions.vkUnmapMemory = dfn.vkUnmapMemory;
