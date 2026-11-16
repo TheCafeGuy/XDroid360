@@ -118,6 +118,10 @@ HostThreadSample SampleHostThread() {
   }
   return sample;
 }
+// AUDIO-H4: the dispatch thread's nice for the report, read once per 10 s
+// pump window (XdroidAudioWatch::window) instead of once per producer slice.
+thread_local int t_dispatch_nice = 0;
+thread_local uint32_t t_nice_window = ~0u;
 }  // namespace
 #endif
 
@@ -761,7 +765,11 @@ void GuestScheduler::LinkReadyLocked(Cpu& cpu, XThread* thread, bool at_head) {
   const uint32_t producer_tid =
       watch.signaler_tid.load(std::memory_order_relaxed);
   if (producer_tid && thread->thread_id() == producer_tid) {
-    watch.producer_ready_tick.store(XdroidNowUs(), std::memory_order_relaxed);
+    // AUDIO-H4: the ready-to-run timing is diagnostics only; with no store
+    // the dispatch side sees 0 and skips its clock read.
+    if (XdroidAudioForensics()) {
+      watch.producer_ready_tick.store(XdroidNowUs(), std::memory_order_relaxed);
+    }
     uint32_t expected = producer_tid;
     if (watch.boost_pending_tid.compare_exchange_strong(
             expected, 0, std::memory_order_acq_rel)) {
@@ -1040,8 +1048,9 @@ void GuestScheduler::SwitchTo(XThread* next) {
   void* fiber_log = links.profiler_log;
   void* dispatch_log = fiber_log ? Profiler::SwapThreadLog(fiber_log) : nullptr;
 #if XE_PLATFORM_ANDROID
-  // XDroid360 AUD-5: split the audio producer's slices (always on, a few
-  // syscalls per producer slice), and optionally boost its host thread.
+  // XDroid360 AUD-5: split the audio producer's slices (gated by
+  // xdroid_diagnostics: sched_getcpu + 2 host samples per slice), and
+  // optionally boost its host thread (nice arm, independent of it).
   XdroidAudioWatch& audio_watch = xdroid_audio_watch;
   const uint32_t audio_producer_tid =
       audio_watch.signaler_tid.load(std::memory_order_relaxed);
@@ -1051,15 +1060,27 @@ void GuestScheduler::SwitchTo(XThread* next) {
   int producer_nice_before = 0;
   bool producer_nice_set = false;
   int producer_host_cpu = -1;
+  // Snapshot per dispatch: a live toggle never pairs a sample with none.
+  bool producer_sampled = false;
   if (is_audio_producer) {
-    errno = 0;
-    producer_nice_before = getpriority(PRIO_PROCESS, 0);
-    if (errno) {
-      producer_nice_before = 0;
-    }
-    audio_watch.dispatch_nice.store(producer_nice_before,
-                                    std::memory_order_relaxed);
     const int32_t wanted = cvars::xdroid_audio_producer_nice;
+    producer_sampled = XdroidAudioForensics();
+    const uint32_t window = audio_watch.window.load(std::memory_order_relaxed);
+    // The nice arm needs a fresh read for an exact restore; the report alone
+    // takes the per-window cached value.
+    if (wanted || (producer_sampled && window != t_nice_window)) {
+      errno = 0;
+      t_dispatch_nice = getpriority(PRIO_PROCESS, 0);
+      if (errno) {
+        t_dispatch_nice = 0;
+      }
+      t_nice_window = window;
+    }
+    producer_nice_before = t_dispatch_nice;
+    if (producer_sampled) {
+      audio_watch.dispatch_nice.store(producer_nice_before,
+                                      std::memory_order_relaxed);
+    }
     if (wanted && wanted != producer_nice_before) {
       if (!setpriority(PRIO_PROCESS, 0, wanted)) {
         producer_nice_set = true;
@@ -1071,13 +1092,15 @@ void GuestScheduler::SwitchTo(XThread* next) {
         }
       }
     }
-    producer_host_cpu = sched_getcpu();
-    producer_in = SampleHostThread();
+    if (producer_sampled) {
+      producer_host_cpu = sched_getcpu();
+      producer_in = SampleHostThread();
+    }
   }
 #endif
   next->dispatch_fiber()->SwitchTo();
 #if XE_PLATFORM_ANDROID
-  if (is_audio_producer) {
+  if (producer_sampled) {
     const HostThreadSample out = SampleHostThread();
     const uint64_t cpu_us = out.cpu_us - producer_in.cpu_us;
     audio_watch.slices.fetch_add(1, std::memory_order_relaxed);
@@ -1102,6 +1125,8 @@ void GuestScheduler::SwitchTo(XThread* next) {
     } else {
       audio_watch.slice_end_yield.fetch_add(1, std::memory_order_relaxed);
     }
+  }
+  if (is_audio_producer) {
     links.xdroid_yield_kind = 0;
     if (producer_nice_set) {
       setpriority(PRIO_PROCESS, 0, producer_nice_before);
@@ -1689,6 +1714,12 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
   }
   {
     std::lock_guard<std::mutex> lock(lock_);
+    // seq_cst and before the epoch reads below: store-then-load here vs
+    // bump-then-load in the wake pre-filters, so at least one side always sees
+    // the other. Stored after them, a signal landing in between saw no blocked
+    // CPU and returned while the epoch read here was still the old one: the
+    // waiter then slept to the backstop.
+    cpus_[cpu_index].has_blocked.store(true);
     // A signal between the caller's failed poll and this park bumped the epoch
     // but walked the blocked list before we joined it, so nothing would re-poll
     // us before the backstop. Compare under the walk's own lock and poke this
@@ -1743,9 +1774,6 @@ void GuestScheduler::BlockCurrentThread(uint64_t deadline_ms,
     if (due && due < cpu.next_timed_repoll_ms) {
       cpu.next_timed_repoll_ms = due;
     }
-    // seq_cst pairs with the wake pre-filters' loads: epoch-read-then-store
-    // here vs bump-then-load there, so at least one side always sees the other.
-    cpu.has_blocked.store(true);
   }
   self->guest_object<X_KTHREAD>()->thread_state = KTHREAD_STATE_WAITING;
   YieldToScheduler();
@@ -2106,12 +2134,16 @@ std::string FormatWaitShape(const XThread::SchedulerLinks& links) {
 }
 }  // namespace
 
-void GuestScheduler::ReportNoProgress() {
-  XELOGW(
-      "GuestScheduler: no guest frame presented in {} watchdog ticks while the "
-      "dispatch threads keep switching. Every fiber below is waiting on "
-      "something none of them is producing:",
-      no_progress_ticks_);
+void GuestScheduler::ReportNoProgress(const char* why) {
+  if (why) {
+    XELOGW("GuestScheduler: state dump on request ({}):", why);
+  } else {
+    XELOGW(
+        "GuestScheduler: no guest frame presented in {} watchdog ticks while "
+        "the dispatch threads keep switching. Every fiber below is waiting on "
+        "something none of them is producing:",
+        no_progress_ticks_);
+  }
   uint64_t now_ms = Clock::QueryHostUptimeMillis();
   std::lock_guard<std::mutex> lock(lock_);
   for (int i = 0; i < kMaxCpus; ++i) {
@@ -2133,7 +2165,7 @@ void GuestScheduler::ReportNoProgress() {
     // Parked fibers are the interesting half: the cycle is whatever they are
     // all waiting for.
     int listed = 0;
-    for (XThread* t = cpu.blocked_head; t && listed < 8;
+    for (XThread* t = cpu.blocked_head; t && listed < 16;
          t = t->scheduler_links().ready_next, ++listed) {
       auto& links = t->scheduler_links();
       XObject* obj = t->cooperative_wait_object();
@@ -2233,6 +2265,11 @@ void GuestScheduler::WatchdogLoop() {
                !no_progress_reported_) {
       no_progress_reported_ = true;
       ReportNoProgress();
+    }
+    // A dump another subsystem asked for (the audio driver on a silent run).
+    if (const char* why = xdroid_audio_watch.sched_dump_reason.exchange(
+            nullptr, std::memory_order_acq_rel)) {
+      ReportNoProgress(why);
     }
 
     uint64_t now = Clock::host_tick_count_raw();

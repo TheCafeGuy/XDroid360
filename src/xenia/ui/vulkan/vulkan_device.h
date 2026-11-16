@@ -388,6 +388,10 @@ class VulkanDevice {
   get_pipeline_executable_statistics_khr() const {
     return vkGetPipelineExecutableStatisticsKHR_;
   }
+  PFN_vkGetPipelineExecutableInternalRepresentationsKHR
+  get_pipeline_executable_internal_representations_khr() const {
+    return vkGetPipelineExecutableInternalRepresentationsKHR_;
+  }
 
   VkResult SubmitAndUpdateLost(const VkQueue queue, const uint32_t submit_count,
                                const VkSubmitInfo* const submits,
@@ -435,6 +439,8 @@ class VulkanDevice {
       vkGetPipelineExecutablePropertiesKHR_ = nullptr;
   PFN_vkGetPipelineExecutableStatisticsKHR
       vkGetPipelineExecutableStatisticsKHR_ = nullptr;
+  PFN_vkGetPipelineExecutableInternalRepresentationsKHR
+      vkGetPipelineExecutableInternalRepresentationsKHR_ = nullptr;
   // VK_EXT_external_memory_host function pointer, loaded only if the extension
   // is enabled. Null otherwise.
   PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_ =

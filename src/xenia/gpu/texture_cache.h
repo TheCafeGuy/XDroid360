@@ -172,6 +172,21 @@ class TextureCache {
   uint64_t probe_frame() const {
     return probe_frame_.load(std::memory_order_relaxed);
   }
+  // TEX-1c/1d: xdroid_tex_link_mips as of the last BeginFrame.
+  uint32_t link_mips() const { return link_mips_; }
+
+  // XDroid360 draw black box: how the texture bound to a fetch constant as of
+  // the latest RequestTextures call last got its data.
+  struct XdroidLoadState {
+    bool bound = false;
+    uint8_t kind = 0;  // 0 never loaded, 1 from guest memory, 2 resolve link.
+    // Bit 0 base outdated, 1 mips outdated, 2 GPU-written bytes in the base
+    // range, 3 scaled resolve.
+    uint8_t flags = 0;
+    uint32_t age = 0;  // Frames since that load.
+    uint64_t base_hash = 0;
+  };
+  XdroidLoadState XdroidGetLoadState(uint32_t fetch_constant_index) const;
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -182,6 +197,13 @@ class TextureCache {
   }
   // SHD-1c: the post-swizzle signs a binding of this fetch constant gets
   // (exactly what GetActiveTextureSwizzledSigns returns after RequestTextures).
+  // SHD-2: whether a fetch constant needs the integer num_format scaling in
+  // the shader (a pure function of the fetch constant, like the signs).
+  static bool IntegerScaleUsedByFetchConstant(
+      const xenos::xe_gpu_texture_fetch_t& fetch) {
+    return GetIntegerScaleBits(fetch.format, fetch.num_format, fetch.swizzle,
+                               SwizzledSignsFromFetchConstant(fetch)) != 0;
+  }
   static uint8_t SwizzledSignsFromFetchConstant(
       const xenos::xe_gpu_texture_fetch_t& fetch) {
     TextureKey key;
@@ -270,6 +292,13 @@ class TextureCache {
     }
     bool operator!=(const TextureKey& key) const { return !(*this == key); }
 
+    // TEX-1b/1c: 2D, one slice, tiled - a shape whose levels a resolve can
+    // write whole.
+    bool IsResolveLinkShape() const {
+      return dimension == xenos::DataDimension::k2DOrStacked &&
+             !depth_or_array_size_minus_1 && tiled && !scaled_resolve;
+    }
+
     uint32_t GetWidth() const { return width_minus_1 + 1; }
     uint32_t GetHeight() const { return height_minus_1 + 1; }
     uint32_t GetDepthOrArraySize() const {
@@ -350,7 +379,9 @@ class TextureCache {
     // not).
     bool base_outdated_lockless() const { return base_outdated_; }
     bool mips_outdated_lockless() const { return mips_outdated_; }
-    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock);
+    // base / mips false: that part is left as it is (outdated stays outdated).
+    bool MakeUpToDateAndWatch(const global_unique_lock_type& global_lock,
+                              bool base = true, bool mips = true);
 
     void WatchCallback(const global_unique_lock_type& global_lock, bool is_mip);
 
@@ -368,6 +399,10 @@ class TextureCache {
     bool ever_loaded() const { return ever_loaded_; }
     struct ProbeState {
       uint64_t first_load_frame = 0;
+      // Draw black box: probe frame and kind (XdroidLoadState) of the latest
+      // load.
+      uint64_t last_load_frame = 0;
+      uint8_t last_load_kind = 0;
       // Written under the global critical region by the watch callback, read
       // at the next load: bit 0 = CPU write, bit 1 = GPU write (resolve or
       // memexport) soon after the first load.
@@ -434,18 +469,31 @@ class TextureCache {
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
 
-  // TEX-1b (xdroid_tex_link): a resolve that writes a whole texture can copy
-  // its pixels straight into the host image instead of the next sampling
-  // loading them back out of guest memory. The candidate at a base page is
-  // the last texture of a linkable shape loaded there.
-  Texture* GetResolveLinkCandidate(uint32_t base_page) const {
-    auto it = link_candidates_.find(base_page);
-    return it != link_candidates_.end() ? it->second : nullptr;
+  // TEX-1b (xdroid_tex_link): a resolve that writes a whole texture level can
+  // copy its pixels straight into the host image instead of the next sampling
+  // loading them back out of guest memory. Candidates are keyed by the page a
+  // level starts at: the base of every texture of a linkable shape and each
+  // of its mip levels that starts on a page (TEX-1c, xdroid_tex_link_mips).
+  // Ordered (TEX-1d) so a lookup also reaches bases that start on an earlier
+  // page than the resolve.
+  struct LinkCandidate {
+    Texture* texture;
+    uint32_t level;
+  };
+  using LinkCandidates = std::multimap<uint32_t, LinkCandidate>;
+  // Every candidate at or before page: walk back from second, nearest first.
+  std::pair<LinkCandidates::const_iterator, LinkCandidates::const_iterator>
+  GetResolveLinkCandidates(uint32_t page) const {
+    return {link_candidates_.cbegin(), link_candidates_.upper_bound(page)};
   }
-  // After the resolve's MarkRangeAsResolved: the host image already holds
-  // the new data, so stop treating it as outdated. False if guest memory
-  // isn't valid there (the next use loads it as usual).
-  bool CompleteResolveLink(Texture& texture);
+  // After the resolve's MarkRangeAsResolved: the host image already holds the
+  // new data of the base (or, mips = true, of one mip level), so stop treating
+  // that part as outdated. False if guest memory isn't valid there (the next
+  // use loads it as usual).
+  bool CompleteResolveLink(Texture& texture, bool mips);
+  // xdroid_tex_link_mips as of the last BeginFrame: a live change takes effect
+  // at a frame boundary and no draw reads the cvar.
+  uint32_t link_mips_ = 0;
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):
@@ -887,10 +935,15 @@ class TextureCache {
   uint64_t current_submission_index_ = 0;
   uint64_t current_submission_time_ = 0;
 
+  // TEX-1b/1c: page a level starts at -> the textures holding that level.
+  // Declared before textures_: a texture's destructor removes its entries.
+  LinkCandidates link_candidates_;
+  void UpdateLinkCandidates(Texture& texture, bool add);
+  // TEX-1c bit 1: key with mip_max_level zeroed -> the most levels a binding
+  // has asked for.
+  std::unordered_map<TextureKey, uint8_t, TextureKey::Hasher> chain_max_levels_;
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher>
       textures_;
-  // TEX-1b: base page -> the last linkable-shape texture loaded there.
-  std::unordered_map<uint32_t, Texture*> link_candidates_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

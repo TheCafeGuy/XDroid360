@@ -16,6 +16,9 @@
 #include "xenia/base/cvar.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
+#include "xenia/kernel/xdroid_wait_probe.h"
+#include "xdroid_mirror.h"
 
 DEFINE_string(apu_aaudio_performance_mode, "power_saving",
               "AAudio performance mode: power_saving (fewer, larger device "
@@ -24,18 +27,36 @@ DEFINE_string(apu_aaudio_performance_mode, "power_saving",
               "APU");
 DECLARE_uint32(apu_max_queued_frames);
 DECLARE_bool(xdroid_diagnostics);
-DEFINE_uint32(apu_queue_bursts, 3,
+DEFINE_uint32(apu_queue_bursts, 5,
               "Device bursts the guest audio queue covers (at least 2). Two "
               "leave no margin for a slow guest callback while the pump refills "
               "after each burst (power_saving bursts are 40 ms; underruns with "
               "a fresh producer, 2026-10-11).",
               "APU");
+DEFINE_uint32(apu_queue_max_frames, 64,
+              "Cap on the guest audio queue, in 5.33 ms frames (at most 256). "
+              "A Bluetooth burst is 31 frames, so 64 covers about two of them. "
+              "Live: a change reopens the stream.",
+              "APU");
+// Configs saved with the old default of 3 move to 5 (AUD-2, 63b4a3553):
+// SaveConfig writes every cvar, so a default change alone never reaches
+// upgraders.
+UPDATE_from_uint32(apu_queue_bursts, 2026, 10, 23, 1, 3);
 
 DEFINE_bool(xdroid_audio_conceal, true,
             "XDroid360 (AUD-2 arm D2): on an audio underrun, loop the last "
             "~10 ms of output (crossfaded, released after 40 ms) instead of "
             "fading to silence, so a short producer delay is not an audible "
             "cut. Live.",
+            "APU");
+
+DEFINE_bool(xdroid_audio_loudness_guard, true,
+            "XDroid360 (AUD-6): protect the listener. Output louder than any "
+            "normal game mix (frame RMS above 0.45; AC6 plays at 0.14-0.19) is "
+            "turned down to it, and after a resume or a gap in the guest "
+            "audio the sound fades in over 0.5 s instead of starting at full "
+            "level (a stall + lock screen played ~13 s at 5x level, "
+            "2026-10-19). Live.",
             "APU");
 
 DEFINE_uint32(xdroid_audio_drc_ppm, 0,
@@ -59,11 +80,12 @@ DEFINE_bool(xdroid_audio_route_watch, false,
 namespace xdroid {
 
 namespace {
-int64_t SteadyMs() {
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
+int64_t SteadyUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
+int64_t SteadyMs() { return SteadyUs() / 1000; }
 
 aaudio_performance_mode_t ParsePerformanceMode(const std::string& name) {
   if (name == "low_latency") {
@@ -311,10 +333,11 @@ uint32_t XDroidAAudioDriver::SizeQueue(AAudioStream* stream) {
       cvars::apu_max_queued_frames,
       uint32_t(xe::apu::AudioSystem::kMinimumQueuedFrames),
       uint32_t(xe::apu::AudioSystem::kMaximumQueuedFrames));
+  sized_bursts_ = cvars::apu_queue_bursts;
+  sized_max_ = cvars::apu_queue_max_frames;
   const uint32_t depth = std::min(
-      kRingSlots,
-      std::max(semaphore_depth,
-               std::max(cvars::apu_queue_bursts, 2u) * burst_frames));
+      std::clamp(sized_max_, semaphore_depth, kRingSlots),
+      std::max(semaphore_depth, std::max(sized_bursts_, 2u) * burst_frames));
   credit_target_.store(depth - semaphore_depth, std::memory_order_relaxed);
   queue_depth_.store(depth, std::memory_order_relaxed);
   burst_frames_.store(std::max(burst_frames, 1u), std::memory_order_relaxed);
@@ -367,6 +390,7 @@ void XDroidAAudioDriver::Resume() {
   // output level closely for the first seconds.
   last_submit_ms_.store(SteadyMs(), std::memory_order_relaxed);
   watch_request_.store(true, std::memory_order_relaxed);
+  fade_request_.store(true, std::memory_order_relaxed);
   if (stream_) {
     // A stream that died while paused fails here; the error callback has
     // already handed it to the service thread, which reopens it.
@@ -375,6 +399,12 @@ void XDroidAAudioDriver::Resume() {
 }
 
 void XDroidAAudioDriver::SubmitFrame(float* frame) {
+  if (xdroid::MirrorAudioArmed()) {
+    xdroid::MirrorOnAudioFrame(
+        this, frame,
+        volume_.load(std::memory_order_relaxed) *
+            float(std::min<uint32_t>(cvars::volume, 100)) / 100.0f);
+  }
   last_submit_ms_.store(SteadyMs(), std::memory_order_relaxed);
   const uint32_t tail = ring_tail_.load(std::memory_order_relaxed);
   const uint32_t head = ring_head_.load(std::memory_order_acquire);
@@ -431,8 +461,72 @@ bool XDroidAAudioDriver::PopFrameToStage() {
   uint32_t limited = 0;
   uint32_t nonfinite = 0;
   float peak = 0.0f;
+  // AUD-6: gain at the start and the end of this frame, ramped across it so
+  // a change is not a click.
+  float gain_from = 1.0f, gain_to = 1.0f;
+  // Guest mix level and treble share: the step between neighbour samples of
+  // one channel carries ~0 of the energy for bass, 1x for content at fs/6
+  // (8 kHz), 2x for white noise and up to 4x near fs/2. Harsh = loud frame
+  // whose steps carry 1.5x its energy (hiss or crackle, not jet rumble).
+  double sum_sq = 0.0, step_sq = 0.0;
+  for (uint32_t i = 0; i < kChannelSamples * 2; ++i) {
+    const float scaled = stage_[i] * volume;
+    if (!std::isfinite(scaled)) {
+      continue;
+    }
+    sum_sq += double(scaled) * scaled;
+    if (i >= 2 && std::isfinite(stage_[i - 2])) {
+      const double step = double(scaled) - double(stage_[i - 2]) * volume;
+      step_sq += step * step;
+    }
+  }
+  const float rms = float(std::sqrt(sum_sq / double(kChannelSamples * 2)));
+  level_raw_rms_max_ = std::max(level_raw_rms_max_, rms);
+  if (rms >= 0.1f && step_sq >= 1.5 * sum_sq) {
+    ++level_harsh_;
+  }
+  if (rms > 0.01f && !std::memcmp(stage_, prev_stage_, sizeof(stage_))) {
+    ++level_repeats_;
+  }
+  std::memcpy(prev_stage_, stage_, sizeof(stage_));
+  if (cvars::xdroid_audio_loudness_guard) {
+    // A fade starts on resume and after 250 ms without guest audio (a stall):
+    // whatever the game mixed meanwhile must not start at full level.
+    constexpr uint32_t kFadeFrames = 94;  // ~0.5 s of 256-sample frames
+    const int64_t now_ms = SteadyMs();
+    if (fade_request_.exchange(false, std::memory_order_relaxed) ||
+        (last_pop_ms_ && now_ms - last_pop_ms_ > 250)) {
+      fade_frames_left_ = kFadeFrames;
+    }
+    last_pop_ms_ = now_ms;
+    // 0.3 already acted in a normal flight (2026-10-19 f6641); the incident
+    // ran at 0.8-0.9.
+    constexpr float kMaxRms = 0.45f;
+    // Instant attack, ~0.3 s release.
+    float target = rms > kMaxRms ? kMaxRms / rms : 1.0f;
+    gain_from = guard_gain_;
+    guard_gain_ = target < guard_gain_
+                      ? target
+                      : guard_gain_ + (1.0f - guard_gain_) * 0.02f;
+    // Count only audible reductions (more than ~1 dB).
+    if (guard_gain_ < 0.9f) {
+      ++level_guarded_;
+    }
+    float fade_from = 1.0f, fade_to = 1.0f;
+    if (fade_frames_left_) {
+      fade_from = 1.0f - float(fade_frames_left_) / float(kFadeFrames);
+      --fade_frames_left_;
+      fade_to = 1.0f - float(fade_frames_left_) / float(kFadeFrames);
+    }
+    gain_from *= fade_from;
+    gain_to = guard_gain_ * fade_to;
+  }
+  const float gain_step =
+      (gain_to - gain_from) / float(kChannelSamples * 2);
+  float gain = gain_from;
   for (float& sample : stage_) {
-    float scaled = sample * volume;
+    float scaled = sample * volume * gain;
+    gain += gain_step;
     // The limiter maps inf to full scale and passes NaN through: either one
     // is heard as a full-volume burst.
     if (!std::isfinite(scaled)) {
@@ -488,13 +582,15 @@ void XDroidAAudioDriver::ConcealNext(float& left, float& right) {
 void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
   consumed_in_render_ = 0;
   int32_t written = 0;
-  // AUD-5 rate control: how far short of full the queue is right before this
-  // callback takes its burst. A producer keeping up refills it every period.
+  // Frames queued right before this callback takes its burst: the F2
+  // per-second minimum, and the AUD-5 rate control (how far short of full
+  // the queue is). A producer keeping up refills it every period.
+  const uint32_t queued = ring_tail_.load(std::memory_order_acquire) -
+                          ring_head_.load(std::memory_order_relaxed);
+  ring_min_ = std::min(ring_min_, queued);
   const uint32_t drc_ppm = std::min<uint32_t>(cvars::xdroid_audio_drc_ppm,
                                               50000);  // 5% at most
   if (drc_ppm) {
-    const uint32_t queued = ring_tail_.load(std::memory_order_acquire) -
-                            ring_head_.load(std::memory_order_relaxed);
     const uint32_t depth = queue_depth_.load(std::memory_order_relaxed);
     const double deficit = depth > queued ? double(depth - queued) : 0.0;
     drc_deficit_ema_ += (deficit - drc_deficit_ema_) * 0.2;
@@ -575,7 +671,8 @@ void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
     hold_[0] = out[written * 2 - 2];
     hold_[1] = out[written * 2 - 1];
   }
-  const int64_t now_ms = SteadyMs();
+  const int64_t now_us = SteadyUs();
+  const int64_t now_ms = now_us / 1000;
   if (drc_calls_ && now_ms - drc_log_ms_ >= 10000) {
     if (drc_log_ms_) {
       XELOGI("XDroid360: audio drc: slow mean {} ppm, max {} ppm over {} "
@@ -685,15 +782,29 @@ void XDroidAAudioDriver::Render(float* out, int32_t pairs) {
     clip_rate_.store(device_rate_, std::memory_order_relaxed);
     clip_pairs_written_.store(at, std::memory_order_release);
   }
-  UpdateLevels(now_ms);
+  UpdateLevels(now_us);
   ReleaseSlots(consumed_in_render_);
 }
 
-void XDroidAAudioDriver::UpdateLevels(int64_t now_ms) {
+void XDroidAAudioDriver::UpdateLevels(int64_t now_us) {
+  const int64_t now_ms = now_us / 1000;
   if (watch_request_.exchange(false, std::memory_order_relaxed)) {
-    // Resume or reconnect: start a fresh window on the new output.
+    // Resume or reconnect: start a fresh window on the new output. The pause
+    // or reconnect before it is no callback gap.
     watch_until_ms_ = now_ms + 2000;
     level_window_ms_ = 0;
+    cb_last_us_ = 0;
+  }
+  if (cb_last_us_) {
+    cb_gap_max_us_ = std::max(cb_gap_max_us_, now_us - cb_last_us_);
+  }
+  cb_last_us_ = now_us;
+  if (now_us - ring_second_us_ >= 1000000) {
+    if (ring_second_us_) {
+      ring_minima_[ring_minima_count_++ % kRingMinima] = ring_min_;
+      ring_min_ = UINT32_MAX;
+    }
+    ring_second_us_ = now_us;
   }
   if (level_window_ms_) {
     const bool watching = now_ms < watch_until_ms_;
@@ -704,8 +815,28 @@ void XDroidAAudioDriver::UpdateLevels(int64_t now_ms) {
         level_samples_
             ? float(std::sqrt(level_sum_sq_ / double(level_samples_)))
             : 0.0f;
-    const bool loud = rms > 0.5f || level_nonfinite_ ||
+    // A burst the guard turned down is still loud.
+    const bool burst = level_raw_rms_max_ > 0.9f || level_harsh_ >= 10 ||
+                       level_repeats_ >= 4;
+    const bool loud = rms > 0.5f || level_nonfinite_ || burst ||
                       uint64_t(level_limited_) * 100 > level_samples_;
+    // Auto-forensics for a run without sound: after 30, 90 and 270 s of
+    // exact-zero guest output, ask the scheduler watchdog to dump what every
+    // guest fiber waits on (at most 6 per run). Sound re-arms it.
+    if (level_peak_ > 0.0f) {
+      silent_since_ms_ = 0;
+      silent_dump_after_ms_ = 30000;
+    } else if (!silent_since_ms_) {
+      silent_since_ms_ = level_window_ms_;
+    } else if (now_ms - silent_since_ms_ >= silent_dump_after_ms_ &&
+               silence_dumps_ < 6) {
+      ++silence_dumps_;
+      silent_dump_after_ms_ *= 3;
+      XELOGW("XDROID-SILENCE: guest audio exact zero for {} ms (dump {})",
+             now_ms - silent_since_ms_, silence_dumps_);
+      xe::kernel::xdroid_audio_watch.sched_dump_reason.store(
+          "guest audio silent", std::memory_order_release);
+    }
     const char* tag = nullptr;
     if (watching) {
       tag = "watch";
@@ -713,6 +844,14 @@ void XDroidAAudioDriver::UpdateLevels(int64_t now_ms) {
       if (now_ms - level_loud_ms_ >= 5000) {
         tag = "loud";
         level_loud_ms_ = now_ms;
+        if (burst) {
+          // Auto-mark: saves the last 7 s of output as a WAV clip. One
+          // signature per minute keeps a burst storm from filling the table.
+          xe::gpu::XdroidEvent("audio_burst", 2, uint64_t(now_ms / 60000),
+                               "raw rms max {:.2f} harsh {} repeats {}",
+                               level_raw_rms_max_, level_harsh_,
+                               level_repeats_);
+        }
       } else {
         ++level_loud_skipped_;
       }
@@ -720,19 +859,36 @@ void XDroidAAudioDriver::UpdateLevels(int64_t now_ms) {
       tag = "level";
     }
     if (tag) {
+      // F2: lowest and median of the 1-s queue minima since the last line
+      // (the current second's minimum before one has ended), in frames.
+      const uint32_t n = std::min(ring_minima_count_, kRingMinima);
+      std::array<uint32_t, kRingMinima> minima = ring_minima_;
+      if (!n) {
+        minima[0] = ring_min_;
+      }
+      const auto end = minima.begin() + std::max(n, 1u);
+      const auto mid = minima.begin() + (end - minima.begin()) / 2;
+      std::nth_element(minima.begin(), mid, end);
       XELOGW(
           "XDroid360: audio {} {} ms: rms {:.3f} peak {:.2f} limited {} "
-          "non-finite {} underruns {} queued {} volume {:.2f} (loud windows "
-          "not logged {})",
+          "non-finite {} underruns {} queued {} volume {:.2f} guarded {} "
+          "(loud windows not logged {}) ring_min1s={}/{} pump_max_us={} "
+          "cb_gap_max_us={} raw_rms_max={:.2f} harsh={} repeats={}",
           tag, now_ms - level_window_ms_, rms, level_peak_, level_limited_,
           level_nonfinite_, level_underruns_,
           ring_tail_.load(std::memory_order_acquire) -
               ring_head_.load(std::memory_order_relaxed),
           volume_.load(std::memory_order_relaxed) *
               float(std::min<uint32_t>(cvars::volume, 100)) / 100.0f,
-          level_loud_skipped_);
+          level_guarded_, level_loud_skipped_,
+          *std::min_element(minima.begin(), end), *mid,
+          xe::kernel::xdroid_audio_watch.pump_took_max_us.exchange(
+              0, std::memory_order_relaxed),
+          cb_gap_max_us_, level_raw_rms_max_, level_harsh_, level_repeats_);
       level_baseline_ms_ = now_ms;
       level_loud_skipped_ = 0;
+      ring_minima_count_ = 0;
+      cb_gap_max_us_ = 0;
     }
   } else if (!level_baseline_ms_) {
     level_baseline_ms_ = now_ms;
@@ -744,7 +900,11 @@ void XDroidAAudioDriver::UpdateLevels(int64_t now_ms) {
   level_samples_ = 0;
   level_limited_ = 0;
   level_nonfinite_ = 0;
+  level_guarded_ = 0;
   level_underruns_ = 0;
+  level_raw_rms_max_ = 0.0f;
+  level_harsh_ = 0;
+  level_repeats_ = 0;
 }
 
 aaudio_data_callback_result_t XDroidAAudioDriver::DataCallback(
@@ -752,6 +912,7 @@ aaudio_data_callback_result_t XDroidAAudioDriver::DataCallback(
     int32_t num_frames) {
   static_cast<XDroidAAudioDriver*>(user_data)->Render(
       static_cast<float*>(audio_data), num_frames);
+  xdroid::MirrorMuteLocal(static_cast<float*>(audio_data), num_frames);
   return AAUDIO_CALLBACK_RESULT_CONTINUE;
 }
 
@@ -783,6 +944,13 @@ void XDroidAAudioDriver::ServiceThreadMain() {
         CheckRoute();
         lock.lock();
       }
+      // Live queue sizing: reopen through the reconnect path below.
+      if (sized_bursts_ != cvars::apu_queue_bursts ||
+          sized_max_ != cvars::apu_queue_max_frames) {
+        XELOGI("XDroid360: AAudio reopen for queue sizing: bursts {} max {}",
+               cvars::apu_queue_bursts, cvars::apu_queue_max_frames);
+        disconnected_.store(true);
+      }
       continue;
     }
     if (service_exit_) {
@@ -798,14 +966,18 @@ void XDroidAAudioDriver::ServiceThreadMain() {
     for (;;) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= next_open) {
+        // Cleared before the open: an error of the new stream right after it
+        // (a route that flaps) must stay set, or the stream stays dead and
+        // the guest audio stalls with no further reconnect.
+        disconnected_.store(false);
         if (AAudioStream* stream = OpenStream()) {
           std::lock_guard<std::mutex> stream_lock(stream_mutex_);
-          disconnected_.store(false);
           stream_ = stream;
+          // Before the start, so its first callback sees the request.
+          watch_request_.store(true, std::memory_order_relaxed);
           if (!paused_) {
             LogIfFailed("restart", AAudioStream_requestStart(stream_));
           }
-          watch_request_.store(true, std::memory_order_relaxed);
           XELOGI("XDroid360: AAudio reconnected");
           break;
         }

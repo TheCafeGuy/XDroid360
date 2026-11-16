@@ -23,6 +23,10 @@
 #include "xdroid_gamepad.h"
 #include "xdroid_gpu_bench.h"
 #include "xdroid_live.h"
+#include "xdroid_mirror.h"
+#include "xdroid_nonfinite.h"
+#include "xdroid_pad_script.h"
+#include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
@@ -44,6 +48,8 @@ DECLARE_int32(vulkan_pipeline_creation_threads);
 DECLARE_string(xdroid_gpu_bench);
 
 namespace xdroid {
+// xdroid_hle_census.cc: wraps HLE exports in counting thunks.
+void InstallHleCensus(xe::cpu::ExportResolver* resolver);
 namespace {
 
 constexpr size_t kInputZOrder = 0;
@@ -103,14 +109,17 @@ std::string BootError() {
 
 const char* BuildId() { return XDROID_BUILD_ID; }
 
-XDroidApp* XDroidApp::instance_ = nullptr;
+std::atomic<XDroidApp*> XDroidApp::instance_{nullptr};
 
 XDroidApp::XDroidApp(xe::ui::WindowedAppContext& app_context)
     : xe::ui::WindowedApp(app_context, "xdroid", "[Path to .iso/.xex]"),
       params_(std::move(g_boot_params)) {}
 
 XDroidApp::~XDroidApp() {
+  // Its threads read the title id through instance_; clearing it first makes
+  // PadScriptStart and PadRecordSet refuse once shutdown has joined them.
   instance_ = nullptr;
+  PadScriptShutdown();
   {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     quit_ = true;
@@ -137,6 +146,8 @@ XDroidApp::~XDroidApp() {
   paused_threads_.clear();
   if (emulator_) {
     AdpfSetEmulator(nullptr);
+    SetLiveGraphicsSystem(nullptr);
+    MirrorDetachGraphics();  // Boot failure or GPU-BENCH: no quick_exit.
     emulator_->TerminateTitle();
     emulator_->Shutdown();
     emulator_.reset();
@@ -161,6 +172,7 @@ bool XDroidApp::OnInitialize() {
 
   config::SetupConfig(storage_root);
   ApplyTestedDefaults();
+  InstallNonFiniteAnalysis();
   StartLiveConfig(storage_root / "live.toml");
   SelectVulkanDriver(params_.driver_path, params_.native_lib_dir,
                      (storage_root / "tu_debug.txt").string());
@@ -169,7 +181,7 @@ bool XDroidApp::OnInitialize() {
   emulator_ = std::make_unique<xe::Emulator>("", storage_root, content_root,
                                             cache_root);
   InstallAc6Fixes(emulator_.get());
-  StartAdpf();
+  StartAdpf(storage_root);
   AdpfSetEmulator(emulator_.get());
   // Library cover fallback: the title's own icon from its XDBF.
   emulator_->on_launch.AddListener(
@@ -254,6 +266,10 @@ void XDroidApp::EmulatorThreadMain() {
 // next dispatch), the list is kept so resume undoes exactly that, and the
 // audio output stops. The GPU thread drains the ring and idles on its own.
 size_t XDroidApp::PauseEmulation() {
+  // The guest must not see the paused time: it resumed with every clock
+  // minutes ahead (timers, system time, time base), a jump the game never
+  // gets on the console.
+  xe::Clock::HoldGuestTime(true);
   if (auto* audio =
           dynamic_cast<XDroidAudioSystem*>(emulator_->audio_system())) {
     audio->SetOutputPaused(true);
@@ -280,6 +296,7 @@ size_t XDroidApp::PauseEmulation() {
 
 size_t XDroidApp::ResumeEmulation() {
   const size_t count = paused_threads_.size();
+  xe::Clock::HoldGuestTime(false);
   if (auto* scheduler = emulator_->kernel_state()->guest_scheduler()) {
     scheduler->SetHostPaused(false);
   }
@@ -358,6 +375,7 @@ bool XDroidApp::Boot() {
            cvars::xdroid_gpu_bench);
     return true;
   }
+  InstallHleCensus(emulator_->export_resolver());
   result = emulator_->LaunchPath(game_path);
   if (XFAILED(result)) {
     SetBootError(fmt::format("Could not load the game (error {:08X})", result));

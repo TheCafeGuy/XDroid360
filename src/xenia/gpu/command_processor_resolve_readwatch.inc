@@ -200,6 +200,7 @@ void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
     uint32_t owner_first_page = owner.address >> 12;
     uint32_t owner_last_page = std::min((owner_end - 1) >> 12, page_count - 1);
     if (owner.submission > submitted) {
+      ++resolve_read_stats_[write ? 3 : 2];
       if (write) {
         ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
                                     first_page, last_page);
@@ -243,7 +244,10 @@ void ProvideResolveOutput(uint32_t address, uint32_t length, bool write) {
     }
     if (FaultCopyResolveToGuestRam(resolve_fault_copy_ranges_)) {
       owner.in_guest_ram = true;
+      ++resolve_read_stats_[write ? 1 : 0];
+      ++resolve_read_destinations_[owner.address];
     } else {
+      ++resolve_read_stats_[4];
       if (write) {
         ClipResolveEdgePagesWritten(owner, owner_first_page, owner_last_page,
                                     first_page, last_page);
@@ -473,7 +477,29 @@ void SetResolvePageOwner(uint32_t base, uint32_t length, uint64_t resolve_key) {
 }
 
 // Ends the resolve frame.
-void NoteResolveFrame() { ++resolve_frame_index_; }
+void NoteResolveFrame() {
+  // XDroid360: what the CPU took from resolves, every 600 frames. A read that
+  // raced the submission of its resolve got the previous contents.
+  if (!(++resolve_frame_index_ % 600)) {
+    std::lock_guard<std::mutex> lock(resolve_read_mutex_);
+    std::string destinations;
+    for (const auto& destination : resolve_read_destinations_) {
+      if (destinations.size() < 160) {
+        destinations +=
+            fmt::format(" {:08X}x{}", destination.first, destination.second);
+      }
+    }
+    XELOGI(
+        "XDROID-RESREAD 600 frames: copied to guest RAM for reads {} for "
+        "writes {}, raced an unsubmitted resolve reads {} writes {}, copy "
+        "failed {}; destinations:{}",
+        resolve_read_stats_[0], resolve_read_stats_[1], resolve_read_stats_[2],
+        resolve_read_stats_[3], resolve_read_stats_[4], destinations);
+    std::fill(std::begin(resolve_read_stats_), std::end(resolve_read_stats_),
+              0);
+    resolve_read_destinations_.clear();
+  }
+}
 
 // What a scaled resolve's readback needs before it can touch the GPU. False
 // means it cannot be read back at all, with the reason already logged.
@@ -589,6 +615,9 @@ std::unique_ptr<std::atomic<uint64_t>[]> resolve_page_owners_;
 // it.
 std::mutex resolve_read_mutex_;
 std::unordered_set<uint64_t> resolve_read_keys_;
+// XDroid360 XDROID-RESREAD, under resolve_read_mutex_.
+uint64_t resolve_read_stats_[5] = {};
+std::unordered_map<uint32_t, uint32_t> resolve_read_destinations_;
 // Resolve output by destination key, for ProvideResolveOutput. Under
 // resolve_read_mutex_.
 struct ResolveOwner {

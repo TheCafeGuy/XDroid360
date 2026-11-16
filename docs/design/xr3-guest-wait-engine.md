@@ -1,6 +1,6 @@
 # XR-3: guest wait engine (design, 2026-10-17; needs approval: architecture change)
 
-The maintainer 2026-10-17: "en vez de simplemente solucionar lo del sleep de cpu, ... un rework entero que aparte de
+the maintainer 2026-10-17: "en vez de simplemente solucionar lo del sleep de cpu, ... un rework entero que aparte de
 solucionarlo nos de mas estabilidad y performance?" This replaces CE-7's futex park with one wait model.
 
 ## Problem (evidence)

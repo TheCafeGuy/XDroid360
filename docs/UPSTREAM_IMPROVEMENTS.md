@@ -123,6 +123,23 @@ kgsl, Ace Combat 6. Status: **validated** (measured on device), **candidate**
   after unlocking. Evidence: code reading of the lock order (sweep 2026-10-09),
   commit 4011527f5. Status: candidate.
 
+- **WaitMultiple spins on a contended handle mutex** (`src/xenia/base/threading_posix.cc`,
+  WaitMultiple try_lock miss -> `std::this_thread::yield()`; Signal/Release wake multi-waiters while
+  still holding the mutex). A high-priority waiter woken onto the holder's core preempts it and spins;
+  CFS ignores the yield, so the holder waits ~100 ms (XAudio2 mixer vs the audio worker: underrun
+  bursts). XDroid360 67331abf9: on a miss with timeout > 0, drop locks and sleep on the contended
+  mutex, and wake after unlocking (live `xdroid_wait_block_contended`, flight A/B pending).
+  Internal note only, never sent. 2026-11-11: default on; mutant release and timer signal poke
+  after unlocking too (4b2d20df0).
+
+- **Guest scheduler: lost cooperative wake** (`GuestScheduler::BlockCurrentThread`,
+  `src/xenia/kernel/guest_scheduler.cc`). The waiter read the wait epoch and stored `has_blocked` last;
+  `WakeForSignal` bumps the epoch and then loads `has_blocked` with no lock. That is load-then-store
+  against store-then-load, so a signal between the two sees no blocked CPU and returns while the
+  waiter parks on the old epoch, until the 64 ms backstop. Needs every CPU's blocked list empty at that
+  moment, so it is rare in a busy title. Fix: store `has_blocked` first, under `lock_` (84e581853).
+  Evidence: code reading. Status: candidate. Internal note only, never sent.
+
 ## Emulator
 
 - **`Emulator::Pause`/`Resume` are unsafe** (not changed upstream-side; the
@@ -138,6 +155,12 @@ kgsl, Ace Combat 6. Status: **validated** (measured on device), **candidate**
   with no frame presented after the pause request, and the game never
   presented again. Status: candidate (code-proven).
 
+- **Render-target cache compiles its dump/transfer pipelines with no pipeline cache**
+  (`src/xenia/gpu/vulkan/vulkan_render_target_cache.cc` GetDumpPipeline / GetTransferPipelines pass
+  VK_NULL_HANDLE), so every launch recompiles them on the CP thread (64-81 ms per transition on
+  Turnip). XDroid360 96b40693e: own small title-independent VkPipelineCache, saved after creation
+  quiets down.
+
 ## Rejected (do not retry without new evidence)
 
 - `db16cyc` spin hint as `yield` instead of `isb`: `yield` is a NOP on
@@ -152,3 +175,12 @@ kgsl, Ace Combat 6. Status: **validated** (measured on device), **candidate**
   render pass hang the GPU at a low rate; candidate driver cause = concurrent resolves
   (RB_CCU_CNTL CONCURRENT_RESOLVE_MODE_2). TU_DEBUG=noconcurrentresolves ran two full missions
   with 0 hangs (2026-10-12) and is now our default (xdroid_driver.cc). Report to Mesa.
+- Direct resolves (host render targets path): a 1x 32bpp resolve over tiles a 2x/4x 32bpp color target owns can
+  read the source sample per pixel with the canonical EDRAM sample layout instead of the dump + copy round trip
+  (RES-4, c69b7fec7); a resolve that writes a whole sampled texture can also copy its pixels into the host image and
+  skip the next untile load (TEX-1b, 67389b5cf). Both bit-identical on GPU-BENCH traces.
+- Vulkan pipeline storage: nothing calls VulkanPipelineCache::EndSubmission (its last caller went away in
+  5a959788c), so the .xsh/.xpso writer never gets a flush request and the files grow only in stdio-buffer steps
+  (AC6 .xpso was exactly 32768 bytes after 256 pipelines). A process that is killed instead of shut down
+  (Android, crashes) loses the tail and recompiles those pipelines mid-game next session. We request the flush
+  every submission (RequestStorageFlush, no wait on the creation queue).

@@ -25,6 +25,26 @@
 
 DECLARE_bool(spirv_fine_derivatives);
 DECLARE_bool(xdroid_shader_sign_spec);
+DEFINE_bool(xdroid_shader_iscale_spec, false,
+            "SHD-2: compile pixel shaders with the fetch constants whose "
+            "texture needs integer num_format scaling as a specialization "
+            "constant, so textures without it skip the scaling code. Needs "
+            "xdroid_shader_sign_spec. Boot only.",
+            "GPU");
+DEFINE_uint32(xdroid_shd_probe, 0,
+              "SHD-2 P0 measurement only (not exact): bit 0 skips the 21-bit "
+              "rounding of transcendental results; bit 1 skips the bounds "
+              "check of vertex fetch words; bit 2 endian swaps vertex fetch "
+              "words two extra times (same result, measures the swap cost). "
+              "Boot only.",
+              "GPU.Debug");
+DEFINE_bool(xdroid_shader_exp_spec, false,
+            "Compile pixel shaders with the fetch constants that have a "
+            "nonzero result exponent adjustment as a specialization constant "
+            "(pipeline key), so the multiplication of every fetched texel by "
+            "2^0 is folded away. Needs xdroid_shader_sign_spec. Boot only. "
+            "Idea: Xendroid+ (phforner0) 9031d521c.",
+            "GPU");
 DEFINE_bool(
     xdroid_tfetch_implicit_lod, true,
     "SHD-2: sample 2D textures with automatic LOD (implicit derivatives "
@@ -270,6 +290,10 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     // quad-list particle draw whose inactive vertices fetch 0 and collapse to a
     // degenerate (zero-area) primitive instead of exploding to garbage.
     spv::Id loaded_word = LoadUint32FromSharedMemory(word_address);
+    if (cvars::xdroid_shd_probe & 2) {
+      word_composite_constituents[word_count++] = loaded_word;
+      continue;
+    }
     spv::Id word_in_bounds = builder_->createBinOp(spv::OpULessThan, type_bool_,
                                                    word_address, fetch_end);
     word_composite_constituents[word_count++] = builder_->createTriOp(
@@ -309,6 +333,9 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     endian = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
                                    fetch_constant_word_1,
                                    builder_->makeUintConstant(0b11));
+  }
+  if (cvars::xdroid_shd_probe & 4) {
+    words = EndianSwap32Uint(EndianSwap32Uint(words, endian), endian);
   }
   words = EndianSwap32Uint(words, endian);
 
@@ -2763,6 +2790,27 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
           spv::Id integer_scale_active = builder_->createBinOp(
               spv::OpINotEqual, type_bool_, integer_scale_bits_packed,
               builder_->makeUintConstant(0));
+          if (cvars::xdroid_shader_iscale_spec &&
+              cvars::xdroid_shader_sign_spec && is_pixel_shader()) {
+            // SHD-2: the pipeline knows whether this fetch constant's texture
+            // uses the scaling at all; when not, the driver drops the block.
+            if (spec_texture_integer_scale_used_ == spv::NoResult) {
+              spec_texture_integer_scale_used_ =
+                  builder_->makeUintConstant(0, true);
+              builder_->addDecoration(spec_texture_integer_scale_used_,
+                                      spv::DecorationSpecId, 9);
+            }
+            integer_scale_active = builder_->createBinOp(
+                spv::OpLogicalAnd, type_bool_, integer_scale_active,
+                builder_->createBinOp(
+                    spv::OpINotEqual, type_bool_,
+                    builder_->createBinOp(
+                        spv::OpBitwiseAnd, type_uint_,
+                        spec_texture_integer_scale_used_,
+                        builder_->makeUintConstant(uint32_t(1)
+                                                   << fetch_constant_index)),
+                    const_uint_0_));
+          }
           SpirvBuilder::IfBuilder if_integer_scale(
               integer_scale_active, spv::SelectionControlMaskNone, *builder_);
           spv::Id integer_scale_result_converted;
@@ -2884,6 +2932,28 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
                                   fetch_constant_word_3_signed,
                                   builder_->makeUintConstant(13),
                                   builder_->makeUintConstant(6)));
+        if (cvars::xdroid_shader_exp_spec && cvars::xdroid_shader_sign_spec &&
+            is_pixel_shader()) {
+          // The pipeline tells whether this fetch constant has an exponent
+          // adjustment; with none (nearly always) the driver folds the
+          // multiplications by 2^0 away.
+          if (spec_texture_exp_adjust_nonzero_ == spv::NoResult) {
+            spec_texture_exp_adjust_nonzero_ =
+                builder_->makeUintConstant(0, true);
+            builder_->addDecoration(spec_texture_exp_adjust_nonzero_,
+                                    spv::DecorationSpecId, 8);
+          }
+          spv::Id has_exp_adjust = builder_->createBinOp(
+              spv::OpINotEqual, type_bool_,
+              builder_->createBinOp(spv::OpBitwiseAnd, type_uint_,
+                                    spec_texture_exp_adjust_nonzero_,
+                                    builder_->makeUintConstant(
+                                        uint32_t(1) << fetch_constant_index)),
+              const_uint_0_);
+          result_exponent_bias =
+              builder_->createTriOp(spv::OpSelect, type_float_, has_exp_adjust,
+                                    result_exponent_bias, const_float_1_);
+        }
         {
           uint32_t result_remaining_components = used_result_nonzero_components;
           uint32_t result_component_index;

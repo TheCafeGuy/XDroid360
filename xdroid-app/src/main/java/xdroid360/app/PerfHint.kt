@@ -3,6 +3,7 @@ package xdroid360.app
 import android.content.Context
 import android.os.Build
 import android.os.PerformanceHintManager
+import android.os.Process
 import android.util.Log
 import java.io.File
 
@@ -15,6 +16,10 @@ import java.io.File
  *
  * Steps aside (session closed) while live.toml sets `xdroid_adpf` != 0: the
  * native per-frame hint (xdroid_adpf.cc, ADPF-1) owns the session then.
+ *
+ * AUDIO-H1 (live xdroid_adpf_exclude): native writes files/xdroid/adpf_exclude
+ * as "pid arm tid..."; a changed file forces a rebuild that drops those tids
+ * from the hottest set (arm 3 also keeps only the 3 busiest left).
  */
 class PerfHint(private val context: Context) {
   private var session: PerformanceHintManager.Session? = null
@@ -25,6 +30,10 @@ class PerfHint(private val context: Context) {
   // All-thread CPU snapshot one tick before a rebuild picks the hot set.
   private var rebuildBase: Map<Int, Long>? = null
   @Volatile var enabled = true
+  private val excludeFile = File(context.filesDir, "xdroid/adpf_exclude")
+  private var excludeStamp = 0L
+  private var excludeArm = 0
+  private var excluded = emptySet<Int>()
 
   /** One sampler tick: [frames] presented during it, at [fps]. */
   fun update(frames: Long, fps: Double) {
@@ -34,6 +43,12 @@ class PerfHint(private val context: Context) {
       ticksSinceBuild = REBUILD_TICKS
       rebuildBase = null
       return
+    }
+    val stamp = excludeFile.lastModified()
+    if (stamp != excludeStamp) {
+      excludeStamp = stamp
+      readExclude()
+      ticksSinceBuild = REBUILD_TICKS
     }
     if (++ticksSinceBuild >= REBUILD_TICKS) {
       val previous = rebuildBase
@@ -71,7 +86,9 @@ class PerfHint(private val context: Context) {
   }
 
   /** For the forensic log (temp): on:<threads>:<target ms>, or off. */
-  fun state(): String = session?.let { "on:${tids.size}:${targetNs / 1_000_000}" } ?: "off"
+  fun state(): String = session?.let {
+    "on:${tids.size}:${targetNs / 1_000_000}" + if (excludeArm > 0) ":x$excludeArm" else ""
+  } ?: "off"
 
   fun close() {
     runCatching { session?.close() }
@@ -87,6 +104,8 @@ class PerfHint(private val context: Context) {
         .sortedByDescending { it.second }
         .take(HOT_THREADS)
         .map { it.first }
+        .filter { it !in excluded }
+        .take(if (excludeArm >= 3) CAP_THREADS else HOT_THREADS)
         .toIntArray()
     if (hot.isEmpty()) return
     try {
@@ -97,6 +116,15 @@ class PerfHint(private val context: Context) {
     } catch (e: Exception) {
       Log.d(TAG, "perf hint unavailable: ${e.message}")
     }
+  }
+
+  // A file from another process (killed run) or a bad line reads as arm 0.
+  private fun readExclude() {
+    val fields = runCatching {
+      excludeFile.readText().trim().split(' ').map { it.toInt() }
+    }.getOrNull()?.takeIf { it.size >= 2 && it[0] == Process.myPid() }
+    excludeArm = fields?.get(1) ?: 0
+    excluded = fields?.drop(2)?.toSet() ?: emptySet()
   }
 
   // utime + stime in clock ticks per thread; null = every thread.
@@ -121,6 +149,7 @@ class PerfHint(private val context: Context) {
   private companion object {
     const val TAG = "XDroid360"
     const val HOT_THREADS = 8
+    const val CAP_THREADS = 3
     const val REBUILD_TICKS = 30
     // USER_HZ is 100 on Android.
     const val NS_PER_TICK = 10_000_000L

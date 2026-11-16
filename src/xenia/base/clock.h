@@ -61,6 +61,9 @@ class Clock {
   // Sets the guest time scalar, adjusting tick and wall clock speed.
   // Ex: 1x=normal, 2x=double speed, 1/2x=half speed.
   static void set_guest_time_scalar(double scalar);
+  // XDroid360: while held no guest clock advances (tick count, system time,
+  // time base), so the game does not see the time the app spent paused.
+  static void HoldGuestTime(bool hold);
   // Get the tick ration between host and guest including time scaling if set.
   static std::pair<uint64_t, uint64_t> guest_tick_ratio();
   // Guest ticks-per-second.

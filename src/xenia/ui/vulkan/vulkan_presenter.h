@@ -143,6 +143,14 @@ class VulkanPresenter final : public Presenter {
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  // XDroid360 MIRROR-1: a second guest output consumer, like
+  // CaptureGuestOutput, for a copy on the graphics and compute queue 0. The
+  // image stays in kGuestOutputInternalLayout between uses; keep_alive_out
+  // holds it until the copy's fence signals. serial_out changes with every
+  // refresh. False if there's no guest output yet.
+  bool AcquireGuestOutputForCopy(VkImage& image_out, VkExtent2D& extent_out,
+                                 uint64_t& serial_out,
+                                 std::shared_ptr<void>& keep_alive_out);
 
   void AwaitUISubmissionCompletionFromUIThread(uint64_t submission_index) {
     ui_completion_timeline_.AwaitSubmissionAndUpdateCompleted(submission_index);
@@ -477,7 +485,7 @@ class VulkanPresenter final : public Presenter {
     VkExtent2D swapchain_native_extent = {};
     // Cvar values the swapchain was created with; a live change of any of them
     // (tools/device live A/B) makes the connection outdated to recreate it.
-    uint32_t swapchain_creation_cvars = 0;
+    uint64_t swapchain_creation_cvars = 0;
     // Reused between connections if the format stays the same.
     VkRenderPass rotate_source_render_pass = VK_NULL_HANDLE;
     VkPipeline rotate_pipeline = VK_NULL_HANDLE;

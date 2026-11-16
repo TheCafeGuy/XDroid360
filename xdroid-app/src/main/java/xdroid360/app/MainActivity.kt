@@ -92,6 +92,7 @@ class MainActivity : ComponentActivity() {
   private val covers by lazy { CoverStore(File(filesDir, "xdroid/covers")) }
   private var coverRevision by mutableStateOf(0)
   @Volatile private var coverScanRunning = false
+  private val tvButton = Tv.libraryButton(this)
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -254,6 +255,7 @@ class MainActivity : ComponentActivity() {
         Text("Made with ♥ by TheCafeGuy", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
       }
       Spacer(Modifier.weight(1f))
+      tvButton()
       OutlinedButton(onClick = { pickFolder = true }) { Text("+ Folder") }
     }
     OutlinedTextField(
@@ -991,7 +993,7 @@ class MainActivity : ComponentActivity() {
           })
         }
         SectionTitle("In game")
-        Text("Back button or Select + Start: quick menu (stats, fast forward, AMOLED tone, exit).")
+        Text("Back button: quick menu. Home/Guide marks a glitch (Diagnostics on) (stats, fast forward, AMOLED tone, exit).")
         Text("PS / Home button: fast forward on/off.")
         Spacer(Modifier.height(16.dp))
         Text(

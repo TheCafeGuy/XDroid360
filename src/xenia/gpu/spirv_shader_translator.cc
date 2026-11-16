@@ -24,6 +24,7 @@
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/spirv_compatibility.h"
 #include "xenia/gpu/spirv_shader.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/ui/vulkan/vulkan_device.h"
 
 DEFINE_string(spirv_version_override, "1.0",
@@ -139,12 +140,20 @@ DEFINE_bool(xdroid_shader_vfetch_spec, true,
             "key), so the driver folds the byte swaps. Boot only.",
             "GPU");
 DECLARE_bool(xdroid_shd_bound_noalpha);
+DECLARE_uint32(xdroid_relaxed_mul);
 DEFINE_bool(spirv_no_contraction_all, false,
             "Decorate every float arithmetic result with NoContraction, "
             "removing the driver's freedom to fuse a multiply and add into "
             "one rounding.",
             "GPU.Debug");
 
+DEFINE_bool(
+    xdroid_structured_jumps, false,
+    "SHD-2: translate shaders whose jumps all go forward and nest (no loops "
+    "or calls) as nested ifs instead of a loop with a switch on the "
+    "program counter, so the driver sees the real liveness of each value. "
+    "Applies to shaders translated after it is set (boot).",
+    "GPU");
 DEFINE_bool(
     spirv_moltenvk_allow_contraction, true,
     "When translating SPIR-V for MoltenVK, omit NoContraction decorations so "
@@ -520,6 +529,20 @@ void SpirvShaderTranslator::BisectOverrideColorOutput() {
 }
 
 void SpirvShaderTranslator::StartTranslation() {
+  // BLACK-H1: exact relaxed multiply (bit 2) needs the inf/NaN analysis.
+  xdroid_relaxed_mul_ = cvars::xdroid_relaxed_mul;
+  xdroid_mul_taint_.clear();
+  for (uint32_t& count : xdroid_mul_counts_) {
+    count = 0;
+  }
+  if ((xdroid_relaxed_mul_ & (is_pixel_shader() ? 2 : 1)) &&
+      (xdroid_relaxed_mul_ & 4)) {
+    auto analyze =
+        GetXdroidGpuHooks().nonfinite_operands.load(std::memory_order_acquire);
+    if (analyze) {
+      analyze(current_shader(), xdroid_mul_taint_);
+    }
+  }
   // TODO(Triang3l): Logger.
   builder_ = std::make_unique<SpirvBuilder>(
       features_.spirv_version, (kSpirvMagicToolId << 16) | 1, nullptr);
@@ -566,6 +589,8 @@ void SpirvShaderTranslator::StartTranslation() {
   const_int4_0_ = builder_->makeCompositeConstant(type_int4_, id_vector_temp_);
   const_uint_0_ = builder_->makeUintConstant(0);
   spec_texture_swizzled_signs_.fill(spv::NoResult);
+  spec_texture_exp_adjust_nonzero_ = spv::NoResult;
+  spec_texture_integer_scale_used_ = spv::NoResult;
   spec_vfetch_endian_.fill(spv::NoResult);
   id_vector_temp_.clear();
   for (uint32_t i = 0; i < 4; ++i) {
@@ -1049,7 +1074,22 @@ void SpirvShaderTranslator::StartTranslation() {
 
   // If no jumps, don't create a switch, but still create a loop so exece can
   // break.
-  bool has_main_switch = !current_shader().label_addresses().empty();
+  structured_jumps_ = cvars::xdroid_structured_jumps &&
+                      current_shader().has_only_nested_forward_jumps();
+  structured_jump_merges_.clear();
+  // Overlapping forward jumps: each stretch between labels and jumps runs
+  // under a guard on the label the code is skipping to (-1 = none).
+  structured_guard_ = cvars::xdroid_structured_jumps && !structured_jumps_ &&
+                      current_shader().has_only_forward_jumps();
+  structured_guard_merge_ = nullptr;
+  var_skip_target_ = spv::NoResult;
+  if (structured_guard_) {
+    structured_jumps_ = true;
+    var_skip_target_ = builder_->createVariable(
+        spv::NoPrecision, spv::StorageClassFunction, type_int_,
+        "xe_var_skip_target", builder_->makeIntConstant(-1));
+  }
+  bool has_main_switch = UsesMainSwitch();
 
   // Main loop header - based on whether it's the first iteration (entered from
   // the function or from the continuation), choose the program counter.
@@ -1098,13 +1138,65 @@ void SpirvShaderTranslator::StartTranslation() {
     function_main_->addBlock(main_switch_case_0_block);
     builder_->setBuildPoint(main_switch_case_0_block);
   }
+  if (structured_guard_) {
+    OpenSkipGuard();
+  }
+}
+
+void SpirvShaderTranslator::OpenSkipGuard() {
+  if (builder_->getBuildPoint()->isTerminated()) {
+    return;
+  }
+  spv::Id not_skipping = builder_->createBinOp(
+      spv::OpIEqual, type_bool_,
+      builder_->createLoad(var_skip_target_, spv::NoPrecision),
+      builder_->makeIntConstant(-1));
+  spv::Block* body = new spv::Block(builder_->getUniqueId(), *function_main_);
+  structured_guard_merge_ =
+      new spv::Block(builder_->getUniqueId(), *function_main_);
+  builder_->createSelectionMerge(structured_guard_merge_,
+                                 spv::SelectionControlMaskNone);
+  builder_->createConditionalBranch(not_skipping, body,
+                                    structured_guard_merge_);
+  function_main_->addBlock(body);
+  builder_->setBuildPoint(body);
+}
+
+void SpirvShaderTranslator::CloseSkipGuard() {
+  if (!structured_guard_merge_) {
+    return;
+  }
+  if (!builder_->getBuildPoint()->isTerminated()) {
+    builder_->createBranch(structured_guard_merge_);
+  }
+  function_main_->addBlock(structured_guard_merge_);
+  builder_->setBuildPoint(structured_guard_merge_);
+  structured_guard_merge_ = nullptr;
 }
 
 std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+  if (xdroid_relaxed_mul_ & 8) {
+    // Keyed like tools/shader/nonfinite_census.py --keys (FNV-1a-64 over the
+    // ucode dwords), to compare per shader.
+    uint64_t key = 0xCBF29CE484222325;
+    for (uint32_t dword : current_shader().ucode_data()) {
+      key = (key ^ dword) * 0x100000001B3;
+    }
+    XELOGI(
+        "XDROID-RMUL {:016X} key={:016X} {} mode={} plain={} guard1={} "
+        "sm3={}",
+        current_shader().ucode_data_hash(), key,
+        is_pixel_shader() ? "ps" : "vs", xdroid_relaxed_mul_,
+        xdroid_mul_counts_[0], xdroid_mul_counts_[1], xdroid_mul_counts_[2]);
+  }
   if (!is_depth_only_fragment_shader_) {
     // Close flow control within the last switch case.
     CloseExecConditionals();
-    bool has_main_switch = !current_shader().label_addresses().empty();
+    if (structured_guard_) {
+      CloseInstructionPredication();
+      CloseSkipGuard();
+    }
+    bool has_main_switch = UsesMainSwitch();
     // After the final exec (if it happened to be not exece, which would already
     // have a break branch), break from the switch if it exists, or from the
     // loop it doesn't.
@@ -1462,6 +1554,38 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
   // Close flow control within the previous switch case.
   CloseExecConditionals();
 
+  if (structured_guard_) {
+    // SHD-2: stop skipping at the label the code was skipping to.
+    CloseInstructionPredication();
+    CloseSkipGuard();
+    spv::Id skip_target =
+        builder_->createLoad(var_skip_target_, spv::NoPrecision);
+    builder_->createStore(
+        builder_->createTriOp(
+            spv::OpSelect, type_int_,
+            builder_->createBinOp(spv::OpIEqual, type_bool_, skip_target,
+                                  builder_->makeIntConstant(int(cf_index))),
+            builder_->makeIntConstant(-1), skip_target),
+        var_skip_target_);
+    OpenSkipGuard();
+    return;
+  }
+  if (structured_jumps_) {
+    // SHD-2: close every if whose skipped range ends here, innermost first.
+    CloseInstructionPredication();
+    while (!structured_jump_merges_.empty() &&
+           structured_jump_merges_.back().first == cf_index) {
+      spv::Block* merge = structured_jump_merges_.back().second;
+      structured_jump_merges_.pop_back();
+      if (!builder_->getBuildPoint()->isTerminated()) {
+        builder_->createBranch(merge);
+      }
+      function_main_->addBlock(merge);
+      builder_->setBuildPoint(merge);
+    }
+    return;
+  }
+
   spv::Function& function = builder_->getBuildPoint()->getParent();
   // Create the next switch case and fallthrough to it.
   spv::Block* new_case = new spv::Block(builder_->getUniqueId(), function);
@@ -1498,9 +1622,8 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(
     // Break out of the main switch (if exists) and the main loop.
     CloseInstructionPredication();
     if (!builder_->getBuildPoint()->isTerminated()) {
-      builder_->createBranch(current_shader().label_addresses().empty()
-                                 ? main_loop_merge_
-                                 : main_switch_merge_);
+      builder_->createBranch(UsesMainSwitch() ? main_switch_merge_
+                                              : main_loop_merge_);
     }
   }
   UpdateExecConditionals(instr.type, instr.bool_constant_index,
@@ -1771,6 +1894,69 @@ void SpirvShaderTranslator::ProcessJumpInstruction(
   // on the control flow level too.
   CloseInstructionPredication();
 
+  if (structured_jumps_) {
+    // SHD-2: the code up to the target runs only when the jump is not
+    // taken: if (!taken) { ... } closed at the target label. The condition is
+    // evaluated after the exec-level if is closed, so it dominates the merge.
+    CloseExecConditionals();
+    if (builder_->getBuildPoint()->isTerminated()) {
+      return;
+    }
+    spv::Id taken;
+    if (instr.type == ParsedJumpInstruction::Type::kConditional) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(int(instr.bool_constant_index >> 7)));
+      id_vector_temp_.push_back(
+          builder_->makeIntConstant(int((instr.bool_constant_index >> 5) & 3)));
+      spv::Id bool_set = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(
+              spv::OpBitwiseAnd, type_uint_,
+              builder_->createLoad(
+                  builder_->createAccessChain(spv::StorageClassUniform,
+                                              uniform_bool_loop_constants_,
+                                              id_vector_temp_),
+                  spv::NoPrecision),
+              builder_->makeUintConstant(uint32_t(1)
+                                         << (instr.bool_constant_index & 31))),
+          const_uint_0_);
+      taken = instr.condition ? bool_set
+                              : builder_->createUnaryOp(spv::OpLogicalNot,
+                                                        type_bool_, bool_set);
+    } else if (instr.type == ParsedJumpInstruction::Type::kPredicated) {
+      spv::Id predicate =
+          builder_->createLoad(var_main_predicate_, spv::NoPrecision);
+      taken = instr.condition ? predicate
+                              : builder_->createUnaryOp(spv::OpLogicalNot,
+                                                        type_bool_, predicate);
+    } else {
+      taken = builder_->makeBoolConstant(true);
+    }
+    if (structured_guard_) {
+      // Inside the guard nothing is being skipped: start skipping to the
+      // target if taken, and reopen the guard for the code after the jump.
+      builder_->createStore(
+          builder_->createTriOp(
+              spv::OpSelect, type_int_, taken,
+              builder_->makeIntConstant(int(instr.target_address)),
+              builder_->makeIntConstant(-1)),
+          var_skip_target_);
+      CloseSkipGuard();
+      OpenSkipGuard();
+      return;
+    }
+    spv::Block* body = new spv::Block(builder_->getUniqueId(), *function_main_);
+    spv::Block* merge =
+        new spv::Block(builder_->getUniqueId(), *function_main_);
+    builder_->createSelectionMerge(merge, spv::SelectionControlMaskNone);
+    builder_->createConditionalBranch(taken, merge, body);
+    function_main_->addBlock(body);
+    builder_->setBuildPoint(body);
+    structured_jump_merges_.emplace_back(instr.target_address, merge);
+    return;
+  }
   if (builder_->getBuildPoint()->isTerminated()) {
     // Unreachable for some reason.
     return;

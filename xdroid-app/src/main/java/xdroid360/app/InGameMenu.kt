@@ -66,10 +66,15 @@ class InGameState {
   var titleId by mutableStateOf("")
   var playSeconds by mutableStateOf(0L)
   var battery by mutableStateOf(-1)
+  // Controller battery in percent (-1 = no controller or not reported).
+  var padBattery by mutableStateOf(-1)
+  var showBattery by mutableStateOf(true)
   var version by mutableStateOf("")
   // Controls.
   var gamepadConnected by mutableStateOf(false)
   var touchEditing by mutableStateOf(false)
+  // PC mirror switch: off at every game start, like every live cvar.
+  var pcMirror by mutableStateOf(false)
 
   companion object {
     const val TABS = 4
@@ -89,6 +94,11 @@ interface InGameHost : ControlsHost {
 
   fun markGlitch()
 
+  /** TV features; a no-op in the public build. */
+  val tv: Tv
+
+  fun setPcMirror(on: Boolean)
+
   /** Asks before leaving the game. */
   fun quit()
 
@@ -98,6 +108,13 @@ interface InGameHost : ControlsHost {
 
   fun applyPad(visible: Boolean, editing: Boolean)
 }
+
+/** Phone and controller battery, e.g. "📱 78%  🎮 60%"; null when neither is known. */
+private fun batteryText(state: InGameState): String? =
+  listOfNotNull(
+    state.battery.takeIf { it >= 0 }?.let { "📱 $it%" },
+    state.padBattery.takeIf { it >= 0 }?.let { "🎮 $it%" },
+  ).joinToString("  ").ifEmpty { null }
 
 @Composable
 fun InGameOverlay(state: InGameState, host: InGameHost) {
@@ -129,6 +146,9 @@ fun InGameOverlay(state: InGameState, host: InGameHost) {
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
           )
+          if (state.showBattery) batteryText(state)?.let {
+            Text(it, color = Color(0xFFB8B8C8), fontFamily = FontFamily.Monospace, fontSize = 9.sp)
+          }
           if (state.detailedStats && state.detail.isNotEmpty()) {
             Text(state.detail, color = Color(0xFFCCCCCC), fontFamily = FontFamily.Monospace, fontSize = 10.sp)
           }
@@ -181,7 +201,7 @@ private fun MenuPanel(state: InGameState, host: InGameHost) {
         "⏱ $played",
         state.fps.takeIf { it.isNotEmpty() },
         state.thermal.takeIf { it.isNotEmpty() },
-        if (state.battery >= 0) "🔋 ${state.battery}%" else null,
+        batteryText(state),
       ).joinToString("  ·  "),
       style = MaterialTheme.typography.bodySmall,
       color = Color(0xFFB8B8C8),
@@ -214,7 +234,7 @@ private fun MenuPanel(state: InGameState, host: InGameHost) {
   }
 }
 
-private val BIG = Modifier.fillMaxWidth().heightIn(min = 48.dp)
+val BIG = Modifier.fillMaxWidth().heightIn(min = 48.dp)
 
 @Composable
 private fun HomeTab(state: InGameState, host: InGameHost) {
@@ -234,6 +254,8 @@ private fun HomeTab(state: InGameState, host: InGameHost) {
     },
     modifier = BIG,
   ) { Text(stringResource(R.string.report_glitch)) }
+  host.tv.MenuRows()
+  SwitchRow(stringResource(R.string.pc_mirror), state.pcMirror) { host.setPcMirror(it) }
   Button(onClick = { host.quit() }, modifier = BIG) { Text(stringResource(R.string.exit_game)) }
 }
 
@@ -250,6 +272,10 @@ private fun GraphicsTab(state: InGameState, host: InGameHost) {
   }
   SwitchRow(stringResource(R.string.stats_overlay), state.showStats) {
     state.showStats = it
+    host.persist()
+  }
+  SwitchRow(stringResource(R.string.battery_stats), state.showBattery) {
+    state.showBattery = it
     host.persist()
   }
   SwitchRow(stringResource(R.string.detailed_stats), state.detailedStats) {

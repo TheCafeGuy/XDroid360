@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <thread>
 #include <utility>
@@ -321,17 +322,44 @@ void VulkanGlitchRecorder::Poll(DeferredCommandBuffer& command_buffer,
         }
       }
     }
+    // Black clouds: the upper cloud layer (y 0.07-0.26) drawn near-black for
+    // one frame. Dark-pixel count of that thumbnail band in n jumps by a
+    // quarter of the band against both neighbours.
+    constexpr uint32_t kCloudFirstRow = 3, kCloudRows = 6, kCloudDark = 14;
+    auto cloud_dark = [&](const std::vector<uint8_t>& l) {
+      uint32_t count = 0;
+      for (uint32_t i = kCloudFirstRow * kThumbWidth;
+           i < (kCloudFirstRow + kCloudRows) * kThumbWidth; ++i) {
+        count += l[i] <= kCloudDark;
+      }
+      return count;
+    };
+    const uint32_t dark_n = cloud_dark(history_[1]);
+    const uint32_t dark_around =
+        std::max(cloud_dark(history_[0]), cloud_dark(history_[2]));
+    const bool cloud_hit = dark_n >= dark_around + kCloudRows * kThumbWidth / 4;
+    if (cloud_hit) {
+      ++cloud_black_;
+      XELOGW("XDROID-CLOUDBLK: frame {} band dark {} vs {}, total {}",
+             slot.frame - 1, dark_n, dark_around, cloud_black_);
+    }
     ++scored_frames_;
+    if (!(scored_frames_ % 300)) {
+      XELOGI("XDROID-CLOUDBLK: total {} in {} frames", cloud_black_,
+             scored_frames_);
+    }
     if (!(scored_frames_ % 1800)) {
       XELOGI(
           "XDroid360: glitch recorder: {} frames scored, {} candidates, {} "
-          "HUD-1 (radar)",
-          scored_frames_, candidates_, hud1_candidates_);
+          "HUD-1 (radar), black_events={} cloud_black={}",
+          scored_frames_, candidates_, hud1_candidates_, black_events_,
+          cloud_black_);
     }
-    if (!candidate) {
+    // A CLOUDBLK hit dumps even when it is not a candidate (no GLITCH line).
+    if (!candidate && !cloud_hit) {
       continue;
     }
-    ++candidates_;
+    candidates_ += candidate;
     const uint64_t n = slot.frame - 1;
     if (hud1) {
       ++hud1_candidates_;
@@ -346,21 +374,66 @@ void VulkanGlitchRecorder::Poll(DeferredCommandBuffer& command_buffer,
     for (uint64_t f = n - 2; f <= n + 1; ++f) {
       frames_in_ring &= slots_[f % kRingSize].frame == f;
     }
+    // Luma of the winning region (the block, or the whole thumbnail) to tell
+    // a black frame from a HUD-1 quad or a cloud/motion pop: mean of n
+    // against the mean of n-1 and n+1, and the dark/bright pixels of n.
+    const uint32_t region_x = block < 0 ? 0 : uint32_t(block % 8) * kBlockWidth;
+    const uint32_t region_y =
+        block < 0 ? 0 : uint32_t(block / 8) * kBlockHeight;
+    const uint32_t region_w = block < 0 ? kThumbWidth : kBlockWidth;
+    const uint32_t region_h = block < 0 ? kThumbHeight : kBlockHeight;
+    float region_mean[3];
+    uint32_t dark = 0, bright = 0;
+    for (uint32_t k = 0; k < 3; ++k) {
+      uint32_t sum = 0;
+      for (uint32_t y = region_y; y < region_y + region_h; ++y) {
+        for (uint32_t x = region_x; x < region_x + region_w; ++x) {
+          const uint8_t value = history_[k][size_t(y) * kThumbWidth + x];
+          sum += value;
+          dark += k == 1 && value < 16;
+          bright += k == 1 && value > 240;
+        }
+      }
+      region_mean[k] = float(sum) / float(region_w * region_h);
+    }
+    const float dl = region_mean[1] - 0.5f * (region_mean[0] + region_mean[2]);
+    // BLACK (G2-1c, docs/runs/2026-11-08/analysis.md): 0 false positives on
+    // 27 eye-checked negatives; the rest (missiles, smoke, fog, camera) are
+    // POP and no longer dump. Events, not frames: a flicker train is one.
+    const bool black =
+        candidate && c <= 6.0f &&
+        (block < 0 ? dl < -4.0f && dark >= 64 : dl <= -15.0f && dark >= 8);
+    if (black) {
+      black_events_ +=
+          last_black_frame_ == UINT64_MAX || n > last_black_frame_ + 2;
+      last_black_frame_ = n;
+    }
+    // The draw black box also saves the frames around a black event.
+    if (black || cloud_hit) {
+      hud1_frame_ = n;
+    }
     const bool dump = frames_in_ring && dump_submission_ == UINT64_MAX &&
-                      dumps_ < kMaxDumps &&
+                      dumps_ < kMaxDumps && (black || hud1 || cloud_hit) &&
                       (hud1 || !last_dump_frame_ || n >= last_dump_frame_ + 30);
-    XELOGW(
-        "XDROID-GLITCH: frame {} differs from both neighbours in {} "
-        "(d(n-1,n)={:.1f} d(n,n+1)={:.1f} d(n-1,n+1)={:.1f}){}",
-        n,
-        block < 0 ? std::string("the whole frame")
-                  : fmt::format("block {},{} of 8x6", block % 8, block / 8),
-        a, b, c, dump ? ", dumping" : "");
-    // HUD-1 tracer: |frame| counts our captures, the log prefix counts CP
-    // swaps; hand over n on the log's scale.
-    if (auto on_glitch =
-            GetXdroidGpuHooks().on_glitch.load(std::memory_order_acquire)) {
-      on_glitch(uint32_t(n + (logging::GetFrameNumber() - frame)));
+    if (candidate) {
+      XELOGW(
+          "XDROID-GLITCH: frame {} differs from both neighbours in {} "
+          "(d(n-1,n)={:.1f} d(n,n+1)={:.1f} d(n-1,n+1)={:.1f}){} dl={:+.1f} "
+          "dark={}/{} bright={}/{} class={}",
+          n,
+          block < 0 ? std::string("the whole frame")
+                    : fmt::format("block {},{} of 8x6", block % 8, block / 8),
+          a, b, c, dump ? ", dumping" : "", dl, dark, region_w * region_h,
+          bright, region_w * region_h,
+          black  ? "BLACK"
+          : hud1 ? "HUD1"
+                 : "POP");
+      // HUD-1 tracer: |frame| counts our captures, the log prefix counts CP
+      // swaps; hand over n on the log's scale.
+      if (auto on_glitch =
+              GetXdroidGpuHooks().on_glitch.load(std::memory_order_acquire)) {
+        on_glitch(uint32_t(n + (logging::GetFrameNumber() - frame)));
+      }
     }
     if (!dump) {
       continue;
@@ -396,13 +469,15 @@ void VulkanGlitchRecorder::WriteDump() {
   range.size = VK_WHOLE_SIZE;
   dfn.vkInvalidateMappedMemoryRanges(vulkan_device_->device(), 1, &range);
   // RGB, frames n-2, n-1, n, n+1 side by side, written off the GPU thread.
-  std::vector<uint8_t> rgb(size_t(kFrameWidth) * kDumpFrames * kFrameHeight *
-                           3);
+  // Not zero-initialised: the loop below writes every byte, so a 2.76 MB
+  // memset on the GPU thread per dump would be wasted work.
+  const size_t rgb_size = size_t(kFrameWidth) * kDumpFrames * kFrameHeight * 3;
+  std::unique_ptr<uint8_t[]> rgb(new uint8_t[rgb_size]);
   for (uint32_t k = 0; k < kDumpFrames; ++k) {
     const uint8_t* src = dump_mapping_ + size_t(kFrameBytes) * k;
     for (uint32_t y = 0; y < kFrameHeight; ++y) {
       uint8_t* dst =
-          rgb.data() +
+          rgb.get() +
           (size_t(y) * kFrameWidth * kDumpFrames + size_t(k) * kFrameWidth) * 3;
       for (uint32_t x = 0; x < kFrameWidth; ++x) {
         const uint8_t* p = src + (size_t(y) * kFrameWidth + x) * 4;
@@ -418,14 +493,14 @@ void VulkanGlitchRecorder::WriteDump() {
   std::filesystem::path path = output_dir_ / name;
   XELOGI("XDROID-GLITCH: frame {} saved as {} (n-2, n-1, n, n+1)", dump_frame_,
          xe::path_to_utf8(path));
-  std::thread([path, rgb = std::move(rgb)] {
+  std::thread([path, rgb = std::move(rgb), rgb_size] {
     FILE* file = xe::filesystem::OpenFile(path, "wb");
     if (!file) {
       return;
     }
     std::fprintf(file, "P6\n%u %u\n255\n", kFrameWidth * kDumpFrames,
                  kFrameHeight);
-    std::fwrite(rgb.data(), 1, rgb.size(), file);
+    std::fwrite(rgb.get(), 1, rgb_size, file);
     std::fclose(file);
   }).detach();
 }

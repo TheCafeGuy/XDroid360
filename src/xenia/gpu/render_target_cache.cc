@@ -29,6 +29,13 @@ DEFINE_bool(xdroid_direct_resolve_average, false,
             "straight from the render target, like the bitwise ones, instead "
             "of the EDRAM dump + full copy round trip. Live-switchable.",
             "GPU");
+DEFINE_bool(xdroid_direct_resolve_average_2x, false,
+            "RES-3 for 2x MSAA sources only, also while "
+            "xdroid_direct_resolve_average is off: the two-sample average "
+            "(dump shader key 0B01, the main scene resolve) ran tens of "
+            "thousands of times per session with no GPU fault, every R5302 "
+            "fault was the four-sample one. Live-switchable.",
+            "GPU");
 DEFINE_bool(xdroid_direct_resolve_read_as_1x, false,
             "RES-4: resolve 1x 32bpp color copies over tiles a multisampled "
             "32bpp color render target owns straight from it, permuting the "
@@ -1425,7 +1432,11 @@ uint32_t RenderTargetCache::GetDirectResolveAverageSamples(
   // The full copy of an 8_8_8_8 UNORM source into a bitwise-equivalent UNORM
   // destination with no exp bias and no gamma only averages the samples, which
   // the direct shader reproduces (edram_dump_shader.cc, average_samples).
-  if (!cvars::xdroid_direct_resolve_average || resolve_info.IsCopyingDepth() ||
+  if (!(cvars::xdroid_direct_resolve_average ||
+        (cvars::xdroid_direct_resolve_average_2x &&
+         resolve_info.color_edram_info.msaa_samples ==
+             xenos::MsaaSamples::k2X)) ||
+      resolve_info.IsCopyingDepth() ||
       resolve_info.color_edram_info.format_is_64bpp ||
       xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format) !=
           xenos::ColorRenderTargetFormat::k_8_8_8_8 ||

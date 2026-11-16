@@ -66,6 +66,7 @@ X_RESULT XDroidGamepadDriver::GetState(uint32_t user_index,
   if (user_index != 0 || !out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
+  LatJitBeforeInputRead();
   out_state->packet_number = g_pad.packet.load(std::memory_order_acquire);
   LatNoteInputRead(out_state->packet_number);
   auto& pad = out_state->gamepad;
@@ -139,6 +140,18 @@ void XDroidGamepadDriver::SetAxis(GamepadAxis axis, float value) {
   if (changed) {
     LatNoteInputChange();
     g_pad.packet.fetch_add(1, std::memory_order_release);
+  }
+}
+
+void XDroidGamepadDriver::Snapshot(uint16_t& buttons, float axes[6]) {
+  buttons = g_pad.buttons.load(std::memory_order_relaxed);
+  for (int i = 0; i < 4; ++i) {
+    // Odd sticks are Y: back to Android's Y down.
+    axes[i] = g_pad.thumbs[i].load(std::memory_order_relaxed) /
+              ((i & 1) ? -32767.0f : 32767.0f);
+  }
+  for (int i = 0; i < 2; ++i) {
+    axes[4 + i] = g_pad.triggers[i].load(std::memory_order_relaxed) / 255.0f;
   }
 }
 

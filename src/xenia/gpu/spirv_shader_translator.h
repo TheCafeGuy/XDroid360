@@ -884,6 +884,31 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // if there's no result to store (like constants only).
   void StoreResult(const InstructionResult& result, spv::Id value);
 
+  // BLACK-H1: xdroid_relaxed_mul at StartTranslation, so one shader never
+  // mixes modes.
+  uint32_t xdroid_relaxed_mul_ = 0;
+  // Per ALU address, see XdroidGpuHooks::nonfinite_operands.
+  std::vector<uint8_t> xdroid_mul_taint_;
+  // 2 bits for the products being emitted: operand 0/1 may be inf/NaN.
+  uint32_t xdroid_mul_taint_cur_ = 3;
+  // Plain, one-compare, SM3 products (XDROID-RMUL, xdroid_relaxed_mul bit 3).
+  uint32_t xdroid_mul_counts_[3] = {};
+  void XdroidSelectMulTaint(bool scalar);
+  // SHD-2 S1: nested forward jumps as ifs (structured_jumps_), each open if
+  // as (target label, merge block), innermost last.
+  bool UsesMainSwitch() const {
+    return !current_shader().label_addresses().empty() && !structured_jumps_;
+  }
+  bool structured_jumps_ = false;
+  std::vector<std::pair<uint32_t, spv::Block*>> structured_jump_merges_;
+  // Overlapping forward jumps: guarded stretches (structured_guard_).
+  void OpenSkipGuard();
+  void CloseSkipGuard();
+  bool structured_guard_ = false;
+  spv::Block* structured_guard_merge_ = nullptr;
+  spv::Id var_skip_target_ = spv::NoResult;
+  spv::Id XdroidMinMax(spv::Op compare_op, spv::Id result_type,
+                       spv::Id bool_type, spv::Id a, spv::Id b);
   // For Shader Model 3 multiplication (+-0 or denormal * anything = +0),
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
@@ -1154,6 +1179,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replacing the texture_swizzled_signs system constant words (SpecId = word
   // index), created on first use.
   std::array<spv::Id, 8> spec_texture_swizzled_signs_;
+  spv::Id spec_texture_exp_adjust_nonzero_ = spv::NoResult;
+  spv::Id spec_texture_integer_scale_used_ = spv::NoResult;
   // SHD-1e (xdroid_shader_vfetch_spec): vertex fetch endianness per vertex
   // fetch constant (SpecId 64 + index), created on first use.
   std::array<spv::Id, 96> spec_vfetch_endian_;

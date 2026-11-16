@@ -37,6 +37,25 @@
  * thread. A dispatch thread hosts other fibers too, so this over-reports
  * rather than under-reports.
  *
+ * Exclusion (xdroid_adpf_exclude, AUDIO-H1, live, every xdroid_adpf mode
+ * except 3): the OEM appears to bind hint session members to cpus 2-4,7, where
+ * ~254% CPU of 8-9 threads queues on 4 cores; the audio producer's host thread
+ * then waits 0.7-1.9 ms in the run queue per 5.33 ms render. This thread
+ * resolves the excluded tids every 2 s (rescan on a producer move or every
+ * 10 s) and both sessions drop them, so EAS places them by demand:
+ *   1 = the "Guest CPU N" thread running the producer (guest tid from the
+ *       worker wait probe's signaler, fallback xdroid_adpf_audio_guest_tid);
+ *   2 = 1 + threads named by xdroid_adpf_exclude_threads (audio, log,
+ *       sampler: members of the app session only);
+ *   3 = 2 + keep only the 3 busiest remaining threads.
+ * App session (xdroid_adpf 0, default): written to <storage>/adpf_exclude as
+ * "pid arm tid..." (no JNI); PerfHint.kt rebuilds when the file changes and
+ * drops those tids from its 8 hottest. Native session (1/2): set_threads in
+ * place. Lookup cost: GuestThreadDispatchCpu takes emulator_mutex and the
+ * kernel global lock (GetThreadByID) every 2 s on this thread only, never in
+ * a watchdog region; only while the arm is non-zero (arm 0: one cvar read per
+ * wake, no lock, no file IO).
+ *
  * Thermal: every 2 s the 10 s headroom forecast picks a frame cap tier
  * (60/40/30; step down at once, step up after 30 s), logged and exported for
  * the adaptive frame target (P60-3). Nothing acts on it yet.
@@ -61,9 +80,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "xenia/base/cvar.h"
@@ -74,6 +96,7 @@
 #include "xenia/emulator.h"
 #include "xenia/kernel/guest_scheduler.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xdroid_wait_probe.h"
 #include "xenia/kernel/xthread.h"
 
 DEFINE_int32(xdroid_adpf, 0,
@@ -111,6 +134,17 @@ DEFINE_string(xdroid_adpf_audio_threads, "Audio Worker,XMA Decoder",
               "XDroid360");
 DEFINE_string(xdroid_adpf_threads, "Guest CPU,GPU Commands",
               "Comma-separated thread name prefixes put in the hint session.",
+              "XDroid360");
+DEFINE_int32(xdroid_adpf_exclude, 0,
+             "XDroid360 (AUDIO-H1): drop threads from the hint session, app "
+             "(xdroid_adpf 0) or native (1/2). 0 = off, 1 = the audio "
+             "producer's Guest CPU N, 2 = 1 + xdroid_adpf_exclude_threads, "
+             "3 = 2 + keep only the 3 busiest. Live.",
+             "XDroid360");
+DEFINE_string(xdroid_adpf_exclude_threads,
+              "Audio Worker,XMA Decoder,Logging Writer,xdroid-sampler",
+              "XDroid360 (AUDIO-H1): thread name prefixes xdroid_adpf_exclude "
+              ">= 2 drops from the hint session.",
               "XDroid360");
 
 namespace xdroid {
@@ -176,6 +210,8 @@ std::atomic<int> recommended_cap{0};
 
 std::mutex emulator_mutex;
 xe::Emulator* emulator_ptr = nullptr;
+// AUDIO-H1 bridge to PerfHint.kt; set once before the ADPF thread starts.
+std::filesystem::path exclude_path;
 
 // "Guest CPU N" index running guest thread `guest_tid`, or -1.
 int GuestThreadDispatchCpu(uint32_t guest_tid) {
@@ -310,6 +346,9 @@ class Adpf {
     }
     xe::threading::WakeGeneration& frames_generation =
         xe::threading::PresentFrameGeneration();
+    // A file left by a killed run never matches this pid, but drop it anyway.
+    std::error_code error;
+    std::filesystem::remove(exclude_path, error);
     while (true) {
       LogSpinSites(std::chrono::steady_clock::now());
       const int mode = cvars::xdroid_adpf;
@@ -317,6 +356,7 @@ class Adpf {
         if (mode_ != 0) {
           Stop();
         }
+        UpdateExclude(std::chrono::steady_clock::now());
         std::this_thread::sleep_for(std::chrono::seconds(1));
         continue;
       }
@@ -408,6 +448,7 @@ class Adpf {
     audio_dispatch_ = -2;
     xe::threading::SpinAccountingEnabled().store(false,
                                                  std::memory_order_relaxed);
+    exclude_dispatch_ = -2;
     threads_.clear();
     mode_ = 0;
     recommended_cap.store(0, std::memory_order_relaxed);
@@ -417,6 +458,10 @@ class Adpf {
     next_housekeeping_ = now + std::chrono::seconds(2);
     SampleThermal(now);
     UpdateAudioThreads(now);
+    // AUDIO-H1: a changed exclusion rescans at once.
+    if (UpdateExclude(now)) {
+      next_scan_ = now;
+    }
     if (now < next_scan_) {
       return;
     }
@@ -424,6 +469,9 @@ class Adpf {
     next_scan_ = now + std::chrono::seconds(5);
     std::vector<Tracked> scanned =
         ScanThreads(SplitPrefixes(cvars::xdroid_adpf_threads));
+    if (exclude_arm_ && mode_ != 3) {
+      Exclude(scanned);
+    }
     bool same = scanned.size() == threads_.size();
     for (size_t i = 0; same && i < scanned.size(); ++i) {
       same = scanned[i].tid == threads_[i].tid;
@@ -448,6 +496,117 @@ class Adpf {
       }
     }
     CloseSession();
+  }
+
+  // AUDIO-H1: resolves the excluded tids (see the file comment) at most every
+  // 2 s and mirrors them to the app's file. True when the arm or the set
+  // changed.
+  bool UpdateExclude(std::chrono::steady_clock::time_point now) {
+    const int arm = std::clamp(int(cvars::xdroid_adpf_exclude), 0, 3);
+    if ((!arm && !exclude_arm_) || now < next_exclude_) {
+      return false;
+    }
+    next_exclude_ = now + std::chrono::seconds(2);
+    int dispatch = -1;
+    if (arm) {
+      uint32_t guest = xe::kernel::xdroid_audio_watch.signaler_tid.load(
+          std::memory_order_relaxed);
+      if (!guest) {
+        guest = uint32_t(cvars::xdroid_adpf_audio_guest_tid);
+      }
+      dispatch = GuestThreadDispatchCpu(guest);
+      if (dispatch != exclude_dispatch_) {
+        XELOGI("XDROID-ADPF: exclude producer guest {} -> Guest CPU {}", guest,
+               dispatch);
+      }
+    }
+    if (arm == exclude_arm_ && dispatch == exclude_dispatch_ &&
+        now < next_exclude_scan_) {
+      return false;
+    }
+    next_exclude_scan_ = now + std::chrono::seconds(10);
+    std::vector<int32_t> tids;
+    if (arm) {
+      for (const Tracked& thread : ScanThreads(
+               arm >= 2 ? SplitPrefixes(cvars::xdroid_adpf_exclude_threads)
+                        : std::vector<std::string>(),
+               dispatch >= 0 ? "Guest CPU " + std::to_string(dispatch)
+                             : std::string())) {
+        tids.push_back(thread.tid);
+      }
+    }
+    const bool changed = arm != exclude_arm_ || tids != exclude_tids_;
+    exclude_arm_ = arm;
+    exclude_dispatch_ = dispatch;
+    exclude_tids_ = std::move(tids);
+    if (changed) {
+      WriteExcludeFile();
+    }
+    return changed;
+  }
+
+  // "pid arm tid..." + newline, or no file while the arm is 0. Written to a
+  // temp file and renamed, so PerfHint.kt never reads half a line.
+  void WriteExcludeFile() {
+    std::error_code error;
+    if (!exclude_arm_) {
+      std::filesystem::remove(exclude_path, error);
+      return;
+    }
+    std::string text =
+        std::to_string(getpid()) + " " + std::to_string(exclude_arm_);
+    for (int32_t tid : exclude_tids_) {
+      text += " " + std::to_string(tid);
+    }
+    text += "\n";
+    std::filesystem::path temp = exclude_path;
+    temp += ".tmp";
+    FILE* file = std::fopen(temp.c_str(), "we");
+    if (!file) {
+      return;
+    }
+    const bool written = std::fputs(text.c_str(), file) >= 0;
+    if (std::fclose(file) == 0 && written) {
+      std::filesystem::rename(temp, exclude_path, error);
+    }
+  }
+
+  // Native session: drop the excluded tids; arm 3 also keeps only the 3
+  // threads with the most CPU since the last scan (ranked over all
+  // candidates, so a dropped thread can come back).
+  void Exclude(std::vector<Tracked>& scanned) {
+    std::erase_if(scanned, [&](const Tracked& thread) {
+      return std::find(exclude_tids_.begin(), exclude_tids_.end(),
+                       thread.tid) != exclude_tids_.end();
+    });
+    if (exclude_arm_ < 3) {
+      cap_cpu_.clear();
+      return;
+    }
+    std::vector<std::pair<int32_t, uint64_t>> cpu_now;
+    std::vector<std::pair<uint64_t, int32_t>> busy;
+    for (const Tracked& thread : scanned) {
+      uint64_t cpu = 0, last = 0;
+      ThreadCpuNs(thread.tid, cpu);
+      for (const auto& [tid, ns] : cap_cpu_) {
+        if (tid == thread.tid) {
+          last = ns;
+        }
+      }
+      cpu_now.emplace_back(thread.tid, cpu);
+      busy.emplace_back(cpu - std::min(cpu, last), thread.tid);
+    }
+    cap_cpu_ = std::move(cpu_now);
+    if (busy.size() <= 3) {
+      return;
+    }
+    std::partial_sort(busy.begin(), busy.begin() + 3, busy.end(),
+                      std::greater<>());
+    std::erase_if(scanned, [&](const Tracked& thread) {
+      return std::none_of(busy.begin(), busy.begin() + 3, [&](const auto& b) {
+        return b.second == thread.tid;
+      });
+    });
   }
 
   void OnWake(std::chrono::steady_clock::time_point now) {
@@ -903,6 +1062,12 @@ class Adpf {
   HintSession* audio_session_ = nullptr;
   std::vector<Tracked> audio_threads_;
   int audio_dispatch_ = -2;
+  int exclude_arm_ = 0;
+  int exclude_dispatch_ = -2;
+  std::vector<int32_t> exclude_tids_;
+  std::chrono::steady_clock::time_point next_exclude_;
+  std::chrono::steady_clock::time_point next_exclude_scan_;
+  std::vector<std::pair<int32_t, uint64_t>> cap_cpu_;
   int64_t audio_target_ns_ = 0;
   std::chrono::steady_clock::time_point audio_last_;
   std::chrono::steady_clock::time_point next_audio_scan_;
@@ -914,9 +1079,10 @@ class Adpf {
 
 }  // namespace
 
-void StartAdpf() {
+void StartAdpf(const std::filesystem::path& storage_root) {
   static std::once_flag started;
-  std::call_once(started, [] {
+  std::call_once(started, [&] {
+    exclude_path = storage_root / "adpf_exclude";
     std::thread([] {
       Adpf adpf;
       adpf.Run();

@@ -28,4 +28,18 @@ class LiveFile(private val file: File) {
       }
       .toMap()
   }
+
+  /** Replaces the whole file with [lines]. */
+  fun write(vararg lines: String) = file.replaceWith(lines.joinToString("\n", postfix = "\n"))
 }
+
+/** Writes a sibling temp file, then renames it over this one: no reader sees half of it. */
+fun File.replaceWith(text: String) =
+  runCatching {
+      val tmp = File("$path.app")  // Not .tmp: the PC viewer writes live.toml.tmp.
+      tmp.writeText(text)
+      check(tmp.renameTo(this))
+    }
+    .isSuccess
+
+fun ByteArray.hex() = joinToString("") { "%02x".format(it) }

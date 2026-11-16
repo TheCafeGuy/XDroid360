@@ -76,13 +76,16 @@ namespace xe {
 namespace ui {
 
 std::atomic<void (*)()> g_xdroid_on_present{nullptr};
+std::atomic<bool> g_xdroid_blank_local{false};
 
 namespace vulkan {
 
 namespace {
-// Cvars read when the swapchain is created; a live change recreates it.
-uint32_t GetSwapchainCreationCvars() {
-  return uint32_t(cvars::present_prerotate) |
+// Cvars (and the guest output height floor) read when the swapchain is
+// created; a live change recreates it.
+uint64_t GetSwapchainCreationCvars(uint32_t guest_output_height_floor) {
+  return uint64_t(guest_output_height_floor) << 23 |
+         uint32_t(cvars::present_prerotate) |
          (uint32_t(cvars::vulkan_allow_present_mode_immediate) << 1) |
          (uint32_t(cvars::vulkan_allow_present_mode_mailbox) << 2) |
          (uint32_t(cvars::vulkan_allow_present_mode_fifo_relaxed) << 3) |
@@ -297,6 +300,27 @@ Surface::TypeFlags VulkanPresenter::GetSupportedSurfaceTypes() const {
   }
   return GetSurfaceTypesSupportedByInstance(
       vulkan_device_->vulkan_instance()->extensions());
+}
+
+bool VulkanPresenter::AcquireGuestOutputForCopy(
+    VkImage& image_out, VkExtent2D& extent_out, uint64_t& serial_out,
+    std::shared_ptr<void>& keep_alive_out) {
+  uint32_t mailbox_index;
+  std::unique_lock<std::mutex> consumer_lock(
+      ConsumeGuestOutput(mailbox_index, nullptr, nullptr));
+  if (mailbox_index == UINT32_MAX) {
+    return false;
+  }
+  const GuestOutputImageInstance& instance =
+      guest_output_images_[mailbox_index];
+  if (!instance.image || !instance.ever_successfully_refreshed) {
+    return false;
+  }
+  image_out = instance.image->image();
+  extent_out = instance.image->extent();
+  serial_out = instance.last_refresher_submission;
+  keep_alive_out = instance.image;
+  return true;
 }
 
 bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
@@ -945,7 +969,8 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(
     paint_context_.DestroySwapchainAndVulkanSurface();
     return SurfacePaintConnectResult::kFailure;
   }
-  paint_context_.swapchain_creation_cvars = GetSwapchainCreationCvars();
+  paint_context_.swapchain_creation_cvars = GetSwapchainCreationCvars(
+      guest_output_height_floor_.load(std::memory_order_relaxed));
 
   // Create per-swapchain-image present semaphores to avoid
   // VUID-vkQueueSubmit-pSignalSemaphores-00067 (semaphore reuse before the
@@ -1638,7 +1663,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
   const VkDevice device = vulkan_device_->device();
 
   // A swapchain creation cvar changed live (on-device A/B): recreate.
-  if (paint_context_.swapchain_creation_cvars != GetSwapchainCreationCvars()) {
+  if (paint_context_.swapchain_creation_cvars !=
+      GetSwapchainCreationCvars(
+          guest_output_height_floor_.load(std::memory_order_relaxed))) {
     return PaintResult::kNotPresentedConnectionOutdated;
   }
 
@@ -1790,6 +1817,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(
     // the consumer critical section now as everything here either will be using
     // the new reference or is exclusively owned by main target painting (and
     // multiple threads can't paint the main target at the same time).
+  }
+  if (g_xdroid_blank_local.load(std::memory_order_relaxed)) {
+    guest_output_image.reset();
   }
 
   if (guest_output_image) {

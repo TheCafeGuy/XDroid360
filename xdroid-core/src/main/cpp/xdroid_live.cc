@@ -8,24 +8,27 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
-#include <vector>
 
 #include "xdroid_audio_driver.h"
 #include "xdroid_events.h"
 #include "xdroid_latency.h"
-#include "xdroid_gamepad.h"
+#include "xdroid_mirror.h"
+#include "xdroid_pad_script.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/gpu/trace_writer.h"
 #include "xenia/gpu/xdroid_gpu_hooks.h"
+#include "xenia/cpu/xex_module.h"
+#include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/user_module.h"
+#include "xenia/memory.h"
 
 DECLARE_bool(xdroid_diagnostics);
 DECLARE_path(trace_gpu_prefix);
@@ -51,14 +54,20 @@ constexpr std::string_view kLiveCvars[] = {
     "guest_spin_park_gpu_pct",
     "guest_spin_park_hints",
     "guest_spin_park_timeout_us",
+    "guest_spin_wfe",
     "xdroid_stall_inject_every_s",
     "xdroid_stall_inject_ms",
     "xdroid_glitch_recorder",
+    "xdroid_gpu_sanity",
+    "ac6_resource_miss_log",
     "vulkan_direct_resolve_transient_dest",
     "vulkan_direct_resolve_post_barrier",
     "xdroid_direct_resolve_average",
+    "xdroid_direct_resolve_average_2x",
     "xdroid_direct_resolve_read_as_1x",
     "xdroid_tex_link",
+    "xdroid_samples_as_pixels",
+    "force_convert_quad_lists_to_triangle_lists",
     "vulkan_direct_resolve_pre_barrier",
     "vulkan_direct_resolve_transient_depth",
     "xdroid_depth_read_repeat",
@@ -75,19 +84,32 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_cp_defer_to_swap_us",
     "xdroid_lat_trace",
     "xdroid_lat_meter",
+    "xdroid_jit_frame",
+    "xdroid_jit_frame_margin_us",
+    "xdroid_jit_frame_max_us",
     "xdroid_vfetch_reupload_max_kb",
     "xdroid_draw_blackbox",
-    "xdroid_cp_ib_kick_hash",
-    "xdroid_cp_snapshot_ib",
+    "xdroid_write_probe_first",
+    "xdroid_write_probe_last",
     "ac6_hud_slot_join",
     "ac6_hud_slot_join_us",
+    "xdroid_cp_defer_yield_hud",
     "xdroid_job_tracer",
+    "apu_queue_bursts",
+    "apu_queue_max_frames",
     "xdroid_audio_conceal",
+    "xdroid_audio_loudness_guard",
     "xdroid_audio_worker_nice",
+    "xdroid_wait_block_contended",
     "xdroid_audio_producer_nice",
     "xdroid_audio_drc_ppm",
     "xdroid_audio_route_watch",
     "xdroid_audio_producer_boost",
+    "xdroid_pulse_multi_waiters",
+    // Only its per-use readers follow live (AUDIO-H4 audio forensics, event
+    // auto marks, clip requests); the boot-time DiagnosticsOn/Off override
+    // and the stream-open clip ring stay as set at boot.
+    "xdroid_diagnostics",
     "xdroid_adpf",
     "xdroid_adpf_target_pct",
     "xdroid_adpf_power_efficiency",
@@ -95,6 +117,7 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_adpf_audio_guest_tid",
     "xdroid_adpf_audio_period_us",
     "xdroid_adpf_audio_target_pct",
+    "xdroid_adpf_exclude",
     "xdroid_time_coupling",
     "readback_resolve",
     "xdroid_time_coupling_slow_pct",
@@ -115,6 +138,16 @@ constexpr std::string_view kLiveCvars[] = {
     "xdroid_async_textured_wait_ms",
     "xdroid_async_textured_skip",
     "xdroid_gpu_trace_frames",
+    "xdroid_mirror",
+    "xdroid_mirror_port",
+    "xdroid_mirror_height",
+    "xdroid_mirror_kbps",
+    "xdroid_mirror_codec",
+    "xdroid_mirror_bitrate_mode",
+    "xdroid_mirror_intra_refresh",
+    "xdroid_mirror_key_interval",
+    "xdroid_mirror_input",
+    "xdroid_mirror_audio",
 };
 
 bool IsLiveCvar(std::string_view name) {
@@ -126,87 +159,8 @@ bool IsLiveCvar(std::string_view name) {
   return false;
 }
 
-// Virtual pad for unattended runs (IS-2): `pad = "A+DPAD_DOWN:150"` holds the
-// buttons (and `LX=-1`-style axis values) for the given milliseconds, then
-// releases them, on its own thread. The host changes another key along with
-// it (a sequence number) so that repeating a press still changes the file.
-struct PadName {
-  std::string_view name;
-  uint16_t mask;
-};
-constexpr PadName kPadButtons[] = {
-    {"DPAD_UP", 0x0001}, {"DPAD_DOWN", 0x0002}, {"DPAD_LEFT", 0x0004},
-    {"DPAD_RIGHT", 0x0008}, {"START", 0x0010},  {"BACK", 0x0020},
-    {"LTHUMB", 0x0040},  {"RTHUMB", 0x0080},     {"LB", 0x0100},
-    {"RB", 0x0200},      {"A", 0x1000},          {"B", 0x2000},
-    {"X", 0x4000},       {"Y", 0x8000},
-};
-struct PadAxisName {
-  std::string_view name;
-  GamepadAxis axis;
-};
-constexpr PadAxisName kPadAxes[] = {
-    {"LX", GamepadAxis::kLeftX},       {"LY", GamepadAxis::kLeftY},
-    {"RX", GamepadAxis::kRightX},      {"RY", GamepadAxis::kRightY},
-    {"LT", GamepadAxis::kLeftTrigger}, {"RT", GamepadAxis::kRightTrigger},
-};
-
-void ApplyPad(const std::string& text) {
-  std::string_view spec(text);
-  uint32_t hold_ms = 120;
-  if (size_t colon = spec.find(':'); colon != std::string_view::npos) {
-    hold_ms = uint32_t(std::strtoul(std::string(spec.substr(colon + 1)).c_str(),
-                                    nullptr, 10));
-    spec = spec.substr(0, colon);
-  }
-  uint16_t mask = 0;
-  std::vector<std::pair<GamepadAxis, float>> axes;
-  while (!spec.empty()) {
-    size_t plus = spec.find('+');
-    std::string_view token = spec.substr(0, plus);
-    spec = plus == std::string_view::npos ? std::string_view()
-                                          : spec.substr(plus + 1);
-    size_t equals = token.find('=');
-    bool known = false;
-    if (equals != std::string_view::npos) {
-      for (const PadAxisName& axis : kPadAxes) {
-        if (axis.name == token.substr(0, equals)) {
-          axes.emplace_back(axis.axis,
-                            std::strtof(std::string(token.substr(equals + 1))
-                                            .c_str(),
-                                        nullptr));
-          known = true;
-        }
-      }
-    } else {
-      for (const PadName& button : kPadButtons) {
-        if (button.name == token) {
-          mask |= button.mask;
-          known = true;
-        }
-      }
-    }
-    if (!known) {
-      XELOGW("XDroid360: live pad: unknown input '{}'", token);
-    }
-  }
-  XELOGI("XDroid360: live pad {} for {} ms", text, hold_ms);
-  std::thread([mask, axes, hold_ms] {
-    for (const auto& [axis, value] : axes) {
-      XDroidGamepadDriver::SetAxis(axis, value);
-    }
-    if (mask) {
-      XDroidGamepadDriver::SetButton(mask, true);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
-    if (mask) {
-      XDroidGamepadDriver::SetButton(mask, false);
-    }
-    for (const auto& [axis, value] : axes) {
-      XDroidGamepadDriver::SetAxis(axis, 0.0f);
-    }
-  }).detach();
-}
+// Set once by StartLiveConfig, before any live key is applied.
+std::filesystem::path g_storage_root;
 
 // By node type: value<bool>() also converts integers (2 printed as "true").
 std::string NodeText(const toml::node& node) {
@@ -225,6 +179,57 @@ std::string NodeText(const toml::node& node) {
   return "?";
 }
 
+// Forensic: guest_dump = "calls:ADDR" lists the call sites of a function;
+// guest_dump = "ADDR:BYTES" (hex address) logs the title's code as
+// big-endian words, to read a hot guest function the sampler names.
+void DumpGuestCode(const std::string& spec) {
+  unsigned address = 0, bytes = 0;
+  auto* kernel_state = xe::kernel::KernelState::shared();
+  auto module = kernel_state ? kernel_state->GetExecutableModule() : nullptr;
+  const xe::cpu::XexModule* xex = module ? module->xex_module() : nullptr;
+  // "calls:ADDR" lists the bl instructions that call ADDR instead.
+  unsigned target = 0;
+  if (xex && std::sscanf(spec.c_str(), "calls:%x", &target) == 1) {
+    const uint8_t* membase = kernel_state->memory()->virtual_membase();
+    std::string sites;
+    unsigned count = 0;
+    for (unsigned site = xex->code_low_address();
+         site < xex->code_high_address(); site += 4) {
+      if (xe::load_and_swap<uint32_t>(membase + site) ==
+          (0x48000001u | ((target - site) & 0x03FFFFFCu))) {
+        char word[10];
+        std::snprintf(word, sizeof(word), " %08X", site);
+        sites += word;
+        if (!(++count % 12)) {
+          XELOGI("XDROID-GCODE calls {:08X}:{}", target, sites);
+          sites.clear();
+        }
+      }
+    }
+    XELOGI("XDROID-GCODE calls {:08X}:{} ({} sites)", target, sites, count);
+    return;
+  }
+  if (!xex || std::sscanf(spec.c_str(), "%x:%u", &address, &bytes) != 2 ||
+      address < xex->code_low_address() ||
+      address >= xex->code_high_address()) {
+    XELOGW("XDroid360: guest_dump {}: not in the title's code", spec);
+    return;
+  }
+  address &= ~3u;
+  bytes = std::min(bytes, std::min(8192u, xex->code_high_address() - address));
+  const uint8_t* membase = kernel_state->memory()->virtual_membase();
+  for (unsigned offset = 0; offset < bytes; offset += 32) {
+    std::string line;
+    for (unsigned i = offset; i < std::min(offset + 32, bytes); i += 4) {
+      char word[10];
+      std::snprintf(word, sizeof(word), " %08X",
+                    xe::load_and_swap<uint32_t>(membase + address + i));
+      line += word;
+    }
+    XELOGI("XDROID-GCODE {:08X}:{}", address + offset, line);
+  }
+}
+
 void ApplyTable(const toml::table& table) {
   for (auto&& [key, node] : table) {
     if (const toml::table* subtable = node.as_table()) {
@@ -233,22 +238,42 @@ void ApplyTable(const toml::table& table) {
       continue;
     }
     const std::string name(key.str());
-    if (name == "pad") {
-      ApplyPad(NodeText(node));
+    if (ApplyPadKey(g_storage_root, name, NodeText(node))) {
+      continue;
+    }
+    if (name == "xdroid_mirror_token") {  // Secret: never logged.
+      MirrorSetToken(NodeText(node));
+      continue;
+    }
+    if (MirrorSetString(name, NodeText(node))) {
+      XELOGI("XDroid360: live {} = {}", name, NodeText(node));
+      continue;
+    }
+    if (name == "guest_dump") {
+      DumpGuestCode(NodeText(node));
       continue;
     }
     cvar::IConfigVar* config_var = nullptr;
-    if (cvar::ConfigVars && IsLiveCvar(name)) {
+    if (cvar::ConfigVars) {
       auto it = cvar::ConfigVars->find(name);
       if (it != cvar::ConfigVars->end()) {
         config_var = it->second;
       }
     }
-    if (config_var) {
+    if (config_var && IsLiveCvar(name)) {
       // Plain stores to word-sized cvars that other threads read without
       // synchronization: they see either value, which is all a switch needs.
-      config_var->LoadConfigValue(&node);
+      // Into the game-config layer, which SaveConfig never writes: a test
+      // toggle ends with the session instead of staying in the user's config
+      // (an averaging A/B left xdroid_direct_resolve_average on for two days
+      // and hung the GPU twice in mission 6, 2026-11-14).
+      config_var->LoadGameConfigValue(&node);
       XELOGI("XDroid360: live cvar {} = {}", name, NodeText(node));
+    } else if (config_var) {
+      // A real cvar outside kLiveCvars only changes after a restart: say so
+      // loudly, or an A/B on it compares two identical arms (gsr2-sab).
+      XELOGW("XDroid360: live key {} = {} IGNORED: restart-only cvar", name,
+             NodeText(node));
     } else {
       XELOGI("XDroid360: live marker {} = {}", name, NodeText(node));
     }
@@ -260,8 +285,8 @@ void ApplyTable(const toml::table& table) {
 // saves the audio, both about 1 s after the mark so the clip also holds what
 // followed it.
 void PollClipRequest(const std::filesystem::path& storage_root,
-                     uint64_t& pending, std::chrono::steady_clock::time_point&
-                                            due) {
+                     uint64_t& pending,
+                     std::chrono::steady_clock::time_point& due) {
   std::error_code error;
   const std::filesystem::path request = storage_root / "clip.req";
   // EVT-0: an automatic mark from a detector event, saved like a user mark
@@ -346,8 +371,9 @@ void PollTraceCapture(const std::filesystem::path& storage_root) {
   XELOGI("XDROID-BENCH: capturing frames {}-{} into {}", frame, end_frame,
          dir.string());
 #else
-  XELOGW("XDROID-BENCH: this build has no trace writer "
-         "(XENIA_ENABLE_GPU_TRACE off); capture ignored");
+  XELOGW(
+      "XDROID-BENCH: this build has no trace writer "
+      "(XENIA_ENABLE_GPU_TRACE off); capture ignored");
   cvars::xdroid_gpu_trace_frames = 0;
 #endif
 }
@@ -393,17 +419,31 @@ void PollLoop(std::filesystem::path path) {
 
 }  // namespace
 
+void ApplyLiveText(const std::string& text) {
+  try {
+    ApplyTable(toml::parse(text));
+  } catch (const toml::parse_error& e) {
+    XELOGW("XDroid360: live text not parsed: {}", e.what());
+  }
+}
+
 void SetLiveGraphicsSystem(xe::gpu::GraphicsSystem* graphics_system) {
   g_graphics_system.store(graphics_system, std::memory_order_release);
+}
+
+xe::gpu::GraphicsSystem* GetLiveGraphicsSystem() {
+  return g_graphics_system.load(std::memory_order_acquire);
 }
 
 void StartLiveConfig(const std::filesystem::path& path) {
   static std::once_flag started;
   std::call_once(started, [&path] {
+    g_storage_root = path.parent_path();
     std::error_code error;
     std::filesystem::remove(path, error);
     InstallEventBus();
     InstallLatencyMeter();
+    InstallMirror();
     // Detached: it only sleeps and touches cvars, and lives as long as the
     // process.
     std::thread(PollLoop, path).detach();

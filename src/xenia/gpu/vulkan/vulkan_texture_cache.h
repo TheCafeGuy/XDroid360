@@ -48,6 +48,9 @@ class VulkanTextureCache final : public TextureCache {
       // Force the border color alpha to 1.0 (only meaningful with a border
       // clamp mode).
       uint32_t force_bc_w_to_max : 1;  // 23
+      // TEX-1c: last level to sample when the host texture holds more levels
+      // than the fetch constant names (0 = no clamp).
+      uint32_t mip_max_level : 4;  // 27
       // Maximum mip level is in the texture resource itself, but mip_base_map
       // limits fetching to mip_min_level (level 0 when the base is available).
     };
@@ -106,20 +109,44 @@ class VulkanTextureCache final : public TextureCache {
     return shared_memory_persistent_descriptor_set_;
   }
 
-  // TEX-1b (xdroid_tex_link). Whether this direct resolve writes the whole of
-  // a texture that was sampled last frame and whose load is a pure bit copy,
-  // so the resolve can also store its pixels linearly for a copy into the
-  // image; remembers it as the pending link. spliced: the resolve is recorded
-  // before the open guest pass (GE-4).
+  // TEX-1b / TEX-1c (xdroid_tex_link, xdroid_tex_link_mips). Whether this
+  // direct resolve writes the whole of a level of textures that were sampled
+  // last frame and whose load is a pure bit copy, so the resolve can also
+  // store its pixels linearly for a copy into their images; remembers them as
+  // the pending link. spliced: the resolve is recorded before the open guest
+  // pass (GE-4).
   bool BeginResolveLink(const draw_util::ResolveInfo& resolve_info,
                         bool spliced);
-  // Copies the resolve's linear pixels (pitch_pixels wide, rows tall, after
-  // the caller's compute write -> transfer read barrier) into the pending
-  // link's image.
+  // Copies the resolve's pixels (pitch_pixels wide, rows tall) into the
+  // pending link's images: from buffer, linear (after the caller's compute
+  // write -> transfer read barrier), or, TEX-1d, from src_image at (src_x,
+  // src_y), a render target the caller moved to TRANSFER_SRC_OPTIMAL.
   void RecordResolveLinkCopy(VkBuffer buffer, uint32_t pitch_pixels,
-                             uint32_t rows, bool spliced);
-  // After MarkRangeAsResolved: marks the pending link's texture current if
-  // the copy was recorded, and drops the pending link either way.
+                             uint32_t rows, bool spliced,
+                             VkImage src_image = VK_NULL_HANDLE,
+                             uint32_t src_x = 0, uint32_t src_y = 0);
+  // TEX-1d: the render target cache dropped the pending link after
+  // BeginResolveLink (reason 9 in the XDROID-TEXLINK line).
+  void NoteResolveLinkDropped() {
+    resolve_link_rejects_ += resolve_link_target_count_;
+    resolve_link_reject_counts_[9] += resolve_link_target_count_;
+  }
+  // TEX-1d (xdroid_tex_link_mips bit 3): 0 = copied image to image, else the
+  // first cause it was not (img and img_no in the XDROID-TEXLINK line).
+  void NoteResolveLinkImageCopy(uint32_t cause) {
+    ++resolve_link_image_counts_[cause];
+  }
+  // TEX-1d: whether every image of the pending link has this format.
+  bool ResolveLinkTargetsHaveFormat(VkFormat format) const {
+    for (uint32_t i = 0; i < resolve_link_target_count_; ++i) {
+      if (resolve_link_targets_[i].format != format) {
+        return false;
+      }
+    }
+    return true;
+  }
+  // After MarkRangeAsResolved: marks the pending link's levels current if the
+  // copy was recorded, and drops the pending link either way.
   void EndResolveLink(bool copied);
 
   // Fetch constants whose host image views have changed since the bits were
@@ -454,13 +481,37 @@ class VulkanTextureCache final : public TextureCache {
                             VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
 
-  // TEX-1b: the texture between BeginResolveLink and EndResolveLink, and the
+  // TEX-1b/1c: the levels between BeginResolveLink and EndResolveLink, and the
   // XDROID-TEXLINK counters.
-  VulkanTexture* resolve_link_texture_ = nullptr;
+  struct ResolveLinkTarget {
+    VulkanTexture* texture;
+    uint32_t level;
+    // TEX-1d: where a partial link's rectangle starts in the level (else 0),
+    // and the image's format.
+    uint32_t x, y;
+    VkFormat format;
+    bool partial;
+    // kb in XDROID-TEXLINK: the level's extent, or the partial rectangle's
+    // texels.
+    uint32_t bytes;
+  };
+  ResolveLinkTarget resolve_link_targets_[8];
+  uint32_t resolve_link_target_count_ = 0;
   uint64_t resolve_link_summary_frame_ = 0;
   uint64_t resolve_links_ = 0;
+  uint64_t resolve_link_mips_ = 0;
   uint64_t resolve_link_bytes_ = 0;
   uint64_t resolve_link_unwatched_ = 0;
+  uint64_t resolve_link_rejects_ = 0;
+  uint64_t resolve_link_partials_ = 0;
+  // By reason (1 to 9), for the summary line.
+  uint32_t resolve_link_reject_counts_[10] = {};
+  // TEX-1d image copies: [0] done, [1 to 6] not done, by cause.
+  uint32_t resolve_link_image_counts_[7] = {};
+  // One XDROID-TEXLINK reject line per (reason, level, address), the first
+  // 64.
+  uint64_t resolve_link_reject_seen_[64] = {};
+  uint32_t resolve_link_reject_seen_count_ = 0;
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 

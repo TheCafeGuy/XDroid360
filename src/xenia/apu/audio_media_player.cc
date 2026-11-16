@@ -557,8 +557,10 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
   }
 
   if (!driver_->Initialize()) {
-    driver_semaphore_.reset();
+    // Shut the driver down before freeing the semaphore its callback
+    // releases (use after free). Idea: Xendroid+ (phforner0) 017ccf748.
     driver_->Shutdown();
+    driver_semaphore_.reset();
     driver_.reset();
     return false;
   }
@@ -569,11 +571,9 @@ bool AudioMediaPlayer::SetupDriver(uint32_t sample_rate, uint32_t channels) {
 void AudioMediaPlayer::DeleteDriver() {
   std::unique_lock<xe_mutex> guard(driver_mutex_);
   if (driver_) {
-    if (driver_semaphore_) {
-      driver_semaphore_.reset();
-    }
-
+    // Shut the driver down first: its callback releases driver_semaphore_.
     driver_->Shutdown();
+    driver_semaphore_.reset();
     driver_.reset();
   }
 }

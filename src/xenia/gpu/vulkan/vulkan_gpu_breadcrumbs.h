@@ -115,8 +115,8 @@ class VulkanGpuBreadcrumbs {
     uint32_t detail_count;
     uint32_t detail[kWorkDetailWords];
   };
-  // Direct resolve dispatches per pipeline key, to weigh the variant a hang
-  // stops in against how often it runs.
+  // Direct resolve and render target dump dispatches per pipeline key, to
+  // weigh the variant a hang stops in against how often it runs.
   struct VariantCount {
     uint32_t pipeline_key;
     uint32_t count;
@@ -152,6 +152,7 @@ class VulkanGpuBreadcrumbs {
   std::vector<DrawRecord> draws_;
   std::vector<WorkRecord> works_;
   VariantCount direct_resolve_variants_[kVariantCountSlots] = {};
+  VariantCount dump_variants_[kVariantCountSlots] = {};
 };
 
 }  // namespace vulkan

@@ -16,6 +16,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/xxhash.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 
 namespace xe {
 namespace gpu {
@@ -467,9 +468,20 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
 
   SCOPE_profile_cpu_f("gpu");
 
-  if (draw_read_marking_serial_) {
-    MarkDrawRead(start, length);
-  }
+  // GE-4: the pages get this draw's serial on the way out, after any upload
+  // below. Marking first replaced the serial an earlier draw of the open pass
+  // had left on them, so UploadRanges never saw that draw and spliced the
+  // copy ahead of it: the earlier draw then read the bytes the guest wrote
+  // for a later one (one-frame garbage geometry in flight).
+  struct MarkOnExit {
+    SharedMemory& shared_memory;
+    uint32_t start, length;
+    ~MarkOnExit() {
+      if (shared_memory.draw_read_marking_serial_) {
+        shared_memory.MarkDrawRead(start, length);
+      }
+    }
+  } mark_on_exit{*this, start, length};
 
   if (!EnsureHostGpuMemoryAllocated(start, length)) {
     return false;
@@ -717,6 +729,11 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_last = page_last >> 6;
 
   auto global_lock = global_critical_region_.Acquire();
+
+  if (auto on_guest_write =
+          GetXdroidGpuHooks().on_guest_write.load(std::memory_order_relaxed)) {
+    on_guest_write(physical_address_start);
+  }
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be

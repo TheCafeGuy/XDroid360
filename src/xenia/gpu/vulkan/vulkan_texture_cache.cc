@@ -39,6 +39,12 @@ DEFINE_bool(
     "(Adreno), where the copy is faster.",
     "Vulkan");
 
+DEFINE_bool(xdroid_texload_coalesced, false,
+            "A5: untile 32-bit-per-block textures with the 4 threads of a "
+            "group on interleaved 4-block chunks, so each 16-byte access of "
+            "the group covers whole cache lines. Same output. Boot only.",
+            "GPU");
+
 DEFINE_bool(xdroid_tex_link, false,
             "TEX-1b: a direct resolve that writes a whole texture sampled in "
             "the previous frame also stores its pixels linearly and copies "
@@ -59,6 +65,7 @@ namespace shaders {
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_128bpb_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_16bpb_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_16bpb_scaled_cs.h"
+#include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_coalesced_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_32bpb_scaled_cs.h"
 #include "xenia/gpu/shaders/bytecode/vulkan_spirv/texture_load_64bpb_cs.h"
@@ -754,6 +761,12 @@ VulkanTextureCache::SamplerParameters VulkanTextureCache::GetSamplerParameters(
     mip_min_level = 0;
   }
   parameters.mip_min_level = mip_min_level;
+  // TEX-1c: the bound host texture may hold more levels than this fetch
+  // constant names (one texture per mip chain), so the constant's last level
+  // limits the LOD. Taken from the constant alone: samplers are gathered
+  // before RequestTextures binds the draw's textures.
+  parameters.mip_max_level =
+      (link_mips_ & 2) && !parameters.mip_base_map ? mip_max_level : 0;
   bool has_mips = mip_max_level > mip_min_level;
   // Apply anisotropic override, but only for mipmapped textures
   // that are already using bilinear/trilinear filtering.
@@ -922,7 +935,9 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters,
     assert_false(parameters.mip_linear);
     sampler_create_info.maxLod = sampler_create_info.minLod + 0.25f;
   } else {
-    sampler_create_info.maxLod = VK_LOD_CLAMP_NONE;
+    sampler_create_info.maxLod = parameters.mip_max_level
+                                     ? float(parameters.mip_max_level)
+                                     : VK_LOD_CLAMP_NONE;
   }
   // The two YCbCr border colors are not expressible as fixed Vulkan border
   // color enums. Use a custom border color when supported, otherwise fall back
@@ -1140,6 +1155,7 @@ uint32_t VulkanTextureCache::GetMaxHostTextureDepthOrArraySize(
 std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
     TextureKey key) {
   SCOPE_profile_cpu_f("gpu");
+  XdroidLazyTimer xdroid_lazy(XdroidLazyKind::kTexture);
   VkFormat formats[] = {VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
   const HostFormatPair& host_format = GetHostFormatPair(key);
   if (host_format.format_signed.format == VK_FORMAT_UNDEFINED) {
@@ -1241,137 +1257,314 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(
 
 bool VulkanTextureCache::BeginResolveLink(
     const draw_util::ResolveInfo& resolve_info, bool spliced) {
-  resolve_link_texture_ = nullptr;
+  resolve_link_target_count_ = 0;
   if (!cvars::xdroid_tex_link || IsDrawResolutionScaled()) {
     return false;
   }
-  uint32_t start = resolve_info.copy_dest_extent_start;
-  if (!resolve_info.copy_dest_extent_length || (start & 0xFFF) ||
-      resolve_info.copy_dest_base != start) {
-    return false;
-  }
-  Texture* candidate = GetResolveLinkCandidate(start >> 12);
-  if (!candidate) {
-    return false;
-  }
-  VulkanTexture& texture = static_cast<VulkanTexture&>(*candidate);
-  const TextureKey& key = texture.key();
   const draw_util::ResolveCopyDestCoordinateInfo& dest_coordinate_info =
       resolve_info.copy_dest_coordinate_info;
   const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
-  // The resolve's texels are the texture's texels, all of them: same tiled
-  // addressing (base, pitch, height), same bits (format, endian), and a
-  // rectangle covering the texture. Only textures someone still samples.
-  if (dest_coordinate_info.offset_x_div_8 ||
-      dest_coordinate_info.offset_y_div_8 || dest_info.copy_dest_array ||
-      dest_coordinate_info.pitch_aligned_div_32 != key.pitch ||
-      dest_coordinate_info.height_aligned_div_32 !=
-          (key.GetHeight() + 31) / 32 ||
-      uint32_t(dest_info.copy_dest_format) != uint32_t(key.format) ||
-      uint32_t(dest_info.copy_dest_endian) != uint32_t(key.endianness) ||
-      resolve_info.copy_dest_extent_length < texture.GetGuestBaseSize() ||
-      resolve_info.coordinate_info.width_div_8 * 8 < key.GetWidth() ||
-      resolve_info.height_div_8 * 8 < key.GetHeight() ||
-      !texture.ever_loaded() || texture.sample_frame() + 1 < probe_frame()) {
+  // dest_base is the tile the rectangle starts in; the rectangle may start
+  // inside it (a level in a packed mip tail).
+  uint32_t dest_base = resolve_info.copy_dest_base;
+  uint32_t start = resolve_info.copy_dest_extent_start;
+  uint32_t length = resolve_info.copy_dest_extent_length;
+  if (!length || (dest_base & 0xFFF) || start < dest_base ||
+      dest_info.copy_dest_array) {
     return false;
   }
-  // A load that only detiles and endian-swaps 32-bit blocks, so the bits
-  // before the resolve's endian swap are what the load would produce.
-  const HostFormatPair& host_format_pair = GetHostFormatPair(key);
-  bool host_format_is_signed;
-  if (IsSignedVersionSeparateForFormat(key)) {
-    host_format_is_signed = bool(key.signed_separate);
-  } else {
-    host_format_is_signed =
-        host_format_pair.format_unsigned.load_shader == kLoadShaderIndexUnknown;
+  uint32_t width = resolve_info.coordinate_info.width_div_8 << 3;
+  uint32_t height = resolve_info.height_div_8 << 3;
+  uint32_t offset_x = dest_coordinate_info.offset_x_div_8 << 3;
+  uint32_t offset_y = dest_coordinate_info.offset_y_div_8 << 3;
+  uint32_t pitch_div_32 = dest_coordinate_info.pitch_aligned_div_32;
+  bool link_mips = (link_mips_ & 1) != 0;
+  // TEX-1d (bit 4): a rectangle that is part of a level-0 base, such as one
+  // half of it, links into that part. Its first page may be inside a base
+  // that starts on an earlier page: the 8 nearest bases are checked (a mip
+  // level there never matches but counts, so the walk stays short).
+  bool link_partial = (link_mips_ & 16) != 0;
+  uint32_t page = dest_base >> 12, earlier = 0;
+  auto candidates = GetResolveLinkCandidates(page);
+  for (auto it = candidates.second; it != candidates.first;) {
+    --it;
+    uint32_t index = page - it->first;
+    if (index && (!link_partial || ++earlier > 8)) {
+      break;
+    }
+    VulkanTexture& texture = static_cast<VulkanTexture&>(*it->second.texture);
+    uint32_t level = it->second.level;
+    const TextureKey& key = texture.key();
+    // Only textures someone still samples; without TEX-1c only textures that
+    // are one level.
+    if (!texture.ever_loaded() || texture.sample_frame() + 1 < probe_frame() ||
+        (!link_mips && (level || key.mip_max_level || key.packed_mips))) {
+      continue;
+    }
+    const texture_util::TextureGuestLayout& layout = texture.guest_layout();
+    const texture_util::TextureGuestLayout::Level& level_layout =
+        level ? layout.mips[level] : layout.base;
+    uint32_t level_width = std::max(key.GetWidth() >> level, UINT32_C(1));
+    uint32_t level_height = std::max(key.GetHeight() >> level, UINT32_C(1));
+    uint32_t level_pitch_div_32 =
+        level ? level_layout.row_pitch_bytes >> 7 : uint32_t(key.pitch);
+    // TEX-1d: tiled 2D at 32bpp stores one 32x32 macro tile per page, row by
+    // row at the level's pitch, so the page index gives the origin. A
+    // rectangle past the pitch wraps into the next tile row (reject 4).
+    uint32_t x = offset_x, y = offset_y;
+    if (index) {
+      if (level || !level_pitch_div_32 ||
+          (index << 12) >= level_layout.level_data_extent_bytes) {
+        continue;
+      }
+      x += index % level_pitch_div_32 * 32;
+      y += index / level_pitch_div_32 * 32;
+    }
+    bool partial = link_partial && !level &&
+                   (x || y || width < level_width || height < level_height);
+    uint32_t level_x = 0, level_y = 0, level_z = 0;
+    if (level && level == layout.packed_level) {
+      texture_util::GetPackedMipOffset(key.GetWidth(), key.GetHeight(), 1,
+                                       key.format, level, level_x, level_y,
+                                       level_z);
+    }
+    // A load that only detiles and endian-swaps 32-bit blocks, so the bits
+    // before the resolve's endian swap are what the load would produce.
+    const HostFormatPair& host_format_pair = GetHostFormatPair(key);
+    bool host_format_is_signed;
+    if (IsSignedVersionSeparateForFormat(key)) {
+      host_format_is_signed = bool(key.signed_separate);
+    } else {
+      host_format_is_signed = host_format_pair.format_unsigned.load_shader ==
+                              kLoadShaderIndexUnknown;
+    }
+    const HostFormat& host_format = host_format_is_signed
+                                        ? host_format_pair.format_signed
+                                        : host_format_pair.format_unsigned;
+    // The resolve's texels are the level's texels, all of them: same bits
+    // (format, endian), same tiled addressing (tile, pitch, offset in the
+    // tile), and a rectangle that is the level (a larger one may cover a
+    // base). Nonzero = the reason in the XDROID-TEXLINK reject line.
+    uint32_t reject = 0;
+    if (uint32_t(dest_info.copy_dest_format) != uint32_t(key.format) ||
+        uint32_t(dest_info.copy_dest_endian) != uint32_t(key.endianness)) {
+      reject = 1;
+    } else if (host_format.load_shader != kLoadShaderIndex32bpb ||
+               host_format.block_compressed) {
+      reject = 2;
+    } else if (pitch_div_32 != level_pitch_div_32) {
+      reject = 3;
+    } else if (partial ? x >= level_width || y >= level_height ||
+                             x + width > pitch_div_32 * 32
+               : level ? width != level_width || height != level_height
+                       : width < level_width || height < level_height ||
+                             dest_coordinate_info.height_aligned_div_32 !=
+                                 (level_height + 31) / 32) {
+      reject = 4;
+    } else if (!partial && (offset_x != level_x || offset_y != level_y)) {
+      reject = 5;
+    } else if ((level || partial)
+                   ? start - (it->first << 12) + length >
+                         xe::align(level_layout.level_data_extent_bytes,
+                                   UINT32_C(0x1000))
+                   : start != dest_base ||
+                         length < level_layout.level_data_extent_bytes) {
+      // A mip level's resolve must stay inside the level: one watch covers all
+      // the mips, so the copy marks every level current. TEX-1d: a partial
+      // one must stay inside the base.
+      reject = 6;
+    } else if (partial ? texture.base_outdated_lockless()
+                       : level && texture.mips_outdated_lockless()) {
+      // Another level is stale already: the next sampling loads them all.
+      // TEX-1d: for a partial link, the rest of the base is.
+      reject = 7;
+    } else if (spliced && command_processor_.IsDrawSerialEarlierInPass(
+                              texture.sample_draw_serial())) {
+      // A copy recorded before the open pass would be seen by draws already
+      // in it.
+      reject = 8;
+    }
+    if (reject) {
+      ++resolve_link_rejects_;
+      ++resolve_link_reject_counts_[reject];
+      uint64_t reject_id =
+          (uint64_t(reject) << 40) | (uint64_t(level) << 32) | dest_base;
+      uint64_t* seen_end =
+          resolve_link_reject_seen_ + resolve_link_reject_seen_count_;
+      if (resolve_link_reject_seen_count_ <
+              xe::countof(resolve_link_reject_seen_) &&
+          std::find(resolve_link_reject_seen_, seen_end, reject_id) ==
+              seen_end) {
+        *seen_end = reject_id;
+        ++resolve_link_reject_seen_count_;
+        XELOGI(
+            "XDROID-TEXLINK reject={} level={} of {} dest={:08X}+{:X} "
+            "len={:X} rect={}x{}@{},{} pitch32={} fmt={} endian={} | level "
+            "{}x{}@{},{} pitch32={} extent={:X} fmt={} endian={}",
+            reject, level, uint32_t(key.mip_max_level), dest_base,
+            start - dest_base, length, width, height, offset_x, offset_y,
+            pitch_div_32, uint32_t(dest_info.copy_dest_format),
+            uint32_t(dest_info.copy_dest_endian), level_width, level_height,
+            level_x, level_y, level_pitch_div_32,
+            level_layout.level_data_extent_bytes, uint32_t(key.format),
+            uint32_t(key.endianness));
+      }
+      continue;
+    }
+    if (resolve_link_target_count_ < xe::countof(resolve_link_targets_)) {
+      // A whole level is copied from its origin.
+      if (!partial) {
+        x = y = 0;
+      }
+      uint32_t bytes = partial ? std::min(width, level_width - x) *
+                                     std::min(height, level_height - y) * 4
+                               : level_layout.level_data_extent_bytes;
+      resolve_link_targets_[resolve_link_target_count_++] = {
+          &texture, level, x, y, host_format.format, partial, bytes};
+    }
   }
-  const HostFormat& host_format = host_format_is_signed
-                                      ? host_format_pair.format_signed
-                                      : host_format_pair.format_unsigned;
-  if (host_format.load_shader != kLoadShaderIndex32bpb ||
-      host_format.block_compressed) {
-    return false;
-  }
-  // A copy recorded before the open pass would be seen by draws already in it.
-  if (spliced && command_processor_.IsDrawSerialEarlierInPass(
-                     texture.sample_draw_serial())) {
-    return false;
-  }
-  resolve_link_texture_ = &texture;
-  return true;
+  return resolve_link_target_count_ != 0;
 }
 
 void VulkanTextureCache::RecordResolveLinkCopy(VkBuffer buffer,
                                                uint32_t pitch_pixels,
-                                               uint32_t rows, bool spliced) {
-  VulkanTexture* texture = resolve_link_texture_;
-  if (!texture) {
+                                               uint32_t rows, bool spliced,
+                                               VkImage src_image,
+                                               uint32_t src_x, uint32_t src_y) {
+  if (!resolve_link_target_count_) {
     return;
   }
-  if (spliced) {
-    command_processor_.NoteSplicedImage(texture->image());
+  for (uint32_t i = 0; i < resolve_link_target_count_; ++i) {
+    VulkanTexture* texture = resolve_link_targets_[i].texture;
+    if (spliced) {
+      command_processor_.NoteSplicedImage(texture->image());
+    }
+    texture->MarkAsUsed();
+    VulkanTexture::Usage old_usage =
+        texture->SetUsage(VulkanTexture::Usage::kTransferDestination);
+    if (old_usage != VulkanTexture::Usage::kTransferDestination) {
+      VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+      VkAccessFlags src_access_mask, dst_access_mask;
+      VkImageLayout old_layout, new_layout;
+      GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
+                           old_layout);
+      GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination,
+                           dst_stage_mask, dst_access_mask, new_layout);
+      command_processor_.PushImageMemoryBarrier(
+          texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
+          src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
+          old_layout, new_layout);
+    } else {
+      // Another copy may have written it earlier in this submission.
+      command_processor_.PushImageMemoryBarrier(
+          texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED, false);
+    }
   }
-  texture->MarkAsUsed();
-  VulkanTexture::Usage old_usage =
-      texture->SetUsage(VulkanTexture::Usage::kTransferDestination);
-  if (old_usage != VulkanTexture::Usage::kTransferDestination) {
-    VkPipelineStageFlags src_stage_mask, dst_stage_mask;
-    VkAccessFlags src_access_mask, dst_access_mask;
-    VkImageLayout old_layout, new_layout;
-    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask,
-                         old_layout);
-    GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination,
-                         dst_stage_mask, dst_access_mask, new_layout);
+  command_processor_.SubmitBarriers(true);
+  DeferredCommandBuffer& command_buffer =
+      command_processor_.deferred_command_buffer();
+  for (uint32_t i = 0; i < resolve_link_target_count_; ++i) {
+    const ResolveLinkTarget& target = resolve_link_targets_[i];
+    const TextureKey& key = target.texture->key();
+    VkImage image = target.texture->image();
+    // TEX-1d: a partial link writes its rectangle, clamped to the level.
+    VkImageSubresourceLayers subresource = {VK_IMAGE_ASPECT_COLOR_BIT,
+                                            target.level, 0, 1};
+    VkOffset3D offset = {int32_t(target.x), int32_t(target.y), 0};
+    VkExtent3D extent = {
+        std::max(key.GetWidth() >> target.level, UINT32_C(1)) - target.x,
+        std::max(key.GetHeight() >> target.level, UINT32_C(1)) - target.y, 1};
+    extent.width = std::min(extent.width, pitch_pixels);
+    extent.height = std::min(extent.height, rows);
+    if (src_image != VK_NULL_HANDLE) {
+      VkImageCopy* region = command_buffer.CmdCopyImageEmplace(
+          src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+      *region = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                 {int32_t(src_x), int32_t(src_y), 0},
+                 subresource,
+                 offset,
+                 extent};
+    } else {
+      VkBufferImageCopy* region = command_buffer.CmdCopyBufferToImageEmplace(
+          buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
+      *region = {0, pitch_pixels, rows, subresource, offset, extent};
+    }
+  }
+  if (!(link_mips_ & 4)) {
+    return;
+  }
+  // Back to sampled now, while no pass is open (or inside the segment): a
+  // barrier at the next sampling would end that draw's pass.
+  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+  VkAccessFlags src_access_mask, dst_access_mask;
+  VkImageLayout old_layout, new_layout;
+  GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination,
+                       src_stage_mask, src_access_mask, old_layout);
+  GetTextureUsageMasks(VulkanTexture::Usage::kGuestShaderSampled,
+                       dst_stage_mask, dst_access_mask, new_layout);
+  for (uint32_t i = 0; i < resolve_link_target_count_; ++i) {
+    VulkanTexture* texture = resolve_link_targets_[i].texture;
+    texture->SetUsage(VulkanTexture::Usage::kGuestShaderSampled);
     command_processor_.PushImageMemoryBarrier(
         texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
         src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
         old_layout, new_layout);
-  } else {
-    // Another copy may have written it earlier in this submission.
-    command_processor_.PushImageMemoryBarrier(
-        texture->image(), ui::vulkan::util::InitializeSubresourceRange(),
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
-        VK_QUEUE_FAMILY_IGNORED, false);
   }
-  command_processor_.SubmitBarriers(true);
-  const TextureKey& key = texture->key();
-  VkBufferImageCopy* copy_region =
-      command_processor_.deferred_command_buffer().CmdCopyBufferToImageEmplace(
-          buffer, texture->image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1);
-  *copy_region = {};
-  copy_region->bufferRowLength = pitch_pixels;
-  copy_region->bufferImageHeight = rows;
-  copy_region->imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-  copy_region->imageSubresource.layerCount = 1;
-  copy_region->imageExtent.width = key.GetWidth();
-  copy_region->imageExtent.height = key.GetHeight();
-  copy_region->imageExtent.depth = 1;
+  if (spliced) {
+    command_processor_.SubmitBarriers(true);
+  }
 }
 
 void VulkanTextureCache::EndResolveLink(bool copied) {
-  VulkanTexture* texture = resolve_link_texture_;
-  resolve_link_texture_ = nullptr;
-  if (!texture || !copied) {
+  uint32_t target_count = resolve_link_target_count_;
+  resolve_link_target_count_ = 0;
+  if (!copied || !target_count) {
     return;
   }
-  if (CompleteResolveLink(*texture)) {
-    ++resolve_links_;
-    resolve_link_bytes_ += texture->GetGuestBaseSize();
-  } else {
-    ++resolve_link_unwatched_;
+  for (uint32_t i = 0; i < target_count; ++i) {
+    const ResolveLinkTarget& target = resolve_link_targets_[i];
+    if (CompleteResolveLink(*target.texture, target.level != 0)) {
+      ++resolve_links_;
+      resolve_link_mips_ += target.level != 0;
+      resolve_link_partials_ += target.partial;
+      resolve_link_bytes_ += target.bytes;
+    } else {
+      ++resolve_link_unwatched_;
+    }
   }
   uint64_t frame = probe_frame();
   if (frame - resolve_link_summary_frame_ >= 600) {
-    XELOGI("XDROID-TEXLINK frames={} links={} kb={} unwatched={}",
-           frame - resolve_link_summary_frame_, resolve_links_,
-           resolve_link_bytes_ >> 10, resolve_link_unwatched_);
+    const uint32_t* by_reason = resolve_link_reject_counts_;
+    const uint32_t* image = resolve_link_image_counts_;
+    XELOGI(
+        "XDROID-TEXLINK frames={} links={} mips={} partial={} kb={} "
+        "unwatched={} rejects={} by_reason={}/{}/{}/{}/{}/{}/{}/{}/{} img={} "
+        "img_no={}/{}/{}/{}/{}/{}",
+        frame - resolve_link_summary_frame_, resolve_links_, resolve_link_mips_,
+        resolve_link_partials_, resolve_link_bytes_ >> 10,
+        resolve_link_unwatched_, resolve_link_rejects_, by_reason[1],
+        by_reason[2], by_reason[3], by_reason[4], by_reason[5], by_reason[6],
+        by_reason[7], by_reason[8], by_reason[9], image[0], image[1], image[2],
+        image[3], image[4], image[5], image[6]);
+    for (uint32_t& count : resolve_link_reject_counts_) {
+      count = 0;
+    }
+    for (uint32_t& count : resolve_link_image_counts_) {
+      count = 0;
+    }
+    resolve_link_partials_ = 0;
     resolve_link_summary_frame_ = frame;
     resolve_links_ = 0;
+    resolve_link_mips_ = 0;
     resolve_link_bytes_ = 0;
     resolve_link_unwatched_ = 0;
+    resolve_link_rejects_ = 0;
   }
 }
 
@@ -2702,6 +2895,11 @@ bool VulkanTextureCache::Initialize() {
 
   // Vulkan Memory Allocator.
 
+  ui::vulkan::xdroid_vma_allocate_note.store(
+      [](uint64_t ns, uint64_t bytes) {
+        XdroidLazyNote(XdroidLazyKind::kTextureMemory, ns, bytes);
+      },
+      std::memory_order_release);
   vma_allocator_ = ui::vulkan::CreateVmaAllocator(vulkan_device, true);
   if (vma_allocator_ == VK_NULL_HANDLE) {
     return false;
@@ -3211,8 +3409,12 @@ bool VulkanTextureCache::Initialize() {
       shaders::texture_load_8bpb_cs, sizeof(shaders::texture_load_8bpb_cs));
   load_shader_code[kLoadShaderIndex16bpb] = std::make_pair(
       shaders::texture_load_16bpb_cs, sizeof(shaders::texture_load_16bpb_cs));
-  load_shader_code[kLoadShaderIndex32bpb] = std::make_pair(
-      shaders::texture_load_32bpb_cs, sizeof(shaders::texture_load_32bpb_cs));
+  load_shader_code[kLoadShaderIndex32bpb] =
+      cvars::xdroid_texload_coalesced
+          ? std::make_pair(shaders::texture_load_32bpb_coalesced_cs,
+                           sizeof(shaders::texture_load_32bpb_coalesced_cs))
+          : std::make_pair(shaders::texture_load_32bpb_cs,
+                           sizeof(shaders::texture_load_32bpb_cs));
   load_shader_code[kLoadShaderIndex64bpb] = std::make_pair(
       shaders::texture_load_64bpb_cs, sizeof(shaders::texture_load_64bpb_cs));
   load_shader_code[kLoadShaderIndex128bpb] = std::make_pair(

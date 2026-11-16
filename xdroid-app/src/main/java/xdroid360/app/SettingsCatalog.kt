@@ -110,6 +110,19 @@ object SettingsCatalog {
           "present_letterbox", "Display", "Keep aspect ratio",
           "Black bars instead of stretching to the full screen.", false,
         ),
+        SettingDef.Choice(
+          "present_resolution_scale_percent", "Display", "Output resolution",
+          "Size of the image sent to the screen. Above 720p the upscaler below has room to sharpen; costs GPU and battery.",
+          listOf("50" to "720p (default)", "75" to "1080p", "100" to "1440p"), "50",
+        ),
+        SettingDef.Toggle(
+          "present_snapdragon_gsr", "Display", "Snapdragon GSR 1",
+          "Sharper upscale of the 720p game image to the output resolution (Qualcomm's one-pass upscaler). Set the output to 1080p or more.", false,
+        ),
+        SettingDef.Toggle(
+          "gsr2", "XDroid360", "Snapdragon GSR 2",
+          "Sharper image: upscales 720p to 1080p with Qualcomm's temporal upscaler (Ace Combat 6).", false,
+        ),
       ),
     ),
     SettingCategory(

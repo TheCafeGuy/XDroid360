@@ -6,6 +6,7 @@
 #define XDROID_LIVE_H_
 
 #include <filesystem>
+#include <string>
 
 namespace xe::gpu {
 class GraphicsSystem;
@@ -24,6 +25,13 @@ void StartLiveConfig(const std::filesystem::path& path);
 // streams about N frames into <storage>/traces/ (needs a build with
 // XENIA_ENABLE_GPU_TRACE; the trace writer is compiled out otherwise).
 void SetLiveGraphicsSystem(xe::gpu::GraphicsSystem* graphics_system);
+// The graphics system set above, or null.
+xe::gpu::GraphicsSystem* GetLiveGraphicsSystem();
+
+// Applies TOML text ("name = value" lines) as a live.toml change would: live
+// cvars switch, other keys are only logged. GPU-BENCH uses it to alternate
+// arms within one replay (xdroid_gpu_bench_arms).
+void ApplyLiveText(const std::string& text);
 
 }  // namespace xdroid
 

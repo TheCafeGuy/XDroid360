@@ -28,6 +28,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.platform.ComposeView
 import java.io.File
+import java.security.SecureRandom
 import java.util.Locale
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -37,7 +38,7 @@ import xdroid360.core.Bridge
  * Fullscreen landscape game session. Boots the game path on creation,
  * forwards controller input (standard mapping plus the user's remap), shows
  * the touch pad when no controller is connected and hosts the quick menu
- * (Back, Select+Start or the on-screen Guide); quitting is a menu action.
+ * (Back, Guide with Diagnostics off, or the on-screen Guide); quitting is a menu action.
  *
  * Threads: UI for boot, surface and teardown (the native context needs its
  * looper); one executor for pause, resume and trim, so they apply in order;
@@ -50,12 +51,16 @@ class GameActivity : ComponentActivity() {
   private var currentSurface: Surface? = null
   private var gamePath = ""
   private var booted = false
+  @Volatile private var liveReady = false  // The native side reads live.toml.
   private var sessionEnded = false
   @Volatile private var stopped = true
   // The exit prompt pauses the game: the wedge killer must not count it.
   @Volatile private var confirmingExit = false
 
   private val menuState = InGameState()
+  private lateinit var tv: Tv
+  // PC mirror: the Windows viewer reads this token with adb shell cat.
+  private val mirrorToken by lazy { getExternalFilesDir(null)?.let { File(it, "xdroid/mirror_token") } }
   private val settings = ControlSettings()
   private val remapState = RemapState()
   private val editorState = EditorState()
@@ -110,6 +115,7 @@ class GameActivity : ComponentActivity() {
       override fun changed() {
         this@GameActivity.settings.save(prefs())
         touchPad.settingsChanged()
+        applyPadDispatch()
       }
 
       override fun presetChanged() {
@@ -128,6 +134,10 @@ class GameActivity : ComponentActivity() {
       override fun setTone(strength: Float) = Bridge.setToneStrength(strength)
 
       override fun markGlitch() = this@GameActivity.markGlitch()
+
+      override val tv get() = this@GameActivity.tv
+
+      override fun setPcMirror(on: Boolean) = this@GameActivity.setPcMirror(on)
 
       override fun quit() = confirmExit()
 
@@ -188,7 +198,35 @@ class GameActivity : ComponentActivity() {
   // Last value sent per axis; NaN forces the first send. Every motion event
   // carries all six axes, mostly unchanged: skip those JNI calls.
   private val axisSent = FloatArray(6) { Float.NaN }
-  private var selectHeld = false
+
+  /**
+   * PC mirror switch: the token file first (the viewer polls it over adb),
+   * then the live cvars the native mirror client connects with. Off once the
+   * native side cleared live.toml at boot; [write] false when a TV session
+   * takes live.toml over.
+   */
+  private fun setPcMirror(on: Boolean, write: Boolean = true) {
+    val token = mirrorToken ?: return
+    if (!liveReady) return
+    if (!on) {
+      menuState.pcMirror = false
+      token.delete()
+      if (write) liveFile.write("xdroid_mirror = false", "xdroid_mirror_token = \"\"")
+      return
+    }
+    tv.yieldLive()
+    val hex = ByteArray(32).also { SecureRandom().nextBytes(it) }.hex()
+    token.parentFile?.mkdirs()
+    if (!token.replaceWith(hex)) return
+    menuState.pcMirror = true
+    liveFile.write(
+      "xdroid_mirror = true",
+      "xdroid_mirror_cast = \"\"",
+      "xdroid_mirror_token = \"$hex\"",
+      "xdroid_mirror_port = 27360",
+      "xdroid_mirror_kbps = 16000",
+    )
+  }
 
   /** Called by the native app context to repaint the surface. */
   @Suppress("unused")
@@ -199,6 +237,8 @@ class GameActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     hideSystemUi()
+    tv = Tv(this) { setPcMirror(false, write = false) }
+    mirrorToken?.delete()  // A stale one from a killed session.
     val root = FrameLayout(this)
     surfaceView =
       SurfaceView(this).also { view ->
@@ -250,6 +290,7 @@ class GameActivity : ComponentActivity() {
     val prefs = prefs()
     menuState.showStats = prefs.getBoolean("ingame_show_stats", true)
     menuState.detailedStats = prefs.getBoolean("ingame_detailed_stats", false)
+    menuState.showBattery = prefs.getBoolean("ingame_show_battery", true)
     menuState.toneStrength = prefs.getFloat("tone_strength", 0f)
     Bridge.setToneStrength(menuState.toneStrength)
     settings.load(prefs)
@@ -262,6 +303,7 @@ class GameActivity : ComponentActivity() {
       matchParent(),
     )
     setContentView(root)
+    applyPadDispatch()
 
     gamePath = intent.getStringExtra(EXTRA_GAME_PATH).orEmpty()
     menuState.gameName = File(gamePath).nameWithoutExtension.substringBefore(" (").trim()
@@ -330,6 +372,7 @@ class GameActivity : ComponentActivity() {
   }
 
   override fun onDestroy() {
+    tv.close()
     getSystemService(InputManager::class.java).unregisterInputDeviceListener(deviceListener)
     sampler.removeCallbacks(tick)
     if (booted) {
@@ -549,6 +592,13 @@ class GameActivity : ComponentActivity() {
     forensics?.sample(fps, frames, frameNumber, perfHint.state())
     ticks++
     if (frameNumber > 0) everPresented = true
+    // live.toml writes (TV session, PC mirror) from the first picture on. Not
+    // sooner: the native start (after Bridge.boot returns) clears live.toml
+    // and with it the mirror token.
+    if (frameNumber > 0 && !liveReady) {
+      liveReady = true
+      tv.ready()
+    }
 
     fpsHistory.addLast(fps)
     while (fpsHistory.size > 10) fpsHistory.removeFirst()
@@ -595,16 +645,22 @@ class GameActivity : ComponentActivity() {
       live["xdroid_adpf"]?.let { perfHint.enabled = it.trim() == "0" }
       // DISP-4 A/B: the stats overlay redraws a full-size layer every second.
       live["xdroid_show_stats"]?.let { show -> runOnUiThread { menuState.showStats = show == "true" } }
+      live["xdroid_show_battery"]?.let { show -> runOnUiThread { menuState.showBattery = show == "true" } }
+      tv.live(live)
     }
     if (!menuPaused) playSeconds++
-    if (menuState.menuOpen) {
+    if (menuState.menuOpen || (menuState.showStats && menuState.showBattery) || tv.active) {
       val battery =
         (getSystemService(BATTERY_SERVICE) as android.os.BatteryManager)
           .getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY)
+      val pad = padBattery()
+      if (logSys) Log.i(TAG, "XDROID-BATT phone $battery% pad $pad%")
+      tv.info("celu $battery%  control ${if (pad < 0) "-" else "$pad%"}")
       val played = playSeconds
       runOnUiThread {
         menuState.playSeconds = played
         menuState.battery = battery
+        menuState.padBattery = pad
       }
     }
     frameRateVoter.update(fps)?.let { rate -> runOnUiThread { applyFrameRate(rate) } }
@@ -697,7 +753,6 @@ class GameActivity : ComponentActivity() {
     for (bit in 0 until 16) Bridge.gamepadButton(1 shl bit, false)
     for (axis in 0 until 6) sendAxis(axis, 0f)
     hatDown.fill(false)
-    selectHeld = false
   }
 
   private fun setFastForward(on: Boolean) {
@@ -741,6 +796,7 @@ class GameActivity : ComponentActivity() {
     prefs().edit()
       .putBoolean("ingame_show_stats", menuState.showStats)
       .putBoolean("ingame_detailed_stats", menuState.detailedStats)
+      .putBoolean("ingame_show_battery", menuState.showBattery)
       .putFloat("tone_strength", menuState.toneStrength)
       .apply()
   }
@@ -797,19 +853,17 @@ class GameActivity : ComponentActivity() {
       return true
     }
     when (keyCode) {
-      // Home / Guide and Back: the quick menu (the pad's Guide does the same).
-      KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_BACK -> if (first) toggleMenu()
+      // With Diagnostics on, Guide / PS marks a glitch (what the auto-catcher
+      // cannot see: wrong colors, missing geometry, A/V desync) and never
+      // reaches the game; Back / Select and Start then go to the game.
+      KeyEvent.KEYCODE_BUTTON_MODE ->
+        if (first) if (forensics != null) markGlitch() else toggleMenu()
+      // Back: the quick menu.
+      KeyEvent.KEYCODE_BACK -> if (first) toggleMenu()
       // Triggers send keys and analog axes: drive the axis only.
       KeyEvent.KEYCODE_BUTTON_L2 -> sendAxis(AXIS_LT, 1f)
       KeyEvent.KEYCODE_BUTTON_R2 -> sendAxis(AXIS_RT, 1f)
       else -> {
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT) selectHeld = true
-        // Select + Start marks a glitch (what the auto-catcher cannot see:
-        // wrong colors, missing geometry, A/V desync); Start is not forwarded.
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_START && selectHeld) {
-          if (first) markGlitch()
-          return true
-        }
         val mask = BUTTON_MAP[keyCode] ?: return super.onKeyDown(keyCode, event)
         Bridge.gamepadButton(mask, true)
       }
@@ -828,12 +882,42 @@ class GameActivity : ComponentActivity() {
       KeyEvent.KEYCODE_BUTTON_L2 -> sendAxis(AXIS_LT, 0f)
       KeyEvent.KEYCODE_BUTTON_R2 -> sendAxis(AXIS_RT, 0f)
       else -> {
-        if (keyCode == KeyEvent.KEYCODE_BUTTON_SELECT) selectHeld = false
         val mask = BUTTON_MAP[keyCode] ?: return super.onKeyUp(keyCode, event)
         Bridge.gamepadButton(mask, false)
       }
     }
     return true
+  }
+
+  // LAT-2: Android batches joystick moves and hands them over at the next
+  // vsync; the low latency option (on by default) asks for every move as it
+  // comes, like the touch pad already does.
+  private fun applyPadDispatch() {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+    window.decorView.requestUnbufferedDispatch(
+      if (settings.lowLatency.value) InputDevice.SOURCE_CLASS_JOYSTICK else InputDevice.SOURCE_CLASS_NONE,
+    )
+  }
+
+  // LAT-2 meter: pad move age when it reaches us (oldest sample of the event),
+  // one forensics line per 2048 events.
+  private val padAges = IntArray(2048)
+  private var padAgeCount = 0
+  private var padBatched = 0
+
+  private fun notePadAge(e: MotionEvent) {
+    val oldest = if (e.historySize > 0) e.getHistoricalEventTime(0) else e.eventTime
+    if (e.historySize > 0) padBatched++
+    padAges[padAgeCount++] = (SystemClock.uptimeMillis() - oldest).toInt()
+    if (padAgeCount < padAges.size) return
+    padAges.sort()
+    val n = padAges.size
+    forensics?.event(
+      "pad-dispatch n=$n batched=$padBatched age_ms p50=${padAges[n / 2]} " +
+        "p95=${padAges[n * 95 / 100]} max=${padAges[n - 1]} unbuffered=${settings.lowLatency.value}",
+    )
+    padAgeCount = 0
+    padBatched = 0
   }
 
   override fun onGenericMotionEvent(event: MotionEvent): Boolean {
@@ -843,6 +927,7 @@ class GameActivity : ComponentActivity() {
     ) {
       return super.onGenericMotionEvent(event)
     }
+    notePadAge(event)
     val hatX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
     val hatY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
     if (menuState.menuOpen) {
@@ -884,6 +969,19 @@ class GameActivity : ComponentActivity() {
       TARGET_RT -> sendAxis(AXIS_RT, if (down) 1f else 0f)
       else -> Bridge.gamepadButton(target, down)
     }
+  }
+
+  // First physical controller that reports a battery (Android 12+; DualSense
+  // and DualShock 4 over Bluetooth do), in percent, or -1.
+  private fun padBattery(): Int {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return -1
+    for (id in InputDevice.getDeviceIds()) {
+      val device = InputDevice.getDevice(id) ?: continue
+      if (device.isVirtual || !device.isGamepad) continue
+      val state = device.batteryState
+      if (state.isPresent && !state.capacity.isNaN()) return Math.round(state.capacity * 100f)
+    }
+    return -1
   }
 
   // Auto-hide for the touch pad: any physical gamepad or joystick counts.

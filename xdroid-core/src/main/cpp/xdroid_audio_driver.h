@@ -75,8 +75,9 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   std::array<std::atomic<int64_t>, kClipUnderruns> clip_underrun_ms_{};
   std::atomic<uint64_t> clip_underruns_{0};
 
-  // Power of two, >= the apu_max_queued_frames upper bound (64).
-  static constexpr uint32_t kRingSlots = 64;
+  // Power of two, >= the apu_max_queued_frames upper bound (64) and the
+  // apu_queue_max_frames cap.
+  static constexpr uint32_t kRingSlots = 256;
   static constexpr uint32_t kChannels = kFrameChannelsDefault;
   static constexpr uint32_t kChannelSamples = kChannelSamplesDefault;
   static constexpr uint32_t kFrameFloats = kChannels * kChannelSamples;
@@ -104,7 +105,7 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   bool PopFrameToStage();
   bool NextPair(float& left, float& right);
   void ReleaseSlots(uint32_t count);
-  void UpdateLevels(int64_t now_ms);
+  void UpdateLevels(int64_t now_us);
 
   xe::threading::Semaphore* semaphore_;
   std::atomic<float> volume_{1.0f};
@@ -122,6 +123,9 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   std::condition_variable service_cv_;
   bool service_exit_ = false;
   std::atomic<bool> disconnected_{false};
+  // Live queue sizing the current stream was sized with (service thread).
+  uint32_t sized_bursts_ = 0;
+  uint32_t sized_max_ = 0;
 
   // SPSC ring: the producer writes slot [tail], the consumer reads [head].
   std::unique_ptr<float[]> ring_;
@@ -185,6 +189,14 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   // Consumer-side logging is bounded: at most 8 watch lines per resume,
   // reconnect or stall, 1 loud line per 5 s and 1 baseline line per 30 s.
   std::atomic<bool> watch_request_{false};
+  // AUD-6 loudness guard (render thread only, except fade_request_): gain
+  // applied before the limiter, the fade-in left after a resume or a producer
+  // gap, and the time of the last frame popped.
+  std::atomic<bool> fade_request_{false};
+  float guard_gain_ = 1.0f;
+  uint32_t fade_frames_left_ = 0;
+  int64_t last_pop_ms_ = 0;
+  uint32_t level_guarded_ = 0;
   int64_t watch_until_ms_ = 0;
   bool producer_stalled_ = false;
   int64_t level_window_ms_ = 0;
@@ -198,6 +210,29 @@ class XDroidAAudioDriver : public xe::apu::AudioDriver {
   uint32_t level_nonfinite_ = 0;
   uint32_t level_underruns_ = 0;
   uint32_t level_loud_skipped_ = 0;
+  // Burst forensics (mission 6 start, 2026-11-13): the guard caps what the
+  // level lines see, so judge the guest mix before it. Loudest frame rms,
+  // loud frames that are mostly treble, loud frames that repeat the previous
+  // one exactly (a stuck decoder buffer).
+  float level_raw_rms_max_ = 0.0f;
+  uint32_t level_harsh_ = 0;
+  uint32_t level_repeats_ = 0;
+  float prev_stage_[kChannelSamples * 2] = {};
+  // Silent-run auto-forensics: start of the current exact-zero stretch, the
+  // silence length that triggers the next fiber dump, dumps so far.
+  int64_t silent_since_ms_ = 0;
+  int64_t silent_dump_after_ms_ = 30000;
+  uint32_t silence_dumps_ = 0;
+  // F2 (on the level lines): frames queued at callback start, minimum of the
+  // current second and the last 1-s minima since the previous line; the
+  // longest gap between callbacks.
+  static constexpr uint32_t kRingMinima = 32;
+  std::array<uint32_t, kRingMinima> ring_minima_{};
+  uint32_t ring_minima_count_ = 0;
+  uint32_t ring_min_ = UINT32_MAX;
+  int64_t ring_second_us_ = 0;
+  int64_t cb_last_us_ = 0;
+  int64_t cb_gap_max_us_ = 0;
 
   // Counters, logged on shutdown and every 4096 drops; underruns (each one an
   // audible fade-out) at most once a second, from the render thread only.

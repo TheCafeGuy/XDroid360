@@ -62,6 +62,13 @@ DEFINE_bool(
     "of the guest thread that wrote the new read position.",
     "Logging");
 
+DEFINE_int32(
+    xdroid_cmd_spin_iterations, 501,
+    "C1: yields the command processor spins through an empty ring before it "
+    "sleeps on the write pointer event (2 ms timeout). Upstream 501; lower "
+    "values spend less CPU waiting for the guest, 0 sleeps at once. Idea: "
+    "Xendroid+ (phforner0) gpu_stall_spin_iterations.",
+    "GPU");
 DEFINE_bool(clear_memory_page_state, false,
             "Refresh state of memory pages to enable gpu written data. "
             "Uses mostly lock-free double-buffering for minimal overhead. "
@@ -494,7 +501,7 @@ void CommandProcessor::WorkerThreadMain() {
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
-        if (loop_count > 500) {
+        if (loop_count >= uint32_t(cvars::xdroid_cmd_spin_iterations)) {
           constexpr int wait_time_ms = 2;
           xe::threading::Wait(write_ptr_index_event_.get(), true,
                               std::chrono::milliseconds(wait_time_ms));
@@ -652,11 +659,6 @@ XE_NOINLINE XE_COLD void CommandProcessor::LogKickoffInitator(uint32_t value) {
 void CommandProcessor::UpdateWritePointer(uint32_t value) {
   XE_UNLIKELY_IF(cvars::log_ringbuffer_kickoff_initiator_bts) {
     LogKickoffInitator(value);
-  }
-  if (auto before_publish =
-          GetXdroidGpuHooks().before_publish.load(std::memory_order_acquire)) {
-    before_publish(memory_, primary_buffer_ptr_, primary_buffer_size_ / 4,
-                   write_ptr_index_.load(std::memory_order_relaxed), value);
   }
   write_ptr_index_ = value;
   if (auto on_kick =

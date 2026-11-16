@@ -338,10 +338,21 @@ void AudioSystem::RunClientCallback(size_t client_index) {
     ApplyWorkerNice();
     thread_local uint64_t total_cpu_us = 0;
     thread_local uint64_t total_runq_us = 0;
-    const CallbackSplit split_before = ReadCallbackSplit();
+    // AUDIO-H4: the split costs 4 syscalls per call and runs only with
+    // xdroid_diagnostics; the wait probe also feeds the boost and nice arms.
+    // Both are snapshot per call, so a live toggle mid-callback never mixes
+    // a sampled and an unsampled read.
+    const bool forensics = kernel::XdroidAudioForensics();
+    const bool probe = kernel::XdroidAudioProbeWanted();
+    CallbackSplit split_before;
+    if (forensics) {
+      split_before = ReadCallbackSplit();
+    }
     // Forensic (AUD-2, temp): which guest waits the blocked time is spent in.
     thread_local kernel::XdroidWaitProbe wait_probe;
-    kernel::xdroid_wait_probe = &wait_probe;
+    if (probe) {
+      kernel::xdroid_wait_probe = &wait_probe;
+    }
 #endif
     const uint64_t start_us = host_us();
     if (last_start_us) {
@@ -355,11 +366,14 @@ void AudioSystem::RunClientCallback(size_t client_index) {
     const uint64_t took_us = end_us - start_us;
 #if XE_PLATFORM_ANDROID
     kernel::xdroid_wait_probe = nullptr;
-    const CallbackSplit split_after = ReadCallbackSplit();
-    total_cpu_us += (split_after.cpu_ns - split_before.cpu_ns) / 1000;
-    total_runq_us += (split_after.runq_ns - split_before.runq_ns) / 1000;
+    if (forensics) {
+      const CallbackSplit split_after = ReadCallbackSplit();
+      total_cpu_us += (split_after.cpu_ns - split_before.cpu_ns) / 1000;
+      total_runq_us += (split_after.runq_ns - split_before.runq_ns) / 1000;
+    }
 #endif
     max_took_us = std::max(max_took_us, took_us);
+    kernel::XdroidNotePumpCall(took_us);
     total_took_us += took_us;
     slow_calls += took_us > 5333;
     ++calls;
@@ -376,56 +390,80 @@ void AudioSystem::RunClientCallback(size_t client_index) {
           calls ? total_took_us / calls : 0, max_took_us / 1000, slow_calls,
           max_gap_us / 1000);
 #if XE_PLATFORM_ANDROID
-      // Mean per call: on a core, runnable but waiting for one, and the rest
-      // (blocked in a wait or sleeping).
-      const uint64_t mean_us = calls ? total_took_us / calls : 0;
-      const uint64_t cpu_us = calls ? total_cpu_us / calls : 0;
-      const uint64_t runq_us = calls ? total_runq_us / calls : 0;
-      XELOGI(
-          "XDroid360: audio pump split per call: cpu {} us, run queue {} us, "
-          "blocked {} us",
-          cpu_us, runq_us,
-          mean_us > cpu_us + runq_us ? mean_us - cpu_us - runq_us : 0);
-      std::string waits;
-      for (const auto& entry : wait_probe.entries) {
-        if (entry.count) {
-          waits += fmt::format(" [lr {:08X} kind {} n {} {} us]", entry.lr,
-                               entry.kind, entry.count, entry.total_us);
-        }
-      }
-      XELOGI("XDroid360: audio pump guest waits: {} us per call in waits{}",
-             calls ? wait_probe.total_us / calls : 0, waits);
-      wait_probe.Reset();
+      // AUDIO-H4: every counter is drained each window, so a live re-enable
+      // never reports counts left from before the toggle. The split lines
+      // need the per-slice samples (forensics); the producer and guest-wait
+      // lines only need the wait probe, which the boost and nice arms keep.
       auto& watch = kernel::xdroid_audio_watch;
       const uint64_t signals = watch.signals.exchange(0);
       const uint64_t latency = watch.signal_latency_us.exchange(0);
-      XELOGI(
-          "XDroid360: audio producer: {} signals, {} us from wait start to "
-          "signal, signaler thread {:X} lr {:08X}; at wait start it was "
-          "running {} ready {} blocked {} unknown {}; boosts {}",
-          signals, signals ? latency / signals : 0, watch.signaler_tid.load(),
-          watch.signaler_lr.load(), watch.producer_state[0].exchange(0),
-          watch.producer_state[1].exchange(0),
-          watch.producer_state[2].exchange(0),
-          watch.producer_state[3].exchange(0), watch.boosts.exchange(0));
+      uint64_t states[4];
+      for (int i = 0; i < 4; ++i) {
+        states[i] = watch.producer_state[i].exchange(0);
+      }
+      const uint64_t boosts = watch.boosts.exchange(0);
       const uint64_t dispatches = watch.dispatches.exchange(0);
-      XELOGI(
-          "XDroid360: audio producer ready-to-run delay: mean {} us, max {} "
-          "us over {} wakes",
-          dispatches ? watch.dispatch_delay_us.exchange(0) / dispatches : 0,
-          watch.dispatch_delay_max_us.exchange(0), dispatches);
-      // AUD-5: where the producer's render time goes on its host thread.
-      // cpu ~ wall: it is CPU work (slow core or clock); runq large: its
-      // dispatch thread waits for a core; neither: it is off its dispatch
-      // thread between slices (guest ready queue or a wait).
-      {
-        const uint64_t slices = watch.slices.exchange(0);
+      const uint64_t dispatch_delay_us = watch.dispatch_delay_us.exchange(0);
+      const uint64_t dispatch_delay_max_us =
+          watch.dispatch_delay_max_us.exchange(0);
+      const uint64_t slices = watch.slices.exchange(0);
+      const uint64_t slice_wall_us = watch.slice_wall_us.exchange(0);
+      const uint64_t slice_cpu_us = watch.slice_cpu_us.exchange(0);
+      const uint64_t slice_runq_us = watch.slice_runq_us.exchange(0);
+      const uint64_t end_wait = watch.slice_end_wait.exchange(0);
+      const uint64_t end_preempt = watch.slice_end_preempt.exchange(0);
+      const uint64_t end_quantum = watch.slice_end_quantum.exchange(0);
+      const uint64_t end_yield = watch.slice_end_yield.exchange(0);
+      uint64_t host_cpu_us[kernel::XdroidAudioWatch::kHostCpus];
+      for (int i = 0; i < kernel::XdroidAudioWatch::kHostCpus; ++i) {
+        host_cpu_us[i] = watch.host_cpu_us[i].exchange(0);
+      }
+      watch.window.fetch_add(1, std::memory_order_relaxed);
+      if (forensics) {
+        // Mean per call: on a core, runnable but waiting for one, and the
+        // rest (blocked in a wait or sleeping).
+        const uint64_t mean_us = calls ? total_took_us / calls : 0;
+        const uint64_t cpu_us = calls ? total_cpu_us / calls : 0;
+        const uint64_t runq_us = calls ? total_runq_us / calls : 0;
+        XELOGI(
+            "XDroid360: audio pump split per call: cpu {} us, run queue {} "
+            "us, blocked {} us",
+            cpu_us, runq_us,
+            mean_us > cpu_us + runq_us ? mean_us - cpu_us - runq_us : 0);
+      }
+      if (probe) {
+        std::string waits;
+        for (const auto& entry : wait_probe.entries) {
+          if (entry.count) {
+            waits += fmt::format(" [lr {:08X} kind {} n {} {} us]", entry.lr,
+                                 entry.kind, entry.count, entry.total_us);
+          }
+        }
+        XELOGI("XDroid360: audio pump guest waits: {} us per call in waits{}",
+               calls ? wait_probe.total_us / calls : 0, waits);
+        XELOGI(
+            "XDroid360: audio producer: {} signals, {} us from wait start to "
+            "signal, signaler thread {:X} lr {:08X}; at wait start it was "
+            "running {} ready {} blocked {} unknown {}; boosts {}",
+            signals, signals ? latency / signals : 0, watch.signaler_tid.load(),
+            watch.signaler_lr.load(), states[0], states[1], states[2],
+            states[3], boosts);
+      }
+      if (forensics) {
+        XELOGI(
+            "XDroid360: audio producer ready-to-run delay: mean {} us, max {} "
+            "us over {} wakes",
+            dispatches ? dispatch_delay_us / dispatches : 0,
+            dispatch_delay_max_us, dispatches);
+        // AUD-5: where the producer's render time goes on its host thread.
+        // cpu ~ wall: it is CPU work (slow core or clock); runq large: its
+        // dispatch thread waits for a core; neither: it is off its dispatch
+        // thread between slices (guest ready queue or a wait).
         const uint64_t per = signals ? signals : 1;
         std::string cores;
         for (int i = 0; i < kernel::XdroidAudioWatch::kHostCpus; ++i) {
-          const uint64_t us = watch.host_cpu_us[i].exchange(0);
-          if (us) {
-            cores += fmt::format(" {}:{}", i, us / per);
+          if (host_cpu_us[i]) {
+            cores += fmt::format(" {}:{}", i, host_cpu_us[i] / per);
           }
         }
         static bool capacities_logged = false;
@@ -451,15 +489,12 @@ void AudioSystem::RunClientCallback(size_t client_index) {
             "{} us, cpu {} us, host runq {} us; slice ends wait {} preempt {} "
             "quantum {} yield {}; cpu us per render by host core:{}; dispatch "
             "nice {} (boost {})",
-            slices, watch.slice_wall_us.exchange(0) / per,
-            watch.slice_cpu_us.exchange(0) / per,
-            watch.slice_runq_us.exchange(0) / per,
-            watch.slice_end_wait.exchange(0),
-            watch.slice_end_preempt.exchange(0),
-            watch.slice_end_quantum.exchange(0),
-            watch.slice_end_yield.exchange(0), cores,
-            watch.dispatch_nice.load(), cvars::xdroid_audio_producer_nice);
+            slices, slice_wall_us / per, slice_cpu_us / per,
+            slice_runq_us / per, end_wait, end_preempt, end_quantum, end_yield,
+            cores, watch.dispatch_nice.load(),
+            cvars::xdroid_audio_producer_nice);
       }
+      wait_probe.Reset();
       total_cpu_us = 0;
       total_runq_us = 0;
 #endif

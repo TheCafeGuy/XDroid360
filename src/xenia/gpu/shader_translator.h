@@ -71,6 +71,8 @@ class ShaderTranslator {
 
   // Temporary register count, accessible via static and dynamic addressing.
   uint32_t register_count() const { return register_count_; }
+  // XDroid360 BLACK-H1: ucode address of the ALU instruction being translated.
+  uint32_t current_alu_address() const { return current_alu_address_; }
 
   // Emits a translation error that will be passed back in the result.
   virtual void EmitTranslationError(const char* message, bool is_fatal = true);
@@ -163,6 +165,7 @@ class ShaderTranslator {
 
   // Current control flow dword index.
   uint32_t cf_index_ = 0;
+  uint32_t current_alu_address_ = 0;
 
   // Kept for supporting vfetch_mini.
   ucode::VertexFetchInstruction previous_vfetch_full_;

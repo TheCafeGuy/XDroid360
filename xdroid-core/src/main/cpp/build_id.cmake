@@ -1,5 +1,6 @@
 # Writes xdroid_build_id.h with the current commit, plus "+dirty" when the
-# tree has uncommitted changes. Runs on every build (not only at configure
+# tree has uncommitted changes outside docs, notes and host tools (those
+# never reach the APK, so they must not mark a clean build as dirty). Runs on every build (not only at configure
 # time), so the boot stamp always matches the sources that were compiled.
 # Inputs: ROOT (repository root), OUT (header path).
 set(_id "unknown")
@@ -9,6 +10,8 @@ if(_git)
                   WORKING_DIRECTORY "${ROOT}" OUTPUT_VARIABLE _id
                   OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
   execute_process(COMMAND "${_git}" --no-optional-locks diff --ignore-submodules=dirty --quiet HEAD --
+                          . ":(exclude)docs" ":(exclude)tools" ":(exclude)scratch"
+                          ":(exclude).claude" ":(exclude)*.md"
                   WORKING_DIRECTORY "${ROOT}" RESULT_VARIABLE _dirty
                   ERROR_QUIET)
   if(_dirty)

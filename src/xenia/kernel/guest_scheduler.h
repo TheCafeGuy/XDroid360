@@ -335,7 +335,8 @@ class GuestScheduler {
   uint32_t last_frame_number_ = 0;
   uint32_t no_progress_ticks_ = 0;
   bool no_progress_reported_ = false;
-  void ReportNoProgress();
+  // why: a dump another subsystem asked for; null = no-progress report.
+  void ReportNoProgress(const char* why = nullptr);
 
   // Watchdog-only stall detection state, touched under lock_.
   static constexpr uint32_t kStallReportTicks = 2000;  // ~2 s at a 1 ms period

@@ -15,19 +15,95 @@
 
 #include "third_party/glslang/SPIRV/GLSL.std.450.h"
 #include "xenia/base/assert.h"
+#include "xenia/base/cvar.h"
 #include "xenia/base/math.h"
 #include "xenia/gpu/spirv_compatibility.h"
+
+DECLARE_uint32(xdroid_shd_probe);
+
+DEFINE_uint32(
+    xdroid_relaxed_mul, 0,
+    "Drop the Shader Model 3 \"0 * anything = 0\" emulation of "
+    "multiplications (the same results for finite operands, up to the sign "
+    "of a zero product; differs where a zero meets an infinity or NaN). "
+    "Bit 0: vertex shaders, bit 1: pixel shaders. Bit 2: only where a "
+    "translation-time analysis proves both operands finite (exact SM3 "
+    "results up to the sign of a zero product, assuming finite constants, "
+    "fetches and interpolants); one-compare guard where one operand is "
+    "finite. Bit 3: log per-shader product counts (XDROID-RMUL). Boot only. "
+    "Idea: Xendroid+ (phforner0) spirv_ps/vs_relaxed_math.",
+    "GPU");
+DEFINE_bool(xdroid_relaxed_minmax, false,
+            "SHD-2: max/min as the host's native instructions instead of the "
+            "Shader Model 3 compare-and-select (differs only for NaN and the "
+            "sign of zero). Boot only.",
+            "GPU");
+DEFINE_bool(xdroid_fast_precision_round, false,
+            "A2: round the 21-bit transcendental results (exp, log, rcp, "
+            "rsq, sqrt) with fewer shader instructions, bit-identical. "
+            "Applies to shaders translated after it is set (boot).",
+            "GPU");
 
 namespace xe {
 namespace gpu {
 
+spv::Id SpirvShaderTranslator::XdroidMinMax(spv::Op compare_op,
+                                            spv::Id result_type,
+                                            spv::Id bool_type, spv::Id a,
+                                            spv::Id b) {
+  // max: a >= b ? a : b; min: a < b ? a : b (Shader Model 3, NaN gives b).
+  if (cvars::xdroid_relaxed_minmax) {
+    // The host's native min/max: the same for every non-NaN pair except the
+    // sign of a zero when both are zero.
+    return builder_->createBinBuiltinCall(
+        result_type, ext_inst_glsl_std_450_,
+        compare_op == spv::OpFOrdGreaterThanEqual ? GLSLstd450FMax
+                                                  : GLSLstd450FMin,
+        a, b);
+  }
+  return builder_->createTriOp(
+      spv::OpSelect, result_type,
+      builder_->createBinOp(compare_op, bool_type, a, b), a, b);
+}
+
+void SpirvShaderTranslator::XdroidSelectMulTaint(bool scalar) {
+  if (!(xdroid_relaxed_mul_ & (is_pixel_shader() ? 2 : 1))) {
+    xdroid_mul_taint_cur_ = 3;
+  } else if (!(xdroid_relaxed_mul_ & 4)) {
+    xdroid_mul_taint_cur_ = 0;
+  } else {
+    uint32_t address = current_alu_address();
+    xdroid_mul_taint_cur_ =
+        address < xdroid_mul_taint_.size()
+            ? (xdroid_mul_taint_[address] >> (scalar ? 2 : 0)) & 3
+            : 3;
+  }
+}
+
 spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value,
                                                       spv::Id operand_0_abs,
                                                       spv::Id operand_1_abs) {
+  if (!xdroid_mul_taint_cur_) {
+    ++xdroid_mul_counts_[0];
+    return value;
+  }
   EnsureBuildPointAvailable();
   assert_true(builder_->getNumComponents(value) == 1);
   assert_true(builder_->getNumComponents(operand_0_abs) == 1);
   assert_true(builder_->getNumComponents(operand_1_abs) == 1);
+  if (xdroid_mul_taint_cur_ != 3) {
+    // BLACK-H1: one operand is proven finite, so only it being 0 can meet an
+    // infinity or NaN in the other.
+    ++xdroid_mul_counts_[1];
+    return builder_->createTriOp(
+        spv::OpSelect, type_float_,
+        builder_->createBinOp(
+            spv::OpFOrdEqual, type_bool_,
+            xdroid_mul_taint_cur_ == 1 ? operand_1_abs : operand_0_abs,
+            const_float_0_),
+        const_float_0_, value);
+  }
+  ++xdroid_mul_counts_[2];
   return builder_->createTriOp(
       spv::OpSelect, type_float_,
       builder_->createBinOp(spv::OpFOrdEqual, type_bool_,
@@ -45,6 +121,9 @@ spv::Id SpirvShaderTranslator::ReduceFloatPrecision(spv::Id value,
   // Denormals may be flushed to zero, closer approximating Xbox 360
   // hardware behavior.
   assert_true(mantissa_bits > 0 && mantissa_bits < 23);
+  if (cvars::xdroid_shd_probe & 1) {
+    return value;
+  }
 
   EnsureBuildPointAvailable();
 
@@ -58,6 +137,39 @@ spv::Id SpirvShaderTranslator::ReduceFloatPrecision(spv::Id value,
   // Create a mask that keeps the sign, exponent, and desired mantissa bits
   uint32_t truncate_mask = ~((1u << truncate_bits) - 1);
   uint32_t round_bit = 1u << (truncate_bits - 1);
+
+  if (cvars::xdroid_fast_precision_round) {
+    // Same results with fewer instructions: adding the half ULP carries into
+    // the kept bits exactly when the discarded bits are >= half, so no
+    // compare is needed. A finite value that rounds to the infinity exponent
+    // keeps its truncated bits; INF and NaN pass through. Bit-identical to
+    // the path below for every input (host test, 2^32 values, 1/10/21/22
+    // bits). Idea: Xendroid+ (phforner0) 7789025f3.
+    spv::Id exp_mask = builder_->makeUintConstant(0x7F800000u);
+    spv::Id mask = builder_->makeUintConstant(truncate_mask);
+    spv::Id value_finite = builder_->createBinOp(
+        spv::OpINotEqual, type_bool_,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, value_bits,
+                              exp_mask),
+        exp_mask);
+    spv::Id rounded = builder_->createBinOp(
+        spv::OpBitwiseAnd, type_uint_,
+        builder_->createBinOp(spv::OpIAdd, type_uint_, value_bits,
+                              builder_->makeUintConstant(round_bit)),
+        mask);
+    spv::Id rounded_to_inf = builder_->createBinOp(
+        spv::OpIEqual, type_bool_,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, rounded, exp_mask),
+        exp_mask);
+    spv::Id finite_result = builder_->createTriOp(
+        spv::OpSelect, type_uint_, rounded_to_inf,
+        builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, value_bits, mask),
+        rounded);
+    return builder_->createUnaryOp(
+        spv::OpBitcast, type_float_,
+        builder_->createTriOp(spv::OpSelect, type_uint_, value_finite,
+                              finite_result, value_bits));
+  }
 
   // Truncate to get the base value
   spv::Id truncated_bits =
@@ -163,10 +275,12 @@ void SpirvShaderTranslator::ProcessAluInstruction(
   // Whether the instruction has changed the predicate, and it needs to be
   // checked again later.
   bool predicate_written_vector = false;
+  XdroidSelectMulTaint(false);
   spv::Id vector_result = ProcessVectorAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_vector);
 
   bool predicate_written_scalar = false;
+  XdroidSelectMulTaint(true);
   spv::Id scalar_result = ProcessScalarAluOperation(
       instr, memexport_eM_potentially_written_before, predicate_written_scalar);
   if (scalar_result != spv::NoResult) {
@@ -284,7 +398,10 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
           used_result_components &
           ~instr.vector_operands[0].GetIdenticalComponents(
               instr.vector_operands[1]);
-      if (multiplicands_different) {
+      if (multiplicands_different && !xdroid_mul_taint_cur_) {
+        xdroid_mul_counts_[0] += xe::bit_count(multiplicands_different);
+      }
+      if (multiplicands_different && xdroid_mul_taint_cur_) {
         // Shader Model 3: +0 or denormal * anything = +-0.
         spv::Id different_operands[2] = {multiplicands[0], multiplicands[1]};
         spv::Id different_result = result;
@@ -321,18 +438,29 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
                 different_result, different_type, uint_vector_temp_[0]);
           }
         }
-        // Check if the different components in any of the operands are zero,
-        // even if the other is NaN - if min(|a|, |b|) is 0.
-        for (uint32_t i = 0; i < 2; ++i) {
-          different_operands[i] = GetAbsoluteOperand(different_operands[i],
-                                                     instr.vector_operands[i]);
+        spv::Id different_zero;
+        if (xdroid_mul_taint_cur_ == 3) {
+          xdroid_mul_counts_[2] += different_count;
+          // Check if the different components in any of the operands are
+          // zero, even if the other is NaN - if min(|a|, |b|) is 0.
+          for (uint32_t i = 0; i < 2; ++i) {
+            different_operands[i] = GetAbsoluteOperand(
+                different_operands[i], instr.vector_operands[i]);
+          }
+          different_zero = builder_->createBinOp(
+              spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
+              builder_->createBinBuiltinCall(
+                  different_type, ext_inst_glsl_std_450_, GLSLstd450NMin,
+                  different_operands[0], different_operands[1]),
+              const_float_vectors_0_[different_count - 1]);
+        } else {
+          // BLACK-H1: one operand is proven finite; -0 == 0, so no abs.
+          xdroid_mul_counts_[1] += different_count;
+          different_zero = builder_->createBinOp(
+              spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
+              different_operands[xdroid_mul_taint_cur_ == 1 ? 1 : 0],
+              const_float_vectors_0_[different_count - 1]);
         }
-        spv::Id different_zero = builder_->createBinOp(
-            spv::OpFOrdEqual, type_bool_vectors_[different_count - 1],
-            builder_->createBinBuiltinCall(
-                different_type, ext_inst_glsl_std_450_, GLSLstd450NMin,
-                different_operands[0], different_operands[1]),
-            const_float_vectors_0_[different_count - 1]);
         // Replace with +0.
         different_result = builder_->createTriOp(
             spv::OpSelect, different_type, different_zero,
@@ -464,12 +592,9 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
         // vectors (with the correct length in case of maxa).
         assert_true(builder_->getNumComponents(operand_0_per_component) ==
                     used_result_component_count);
-        return builder_->createTriOp(
-            spv::OpSelect, result_type,
-            builder_->createBinOp(
-                op, type_bool_vectors_[used_result_component_count - 1],
-                operand_0_per_component, operand_1),
-            operand_0_per_component, operand_1);
+        return XdroidMinMax(op, result_type,
+                            type_bool_vectors_[used_result_component_count - 1],
+                            operand_0_per_component, operand_1);
       }
       // Mixed identical and different components.
       assert_true(used_result_component_count > 1);
@@ -492,11 +617,9 @@ spv::Id SpirvShaderTranslator::ProcessVectorAluOperation(
         if (!(identical & (1 << component_index))) {
           spv::Id operand_1_component =
               builder_->createCompositeExtract(operand_1, type_float_, i);
-          result_component = builder_->createTriOp(
-              spv::OpSelect, type_float_,
-              builder_->createBinOp(op, type_bool_, result_component,
-                                    operand_1_component),
-              result_component, operand_1_component);
+          result_component =
+              XdroidMinMax(op, type_float_, type_bool_, result_component,
+                           operand_1_component);
         }
         id_vector_temp_.push_back(result_component);
       }
@@ -1172,11 +1295,8 @@ spv::Id SpirvShaderTranslator::ProcessScalarAluOperation(
       }
       // Shader Model 3 NaN behavior (a op b ? a : b, not SPIR-V FMax/FMin which
       // are undefined for NaN or NMax/NMin which return the non-NaN operand).
-      return builder_->createTriOp(
-          spv::OpSelect, type_float_,
-          builder_->createBinOp(spv::Op(kOps[size_t(instr.scalar_opcode)]),
-                                type_bool_, a, b),
-          a, b);
+      return XdroidMinMax(spv::Op(kOps[size_t(instr.scalar_opcode)]),
+                          type_float_, type_bool_, a, b);
     }
 
     case ucode::AluScalarOpcode::kSeqs:

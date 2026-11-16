@@ -1,6 +1,6 @@
 /**
- * XDroid360 forensic (AUD-2, temp, revert-planned): attributes the time a
- * host thread spends in guest kernel waits to (guest caller, wait kind), for
+ * XDroid360 forensic (AUD-2, gated by xdroid_diagnostics): attributes the time
+ * a host thread spends in guest kernel waits to (guest caller, wait kind), for
  * a thread that installs a probe (the audio worker, around the guest audio
  * callback).
  */
@@ -12,8 +12,27 @@
 #include <chrono>
 #include <cstdint>
 
+#include "xenia/base/cvar.h"
+
+DECLARE_bool(xdroid_diagnostics);
+DECLARE_bool(xdroid_audio_producer_boost);
+DECLARE_int32(xdroid_audio_producer_nice);
+DECLARE_int32(xdroid_adpf_exclude);
+
 namespace xe {
 namespace kernel {
+
+// AUD-2/AUD-5 split (syscalls per producer slice and per callback): read per
+// use, so it follows a live toggle.
+inline bool XdroidAudioForensics() { return cvars::xdroid_diagnostics; }
+// Signaler discovery (the worker's wait probe) feeds the boost and nice arms
+// and the ADPF exclusion (AUDIO-H1, learns the producer from signaler_tid), so
+// it stays on while any of them is armed.
+inline bool XdroidAudioProbeWanted() {
+  return XdroidAudioForensics() || cvars::xdroid_audio_producer_boost ||
+         cvars::xdroid_audio_producer_nice != 0 ||
+         cvars::xdroid_adpf_exclude != 0;
+}
 
 struct XdroidWaitProbe {
   struct Entry {
@@ -75,7 +94,8 @@ struct XdroidAudioWatch {
   // before its wait (a ping-pong), so the boost applies when the scheduler
   // makes it ready: its next ready link goes to the head of the list.
   std::atomic<uint32_t> boost_pending_tid{0};
-  // Producer wake-to-dispatch delay (ready link to fiber switch), always on.
+  // Producer wake-to-dispatch delay (ready link to fiber switch), diagnostics
+  // only.
   std::atomic<uint64_t> producer_ready_tick{0};
   std::atomic<uint64_t> dispatch_delay_us{0};
   std::atomic<uint64_t> dispatches{0};
@@ -99,8 +119,27 @@ struct XdroidAudioWatch {
   std::atomic<uint64_t> host_cpu_us[kHostCpus] = {};
   // Nice of the dispatch thread at the last switch-in (before any boost).
   std::atomic<int32_t> dispatch_nice{0};
+  // Bumped by the audio pump at each 10 s report: the dispatch thread
+  // re-reads its nice once per window instead of once per slice.
+  std::atomic<uint32_t> window{0};
+  // F2: longest guest audio callback (us) since the AAudio driver's last audio
+  // report line took it.
+  std::atomic<uint64_t> pump_took_max_us{0};
+  // Set by the AAudio driver after a long stretch of exact-zero guest output;
+  // the scheduler watchdog takes it and dumps every guest fiber's wait
+  // (2026-11-13: AC6 boots without music 2 of ~36 times).
+  std::atomic<const char*> sched_dump_reason{nullptr};
 };
 inline XdroidAudioWatch xdroid_audio_watch;
+// The audio worker after each guest audio callback. Lock-free: the driver
+// takes the value from its real-time callback.
+inline void XdroidNotePumpCall(uint64_t took_us) {
+  auto& max_us = xdroid_audio_watch.pump_took_max_us;
+  uint64_t seen = max_us.load(std::memory_order_relaxed);
+  while (took_us > seen && !max_us.compare_exchange_weak(
+                               seen, took_us, std::memory_order_relaxed)) {
+  }
+}
 inline uint64_t XdroidNowUs() {
   return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now().time_since_epoch())

@@ -712,6 +712,10 @@ class Presenter {
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
 
+  // Tallest guest output seen (only rises): the swapchain never goes below it,
+  // so an upscaled guest output (GSR2) is not shrunk back by the presenter.
+  std::atomic<uint32_t> guest_output_height_floor_{0};
+
  private:
   enum class PaintMode {
     // Don't paint at all.

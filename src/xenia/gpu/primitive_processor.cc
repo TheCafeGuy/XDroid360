@@ -120,6 +120,7 @@ bool PrimitiveProcessor::InitializeCommon(
       !triangle_fans_supported || cvars::force_convert_triangle_fans_to_lists;
   convert_line_loops_to_strips_ =
       !line_loops_supported || cvars::force_convert_line_loops_to_strips;
+  quad_lists_supported_ = quad_lists_supported;
   convert_quad_lists_to_triangle_lists_ =
       !quad_lists_supported ||
       cvars::force_convert_quad_lists_to_triangle_lists;
@@ -450,7 +451,11 @@ bool PrimitiveProcessor::Process(ProcessingResult& result_out) {
         }
         break;
       case xenos::PrimitiveType::kQuadList:
-        if (convert_quad_lists_to_triangle_lists_) {
+        // Live-switchable (xdroid_live) while the conversion index buffer
+        // exists: off falls back to the host quad list path.
+        if (convert_quad_lists_to_triangle_lists_ &&
+            (!quad_lists_supported_ ||
+             cvars::force_convert_quad_lists_to_triangle_lists)) {
           host_primitive_type = xenos::PrimitiveType::kTriangleList;
         }
         break;

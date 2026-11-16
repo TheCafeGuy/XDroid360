@@ -1160,6 +1160,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     device->vkGetPipelineExecutableStatisticsKHR_ =
         PFN_vkGetPipelineExecutableStatisticsKHR(ifn.vkGetDeviceProcAddr(
             device->device_, "vkGetPipelineExecutableStatisticsKHR"));
+    device->vkGetPipelineExecutableInternalRepresentationsKHR_ =
+        PFN_vkGetPipelineExecutableInternalRepresentationsKHR(
+            ifn.vkGetDeviceProcAddr(
+                device->device_,
+                "vkGetPipelineExecutableInternalRepresentationsKHR"));
     if (!device->vkGetPipelineExecutablePropertiesKHR_ ||
         !device->vkGetPipelineExecutableStatisticsKHR_) {
       device->extensions_.ext_KHR_pipeline_executable_properties = false;

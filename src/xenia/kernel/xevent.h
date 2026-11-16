@@ -48,6 +48,9 @@ class XEvent : public XObject {
   uint32_t cooperative_pulse_epoch() const override {
     return pulse_epoch_.load();
   }
+  // A fiber in a cooperative WaitAny holding this event (see Pulse).
+  void AddMultiWaiter() { multi_waiters_.fetch_add(1); }
+  void RemoveMultiWaiter() { multi_waiters_.fetch_sub(1); }
 
  protected:
   xe::threading::WaitHandle* GetWaitHandle() override { return event_.get(); }
@@ -70,6 +73,31 @@ class XEvent : public XObject {
   // Parked cooperative waiters, so Pulse knows one will consume a set.
   CooperativeWaiterFifo waiters_;
   std::atomic<uint32_t> pulse_epoch_{0};
+  // Fibers polling this event inside a cooperative WaitAny. They never park
+  // on waiters_, so without this count Pulse sees no waiter and drops it.
+  std::atomic<uint32_t> multi_waiters_{0};
+};
+
+// Counts a cooperative WaitAny fiber as a waiter on each event it holds, for
+// the life of the wait.
+class XEventMultiWaitScope {
+ public:
+  XEventMultiWaitScope(XObject** objects, uint32_t count)
+      : objects_(objects), count_(count) {
+    Each(&XEvent::AddMultiWaiter);
+  }
+  ~XEventMultiWaitScope() { Each(&XEvent::RemoveMultiWaiter); }
+
+ private:
+  void Each(void (XEvent::*op)()) {
+    for (uint32_t i = 0; objects_ && i < count_; ++i) {
+      if (objects_[i]->type() == XObject::Type::Event) {
+        (static_cast<XEvent*>(objects_[i])->*op)();
+      }
+    }
+  }
+  XObject** objects_;
+  uint32_t count_;
 };
 
 }  // namespace kernel

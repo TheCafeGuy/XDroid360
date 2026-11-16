@@ -1,0 +1,86 @@
+From: XDroid360
+Subject: [PATCH] tu: TU_DEBUG=oldbindlessinv switch, and a bindless
+ invalidate at the start of every command buffer
+
+Switch for the 0001 backport: the flag restores the sequence before c88b6eb
+(SP_UPDATE_CNTL only, on every chip), so a bench compares both on one build.
+
+Xenia never uses descriptor buffers, so the 0001 flush path never runs for
+it. It resets descriptor pools once a submission retires and gets new sets
+at the same addresses with new contents, and the bind path writes only
+SP_UPDATE_CNTL, which c88b6eb found does not drop cached descriptors. Each
+command buffer now starts with the full invalidate at its first cache flush,
+behind the same switch. Once per command buffer, not per bind: a bind inside
+a render pass goes into draw state that replays for every bin, and a set is
+never reused inside one submission.
+
+---
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index cb2bfe4..c7b0709 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -383,14 +383,20 @@ tu6_emit_flushes(struct tu_cmd_buffer *cmd_buffer,
+    if (flushes & TU_CMD_FLAG_CACHE_INVALIDATE)
+       tu_emit_event_write<CHIP>(cmd_buffer, cs, FD_CACHE_INVALIDATE);
+    if (flushes & TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE) {
+-      if (CHIP < A8XX) {
++      /* XDroid360: TU_DEBUG=oldbindlessinv keeps the sequence before
++       * c88b6eb (SP_UPDATE_CNTL only, on every chip), to A/B the fix on one
++       * build.
++       */
++      if (CHIP < A8XX || TU_DEBUG(OLD_BINDLESS_INVALIDATE)) {
+          tu_cs_emit_regs(cs, SP_UPDATE_CNTL(CHIP,
+                .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
+                .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,
+          ));
+       }
+-      tu_cs_emit_regs(cs, A6XX_SP_CS_BINDLESS_INVALIDATE(1));
+-      tu_cs_emit_regs(cs, A6XX_SP_GFX_BINDLESS_INVALIDATE(1));
++      if (!TU_DEBUG(OLD_BINDLESS_INVALIDATE)) {
++         tu_cs_emit_regs(cs, A6XX_SP_CS_BINDLESS_INVALIDATE(1));
++         tu_cs_emit_regs(cs, A6XX_SP_GFX_BINDLESS_INVALIDATE(1));
++      }
+    }
+    if (CHIP >= A7XX && flushes & TU_CMD_FLAG_BLIT_CACHE_CLEAN)
+       /* On A7XX, blit cache flushes are required to ensure blit writes are visible
+@@ -4357,6 +4363,16 @@ tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
+ 
+    tu_cache_init(&cmd_buffer->state.cache);
+    tu_cache_init(&cmd_buffer->state.renderpass_cache);
++   /* XDroid360: drop cached bindless descriptors once per command buffer.
++    * Xenia resets descriptor pools after a submission retires and gets new
++    * sets at the same addresses with new contents; only descriptor buffer
++    * barriers take the 0001 flush. Once here, not per bind: a bind inside a
++    * render pass lands in draw state that replays for every bin.
++    * TU_DEBUG=oldbindlessinv turns it off.
++    */
++   if (!TU_DEBUG(OLD_BINDLESS_INVALIDATE))
++      cmd_buffer->state.cache.flush_bits |=
++         TU_CMD_FLAG_BINDLESS_DESCRIPTOR_INVALIDATE;
+    cmd_buffer->usage_flags = pBeginInfo->flags;
+ 
+    tu_cs_begin(&cmd_buffer->cs);
+diff --git a/src/freedreno/vulkan/tu_util.cc b/src/freedreno/vulkan/tu_util.cc
+index 598c3dc..6107564 100644
+--- a/src/freedreno/vulkan/tu_util.cc
++++ b/src/freedreno/vulkan/tu_util.cc
+@@ -57,6 +57,7 @@ static const struct debug_control tu_debug_options[] = {
+    { "nocb", TU_DEBUG_NO_CONCURRENT_BINNING },
+    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
+    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
++   { "oldbindlessinv", TU_DEBUG_OLD_BINDLESS_INVALIDATE },
+    { NULL, 0 }
+ };
+ 
+diff --git a/src/freedreno/vulkan/tu_util.h b/src/freedreno/vulkan/tu_util.h
+index f73c1f9..9dbfc1a 100644
+--- a/src/freedreno/vulkan/tu_util.h
++++ b/src/freedreno/vulkan/tu_util.h
+@@ -75,6 +75,7 @@ enum tu_debug_flags : uint64_t
+    TU_DEBUG_NO_CONCURRENT_BINNING    = BITFIELD64_BIT(35),
+    TU_DEBUG_FORCE_CONCURRENT_BINNING = BITFIELD64_BIT(36),
+    TU_DEBUG_COMPUTE_ROUND_ROBIN      = BITFIELD64_BIT(37),
++   TU_DEBUG_OLD_BINDLESS_INVALIDATE  = BITFIELD64_BIT(38),
+ };
+ 
+ struct tu_env {

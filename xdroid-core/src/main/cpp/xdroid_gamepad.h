@@ -55,6 +55,8 @@ class XDroidGamepadDriver : public xe::hid::InputDriver {
   static void SetButton(uint16_t mask, bool down);
   // Raw Android axis value: sticks -1..1 (Y down), triggers 0..1.
   static void SetAxis(GamepadAxis axis, float value);
+  // Any thread: the current state, axes as SetAxis takes them (pad recorder).
+  static void Snapshot(uint16_t& buttons, float axes[6]);
 };
 
 }  // namespace xdroid

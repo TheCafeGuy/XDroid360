@@ -9,7 +9,9 @@
 
 #include "xenia/gpu/draw_extent_estimator.h"
 
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/cvar.h"
@@ -266,6 +268,257 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
           ((rb_surface_info.msaa_samples == xenos::MsaaSamples::k1X) ? 127
                                                                      : 255)) >>
          8;
+}
+
+void DrawExtentEstimator::PositionExportSink::Export(
+    ucode::ExportRegister export_register, const float* value,
+    uint32_t value_mask) {
+  if (export_register == ucode::ExportRegister::kVSPosition) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (1u << i)) {
+        position_[i] = value[i];
+      }
+    }
+    position_mask_ |= value_mask;
+  } else if (export_register ==
+             ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex) {
+    if ((value_mask & 0b0100) &&
+        (xe::memory::Reinterpret<uint32_t>(value[2]) & ~(UINT32_C(1) << 31))) {
+      vertex_kill_ = true;
+    }
+  }
+}
+
+bool DrawExtentEstimator::EstimateRectangleCover(const Shader& vertex_shader,
+                                                 int32_t& left, int32_t& top,
+                                                 int32_t& right,
+                                                 int32_t& bottom) {
+  SCOPE_profile_cpu_f("gpu");
+  const RegisterFile& regs = register_file_;
+
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  uint32_t vertex_count;
+  if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kRectangleList) {
+    vertex_count = 3;
+  } else if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kQuadList) {
+    vertex_count = 4;
+  } else {
+    return RejectRectangleCover(kRejectPrimitive);
+  }
+  if (vgt_draw_initiator.num_indices != vertex_count ||
+      (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
+       vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex)) {
+    return RejectRectangleCover(kRejectVertexCount);
+  }
+  // A clipped draw keeps its whole shape only when every vertex is inside
+  // the clip volume (checked per vertex below) and no user plane is on.
+  auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
+  const bool clipped = !pa_cl_clip_cntl.clip_disable;
+  if (clipped && (pa_cl_clip_cntl.value & 0b111111)) {
+    return RejectRectangleCover(kRejectClipped);
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode,
+                                 vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return RejectRectangleCover(kRejectTessellated);
+  }
+  if (!vertex_shader.is_ucode_analyzed() ||
+      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return RejectRectangleCover(kRejectShader);
+  }
+
+  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+  const void* index_buffer = nullptr;
+  xenos::Endian index_endian = vgt_dma_size.swap_mode;
+  const bool index_16 =
+      vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    if (vgt_dma_size.num_words < vertex_count) {
+      return RejectRectangleCover(kRejectIndices);
+    }
+    uint32_t index_buffer_base = xenos::CpuToGpu(regs[XE_GPU_REG_VGT_DMA_BASE]);
+    if (index_16) {
+      if (index_endian == xenos::Endian::k8in32) {
+        index_endian = xenos::Endian::k8in16;
+      } else if (index_endian == xenos::Endian::k16in32) {
+        index_endian = xenos::Endian::kNone;
+      }
+      index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
+    } else {
+      index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
+    }
+    if (trace_writer_) {
+      trace_writer_->WriteMemoryRead(
+          index_buffer_base,
+          uint32_t(index_16 ? sizeof(uint16_t) : sizeof(uint32_t)) *
+              vertex_count);
+    }
+    index_buffer = memory_.TranslatePhysical(index_buffer_base);
+  }
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  uint32_t reset_index =
+      regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const float scale_x = pa_cl_vte_cntl.vport_x_scale_ena
+                            ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)
+                            : 1.0f;
+  const float offset_x = pa_cl_vte_cntl.vport_x_offset_ena
+                             ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET)
+                             : 0.0f;
+  const float scale_y = pa_cl_vte_cntl.vport_y_scale_ena
+                            ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)
+                            : 1.0f;
+  const float offset_y = pa_cl_vte_cntl.vport_y_offset_ena
+                             ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)
+                             : 0.0f;
+  // Half-pixel and window offsets, added after the viewport transform.
+  auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  float add_x = 0.0f, add_y = 0.0f;
+  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center ==
+      xenos::PixelCenter::kD3DZero) {
+    add_x += 0.5f;
+    add_y += 0.5f;
+  }
+  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
+    add_x += float(pa_sc_window_offset.window_x_offset);
+    add_y += float(pa_sc_window_offset.window_y_offset);
+  }
+
+  float xs[4], ys[4];
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionExportSink sink;
+  shader_interpreter_.SetExportSink(&sink);
+  bool ok = true;
+  bool clip_rejected = false;
+  for (uint32_t i = 0; i < vertex_count; ++i) {
+    uint32_t vertex_index = i;
+    if (index_buffer) {
+      vertex_index = index_16 ? static_cast<const uint16_t*>(index_buffer)[i]
+                              : static_cast<const uint32_t*>(index_buffer)[i];
+      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
+      if (pa_su_sc_mode_cntl.multi_prim_ib_ena && vertex_index == reset_index) {
+        ok = false;
+        break;
+      }
+    }
+    vertex_index =
+        std::min(max_index,
+                 std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if (sink.vertex_kill_ || (sink.position_mask_ & 0b0011) != 0b0011) {
+      ok = false;
+      break;
+    }
+    float x = sink.position_[0], y = sink.position_[1];
+    if (clipped) {
+      // Inside the view volume: -w <= x, y <= w, and 0 (D3D) or -w <= z <= w.
+      const float w = sink.position_[3], z = sink.position_[2];
+      if ((sink.position_mask_ & 0b1111) != 0b1111 ||
+          pa_cl_vte_cntl.vtx_xy_fmt || !(w > 0.0f) || !(std::abs(x) <= w) ||
+          !(std::abs(y) <= w) || !(z <= w) ||
+          !(pa_cl_clip_cntl.dx_clip_space_def ? z >= 0.0f : z >= -w)) {
+        clip_rejected = true;
+        ok = false;
+        break;
+      }
+    }
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      if (!(sink.position_mask_ & 0b1000) || !(sink.position_[3] > 0.0f)) {
+        ok = false;
+        break;
+      }
+      x /= sink.position_[3];
+      y /= sink.position_[3];
+    }
+    xs[i] = x * scale_x + offset_x + add_x;
+    ys[i] = y * scale_y + offset_y + add_y;
+    if (!std::isfinite(xs[i]) || !std::isfinite(ys[i])) {
+      ok = false;
+      break;
+    }
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!ok) {
+    return RejectRectangleCover(clip_rejected ? kRejectClipped : kRejectVertex);
+  }
+
+  // Axis-aligned: every corner takes one of two X and one of two Y values,
+  // and at least 3 of the 4 combinations appear (a rectangle list gives 3).
+  float x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
+  for (uint32_t i = 1; i < vertex_count; ++i) {
+    x0 = std::min(x0, xs[i]);
+    x1 = std::max(x1, xs[i]);
+    y0 = std::min(y0, ys[i]);
+    y1 = std::max(y1, ys[i]);
+  }
+  bool seen_corner[4] = {};
+  for (uint32_t i = 0; i < vertex_count; ++i) {
+    if ((xs[i] != x0 && xs[i] != x1) || (ys[i] != y0 && ys[i] != y1)) {
+      return RejectRectangleCover(kRejectNotAxisAligned);
+    }
+    seen_corner[(xs[i] == x1 ? 1 : 0) | (ys[i] == y1 ? 2 : 0)] = true;
+  }
+  uint32_t corners = 0;
+  for (bool corner : seen_corner) {
+    corners += corner ? 1 : 0;
+  }
+  if (corners < 3 || !(x1 > x0) || !(y1 > y0)) {
+    return RejectRectangleCover(kRejectNotAxisAligned);
+  }
+
+  // Pixels whose every sample is inside. Without MSAA the center (x + 0.5)
+  // must be in [x0, x1) (top-left rule); with MSAA the whole pixel must be,
+  // which holds for any sample pattern.
+  const bool msaa =
+      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k1X;
+  const float limit = float(xenos::kTexture2DCubeMaxWidthHeight * 2);
+  x0 = std::max(-limit, std::min(limit, x0));
+  x1 = std::max(-limit, std::min(limit, x1));
+  y0 = std::max(-limit, std::min(limit, y0));
+  y1 = std::max(-limit, std::min(limit, y1));
+  if (msaa) {
+    left = int32_t(std::ceil(x0));
+    top = int32_t(std::ceil(y0));
+    right = int32_t(std::floor(x1));
+    bottom = int32_t(std::floor(y1));
+  } else {
+    left = int32_t(std::ceil(x0 - 0.5f));
+    top = int32_t(std::ceil(y0 - 0.5f));
+    right = int32_t(std::ceil(x1 - 0.5f));
+    bottom = int32_t(std::ceil(y1 - 0.5f));
+  }
+
+  // Scissors.
+  auto window_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+  auto window_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+  int32_t scissor_left = int32_t(window_tl.tl_x);
+  int32_t scissor_top = int32_t(window_tl.tl_y);
+  int32_t scissor_right = int32_t(window_br.br_x);
+  int32_t scissor_bottom = int32_t(window_br.br_y);
+  if (!window_tl.window_offset_disable) {
+    scissor_left += pa_sc_window_offset.window_x_offset;
+    scissor_right += pa_sc_window_offset.window_x_offset;
+    scissor_top += pa_sc_window_offset.window_y_offset;
+    scissor_bottom += pa_sc_window_offset.window_y_offset;
+  }
+  auto screen_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+  auto screen_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+  left = std::max(left, std::max(scissor_left, int32_t(screen_tl.tl_x)));
+  top = std::max(top, std::max(scissor_top, int32_t(screen_tl.tl_y)));
+  right = std::min(right, std::min(scissor_right, int32_t(screen_br.br_x)));
+  bottom = std::min(bottom, std::min(scissor_bottom, int32_t(screen_br.br_y)));
+  if (!(right > left && bottom > top)) {
+    return RejectRectangleCover(kRejectScissored);
+  }
+  ++rectangle_cover_counts[kCovered];
+  return true;
 }
 
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,

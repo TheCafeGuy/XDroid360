@@ -92,6 +92,15 @@ inline SpinSite* FindSpinSite(uint32_t pc) {
   return nullptr;
 }
 
+// PERF-H1: the GPU write-back generation a db16cyc sled saw last, per sled
+// (guest_spin_wfe, a64_seq_memory.cc). Sleds that hash to the same word, or
+// threads sharing one, only cost one skipped or one extra <=100 us wait.
+inline std::atomic<uint32_t>* SpinWfeSeen(uint32_t pc) {
+  constexpr size_t kWords = 256;
+  static std::atomic<uint32_t> seen[kWords];
+  return &seen[size_t((pc >> 2) * 2654435761u) % kWords];
+}
+
 }  // namespace threading
 }  // namespace xe
 
