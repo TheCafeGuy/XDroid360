@@ -118,7 +118,8 @@ thread freed its Capture, before the device goes away.
   `adb shell cat` every 1 s while no stream runs (trimmed, exactly 64 lowercase hex = server + client
   keys, else only its own unpublished keys pass). The in-game switch "PC mirror (experimental)"
   writes a new token on every switch-on, sets the live cvars itself (port 27360) and deletes the file
-  on switch-off. No token: window and console say to turn the switch on. Either order works; at exit
+  on switch-off. The library's switch of the same name (pref `pc_mirror`) makes every game
+  turn the in-game switch on at its first frame, so no touch menu is needed with a pad. No token: window and console say to turn the switch on. Either order works; at exit
   the viewer removes only the reverse (the switch owns the cvars).
 - Connect order: video first, then audio; the app serves a viewer only when both handshakes pass.
   kPong goes on the audio socket whichever socket carried the kPing (no pong behind a large AU).

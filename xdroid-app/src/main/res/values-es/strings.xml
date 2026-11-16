@@ -12,6 +12,7 @@
     <string name="resume">Reanudar</string>
     <string name="report_glitch">Reportar glitch</string>
     <string name="pc_mirror">Espejo a PC (experimental)</string>
+    <string name="pc_mirror_hint">Los juegos arrancan con el espejo prendido. Necesita xdroid-viewer en una PC, por USB.</string>
     <string name="exit_game">Salir del juego</string>
     <string name="exit_title">¿Salir del juego?</string>
     <string name="exit_message">Se pierde el progreso desde el último guardado.</string>

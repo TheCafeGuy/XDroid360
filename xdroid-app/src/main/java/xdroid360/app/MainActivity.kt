@@ -61,6 +61,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.Image
@@ -89,6 +90,7 @@ class MainActivity : ComponentActivity() {
   private val games = mutableStateListOf<GameEntry>()
   private val store by lazy { ConfigStore(File(filesDir, "xdroid").apply { mkdirs() }) }
   private var diagnostics by mutableStateOf(true)
+  private var pcMirror by mutableStateOf(false)  // Games start with the PC mirror on.
   private val covers by lazy { CoverStore(File(filesDir, "xdroid/covers")) }
   private var coverRevision by mutableStateOf(0)
   @Volatile private var coverScanRunning = false
@@ -107,6 +109,7 @@ class MainActivity : ComponentActivity() {
     ensureStorageAccess()
     firstRunDefaults()
     diagnostics = Diagnostics.enabled(store.globalFile.parentFile!!)
+    pcMirror = prefs().getBoolean("pc_mirror", false)
     // An install the app was killed during leaves its staging copy (and maybe
     // a replaced one) behind; queued behind any install still running.
     installExecutor.execute {
@@ -277,6 +280,10 @@ class MainActivity : ComponentActivity() {
         },
         label = { Text(if (diagnostics) "Diagnostics on" else "Diagnostics off") },
       )
+    }
+    SwitchRow(stringResource(R.string.pc_mirror), pcMirror, stringResource(R.string.pc_mirror_hint)) {
+      pcMirror = it
+      prefs().edit().putBoolean("pc_mirror", it).apply()
     }
     val shown =
       games

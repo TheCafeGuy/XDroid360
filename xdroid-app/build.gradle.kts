@@ -91,11 +91,11 @@ android {
     defaultConfig {
         // One app on the phone: test builds share the release id and key, so
         // each build (test or release) installs over the previous one.
-        // Keep versionCode >= the latest public release (v0.2.0 = 4, v0.2.1 = 5, v0.3.0 = 6).
+        // Keep versionCode >= the latest public release (v0.2.0 = 4, v0.2.1 = 5, v0.3.0 = 7; its first upload was 6).
         applicationId = "io.github.thecafeguy.xdroid360"
         minSdk = 29
         targetSdk = 35
-        versionCode = 6
+        versionCode = 7
         versionName = "0.3.0"
     }
 

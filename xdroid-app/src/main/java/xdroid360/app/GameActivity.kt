@@ -598,6 +598,8 @@ class GameActivity : ComponentActivity() {
     if (frameNumber > 0 && !liveReady) {
       liveReady = true
       tv.ready()
+      // The library's switch: every game starts with the PC mirror on.
+      if (prefs().getBoolean("pc_mirror", false)) runOnUiThread { if (!tv.active) setPcMirror(true) }
     }
 
     fpsHistory.addLast(fps)
