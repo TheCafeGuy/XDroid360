@@ -112,10 +112,11 @@ int32_t XEvent::Pulse(uint32_t priority_increment, bool wait) {
     const uint32_t n = cases.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool deliver = cvars::xdroid_pulse_multi_waiters;
     if (n <= 16 || !(n & (n - 1))) {
-      XELOGW("XDROID-PULSE: auto-reset event {:08X} pulsed with {} WaitAny "
-             "waiter(s), case {}: {}",
-             handle(), multi_waiters_.load(), n,
-             deliver ? "delivered as a set" : "dropped");
+      XELOGW(
+          "XDROID-PULSE: auto-reset event {:08X} pulsed with {} WaitAny "
+          "waiter(s), case {}: {}",
+          handle(), multi_waiters_.load(), n,
+          deliver ? "delivered as a set" : "dropped");
     }
     if (deliver) {
       Set(priority_increment, wait);

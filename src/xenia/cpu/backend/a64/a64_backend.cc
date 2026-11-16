@@ -859,18 +859,21 @@ constexpr int kExclusiveRetry = 2;
 // One asm block, so no compiler-placed access lands inside the window.
 // Returns kExclusiveStored, kExclusiveMismatch (generation or value changed
 // since lwarx) or kExclusiveRetry (the exclusive store failed).
-#define XDROID_RESERVE_WINDOW_ASM(R)                                   \
-  "ldaxr %" R "[old], [%[data]]\n"                                     \
-  "ldr %w[gen], [%[generation]]\n"                                     \
-  "mov %w[status], #1\n"                                               \
-  "cmp %w[gen], %w[expected_gen]\n"                                    \
-  "b.ne 1f\n"                                                          \
-  "cmp %" R "[old], %" R "[expected]\n"                                \
-  "b.ne 1f\n"                                                          \
-  "stlxr %w[status], %" R "[value], [%[data]]\n"                       \
-  "lsl %w[status], %w[status], #1\n"                                   \
-  "b 2f\n"                                                             \
-  "1: clrex\n"                                                         \
+#define XDROID_RESERVE_WINDOW_ASM(R) \
+  "ldaxr %" R                        \
+  "[old], [%[data]]\n"               \
+  "ldr %w[gen], [%[generation]]\n"   \
+  "mov %w[status], #1\n"             \
+  "cmp %w[gen], %w[expected_gen]\n"  \
+  "b.ne 1f\n"                        \
+  "cmp %" R "[old], %" R             \
+  "[expected]\n"                     \
+  "b.ne 1f\n"                        \
+  "stlxr %w[status], %" R            \
+  "[value], [%[data]]\n"             \
+  "lsl %w[status], %w[status], #1\n" \
+  "b 2f\n"                           \
+  "1: clrex\n"                       \
   "2:\n"
 template <typename T>
 int StoreIfReservationHolds(T* data, T expected, T value,

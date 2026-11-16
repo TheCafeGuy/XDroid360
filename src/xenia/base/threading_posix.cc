@@ -69,12 +69,13 @@ DEFINE_bool(wfe_precise_sleep, false,
 #endif
 
 #include "xenia/base/cvar.h"
-DEFINE_uint32(xdroid_wait_block_contended, 1,
-              "XDroid360 G5-3: a multi-object wait that finds a handle locked "
-              "sleeps on that lock instead of yielding, and signals wake "
-              "multi-waiters after unlocking. 0 = old spin-yield path (a woken "
-              "higher-priority waiter could starve the signaler ~100 ms). Live.",
-              "CPU");
+DEFINE_uint32(
+    xdroid_wait_block_contended, 1,
+    "XDroid360 G5-3: a multi-object wait that finds a handle locked "
+    "sleeps on that lock instead of yielding, and signals wake "
+    "multi-waiters after unlocking. 0 = old spin-yield path (a woken "
+    "higher-priority waiter could starve the signaler ~100 ms). Live.",
+    "CPU");
 
 #if XE_PLATFORM_LINUX
 // SIGEV_THREAD_ID in timer_create(...) is a Linux extension

@@ -1335,8 +1335,8 @@ bool VulkanTextureCache::BeginResolveLink(
     if (IsSignedVersionSeparateForFormat(key)) {
       host_format_is_signed = bool(key.signed_separate);
     } else {
-      host_format_is_signed =
-          host_format_pair.format_unsigned.load_shader == kLoadShaderIndexUnknown;
+      host_format_is_signed = host_format_pair.format_unsigned.load_shader ==
+                              kLoadShaderIndexUnknown;
     }
     const HostFormat& host_format = host_format_is_signed
                                         ? host_format_pair.format_signed

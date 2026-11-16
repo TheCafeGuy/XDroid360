@@ -15,8 +15,8 @@
 #include "xenia/base/bit_range.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/profiling.h"
-#include "xenia/gpu/xdroid_gpu_hooks.h"
 #include "xenia/base/xxhash.h"
+#include "xenia/gpu/xdroid_gpu_hooks.h"
 
 namespace xe {
 namespace gpu {
@@ -730,8 +730,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
-  if (auto on_guest_write = GetXdroidGpuHooks().on_guest_write.load(
-          std::memory_order_relaxed)) {
+  if (auto on_guest_write =
+          GetXdroidGpuHooks().on_guest_write.load(std::memory_order_relaxed)) {
     on_guest_write(physical_address_start);
   }
 

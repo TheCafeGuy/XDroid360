@@ -282,10 +282,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     image = vrt->image();
     view_depth_color = vrt->view_depth_color();
     const xenos::MsaaSamples msaa = rt->key().msaa_samples;
-    samples = msaa == xenos::MsaaSamples::k1X ? VK_SAMPLE_COUNT_1_BIT
-              : msaa == xenos::MsaaSamples::k2X && msaa_2x_attachments_supported_
-                  ? VK_SAMPLE_COUNT_2_BIT
-                  : VK_SAMPLE_COUNT_4_BIT;
+    samples =
+        msaa == xenos::MsaaSamples::k1X ? VK_SAMPLE_COUNT_1_BIT
+        : msaa == xenos::MsaaSamples::k2X && msaa_2x_attachments_supported_
+            ? VK_SAMPLE_COUNT_2_BIT
+            : VK_SAMPLE_COUNT_4_BIT;
     return true;
   }
 

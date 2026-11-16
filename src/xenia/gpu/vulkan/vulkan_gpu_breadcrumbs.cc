@@ -141,8 +141,8 @@ void VulkanGpuBreadcrumbs::OnWorkBegin(DeferredCommandBuffer& command_buffer,
       work.detail_count) {
     // Linear probe on the pipeline key; a slot is empty while its count is 0
     // (a 1x k_8_8_8_8 color dump key is 0). A full table drops new keys.
-    VariantCount* table = kind == WorkKind::kDump ? dump_variants_
-                                                  : direct_resolve_variants_;
+    VariantCount* table =
+        kind == WorkKind::kDump ? dump_variants_ : direct_resolve_variants_;
     const uint32_t key = work.detail[0];
     for (uint32_t i = 0; i < kVariantCountSlots; ++i) {
       VariantCount& variant = table[(key + i) % kVariantCountSlots];

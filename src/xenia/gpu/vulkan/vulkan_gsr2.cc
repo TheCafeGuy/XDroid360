@@ -350,13 +350,12 @@ bool VulkanGsr2::EnsureInitialized(
       const uint32_t* code;
       size_t size;
       VkPipeline* pipeline;
-    } shaders[] = {
-        {shaders::sgsr2_depth_cs, sizeof(shaders::sgsr2_depth_cs),
-         &depth_pipeline_},
-        {shaders::sgsr2_convert_cs, sizeof(shaders::sgsr2_convert_cs),
-         &convert_pipeline_},
-        {shaders::sgsr2_upscale_cs, sizeof(shaders::sgsr2_upscale_cs),
-         &upscale_pipeline_}};
+    } shaders[] = {{shaders::sgsr2_depth_cs, sizeof(shaders::sgsr2_depth_cs),
+                    &depth_pipeline_},
+                   {shaders::sgsr2_convert_cs,
+                    sizeof(shaders::sgsr2_convert_cs), &convert_pipeline_},
+                   {shaders::sgsr2_upscale_cs,
+                    sizeof(shaders::sgsr2_upscale_cs), &upscale_pipeline_}};
     for (auto& s : shaders) {
       VkShaderModule module =
           ui::vulkan::util::CreateShaderModule(vulkan_device, s.code, s.size);
@@ -467,9 +466,8 @@ void VulkanGsr2::CopyDepth(DeferredCommandBuffer& cb, VkImage depth_image,
   }
 
   // Descriptors 10 (MS depth) and 11 (R32F destination) of this slot.
-  VkDescriptorImageInfo src = {
-      nearest_sampler_, depth_view,
-      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+  VkDescriptorImageInfo src = {nearest_sampler_, depth_view,
+                               VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
   VkDescriptorImageInfo dst = {VK_NULL_HANDLE, depth_.view,
                                VK_IMAGE_LAYOUT_GENERAL};
   VkWriteDescriptorSet w[2] = {};

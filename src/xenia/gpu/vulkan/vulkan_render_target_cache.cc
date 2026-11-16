@@ -1613,8 +1613,8 @@ bool VulkanRenderTargetCache::Resolve(
           command_processor_.TagDispatch(
               VulkanGpuBreadcrumbs::WorkKind::kResolveCopy);
           if (!(cvars::xdroid_resolve_skip & 4)) {
-            command_buffer.CmdVkDispatch(copy_group_count_x,
-                                         copy_group_count_y, 1);
+            command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y,
+                                         1);
           }
 
           // Make the scaled resolve buffer write visible to later reads.
@@ -1884,10 +1884,9 @@ std::string VulkanRenderTargetCache::TakeTransferPairCensus(double frames) {
   auto describe = [](uint32_t key_high) {
     RenderTargetKey key;
     key.key = key_high << 11;
-    return fmt::format("{}{}x{}p{}", key.is_depth ? "d" : "c",
-                       uint32_t(key.resource_format),
-                       1u << uint32_t(key.msaa_samples),
-                       uint32_t(key.pitch_tiles_at_32bpp));
+    return fmt::format(
+        "{}{}x{}p{}", key.is_depth ? "d" : "c", uint32_t(key.resource_format),
+        1u << uint32_t(key.msaa_samples), uint32_t(key.pitch_tiles_at_32bpp));
   };
   std::string line;
   for (size_t i = 0; i < std::min(pairs.size(), size_t(8)); ++i) {

@@ -3145,8 +3145,8 @@ void VulkanPipelineCache::MaybeSaveVkPipelineCache(bool may_write) {
   constexpr auto kMinInterval = std::chrono::seconds(30);
   // A pipeline created synchronously on the draw thread counts, but the save
   // waits for a creation thread: vkGetPipelineCacheData copies ~20 MB under
-  // the driver's cache lock (the maintainer's mission 2026-10-19: a 200 ms frame when
-  // the draw thread saved).
+  // the driver's cache lock (the maintainer's mission 2026-10-19: a 200 ms
+  // frame when the draw thread saved).
   if (vk_pipeline_cache_unsaved_.fetch_add(1, std::memory_order_relaxed) + 1 <
           kMinNewPipelines ||
       !may_write || t_is_draw_thread) {

@@ -56,7 +56,8 @@ std::pair<uint64_t, uint64_t> guest_tick_ratio_ = std::make_pair(1, 1);
 uint64_t last_guest_tick_count_ = 0;
 // Last sampled host tick count.
 uint64_t last_host_tick_count_ = Clock::QueryHostTickCount();
-// XDroid360: guest clocks frozen (Clock::HoldGuestTime). Guarded by tick_mutex_.
+// XDroid360: guest clocks frozen (Clock::HoldGuestTime). Guarded by
+// tick_mutex_.
 bool guest_time_held_ = false;
 
 using tick_mutex_type = std::mutex;
@@ -109,10 +110,10 @@ uint64_t UpdateGuestClock() {
                                    ? host_tick_count - last_host_tick_count_
                                    : 0;
     last_host_tick_count_ = host_tick_count;
-    uint64_t guest_tick_delta =
-        guest_time_held_ ? 0
-                         : host_tick_delta * guest_tick_ratio_.first /
-                               guest_tick_ratio_.second;
+    uint64_t guest_tick_delta = guest_time_held_ ? 0
+                                                 : host_tick_delta *
+                                                       guest_tick_ratio_.first /
+                                                       guest_tick_ratio_.second;
     last_guest_tick_count_ += guest_tick_delta;
     return last_guest_tick_count_;
   } else {

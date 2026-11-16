@@ -514,9 +514,9 @@ void TextureCache::UpdateLinkCandidates(Texture& texture, bool add) {
   uint32_t level_last =
       key.mip_page ? std::min(layout.max_level, layout.packed_level) : 0;
   for (uint32_t level = key.base_page ? 0 : 1; level <= level_last; ++level) {
-    uint32_t address = level ? (uint32_t(key.mip_page) << 12) +
-                                   layout.mip_offsets_bytes[level]
-                             : uint32_t(key.base_page) << 12;
+    uint32_t address =
+        level ? (uint32_t(key.mip_page) << 12) + layout.mip_offsets_bytes[level]
+              : uint32_t(key.base_page) << 12;
     if (address & 0xFFF) {
       continue;
     }
@@ -538,7 +538,7 @@ TextureCache::XdroidLoadState TextureCache::XdroidGetLoadState(
     uint32_t fetch_constant_index) const {
   XdroidLoadState state;
   const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
-  const Texture* texture = !binding          ? nullptr
+  const Texture* texture = !binding           ? nullptr
                            : binding->texture ? binding->texture
                                               : binding->texture_signed;
   if (!texture) {
@@ -546,14 +546,13 @@ TextureCache::XdroidLoadState TextureCache::XdroidGetLoadState(
   }
   state.bound = true;
   state.kind = texture->probe_.last_load_kind;
-  state.flags = uint8_t(
-      uint32_t(texture->base_outdated_lockless()) |
-      uint32_t(texture->mips_outdated_lockless()) << 1 |
-      uint32_t(shared_memory().IsRangeAnyGpuWritten(
-          uint32_t(texture->key().base_page) << 12,
-          texture->GetGuestBaseSize()))
-          << 2 |
-      uint32_t(texture->key().scaled_resolve) << 3);
+  state.flags = uint8_t(uint32_t(texture->base_outdated_lockless()) |
+                        uint32_t(texture->mips_outdated_lockless()) << 1 |
+                        uint32_t(shared_memory().IsRangeAnyGpuWritten(
+                            uint32_t(texture->key().base_page) << 12,
+                            texture->GetGuestBaseSize()))
+                            << 2 |
+                        uint32_t(texture->key().scaled_resolve) << 3);
   state.age = uint32_t(probe_frame() - texture->probe_.last_load_frame);
   state.base_hash = texture->census_.base_hash;
   return state;

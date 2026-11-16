@@ -2504,8 +2504,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
 
   // XDroid360 GSR2: upscale the 720p frame to the output size in the swap
   // when this frame had a world pass with depth and camera data.
-  gsr2_on_ =
-      VulkanGsr2::IsOn(kernel_state_ ? kernel_state_->title_id() : 0);
+  gsr2_on_ = VulkanGsr2::IsOn(kernel_state_ ? kernel_state_->title_id() : 0);
   const bool gsr2_run = gsr2_on_ && gsr2_.FrameReady();
   bool gsr2_ran = false;
   uint32_t out_width = frontbuffer_width_scaled;
@@ -2549,8 +2548,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                 xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
-        bool use_fxaa = gsr2_run ||
-                        swap_post_effect == SwapPostEffect::kFxaa ||
+        bool use_fxaa = gsr2_run || swap_post_effect == SwapPostEffect::kFxaa ||
                         swap_post_effect == SwapPostEffect::kFxaaExtreme;
 
         if (use_fxaa) {

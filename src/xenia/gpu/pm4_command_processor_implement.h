@@ -94,8 +94,8 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
     ++xdroid_ib_depth_;
 
     // Execute commands!
-    new (&reader_) RingBuffer(memory_->TranslatePhysical(ptr),
-                              count * sizeof(uint32_t));
+    new (&reader_)
+        RingBuffer(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
     reader_.set_write_offset(count * sizeof(uint32_t));
     // prefetch the wraparound range
     // it likely is already in L3 cache, but in a zen system it may be another

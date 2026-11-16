@@ -485,8 +485,8 @@ void NoteResolveFrame() {
     std::string destinations;
     for (const auto& destination : resolve_read_destinations_) {
       if (destinations.size() < 160) {
-        destinations += fmt::format(" {:08X}x{}", destination.first,
-                                    destination.second);
+        destinations +=
+            fmt::format(" {:08X}x{}", destination.first, destination.second);
       }
     }
     XELOGI(
