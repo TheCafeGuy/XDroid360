@@ -80,7 +80,8 @@ Expect bugs, crashes and missing features. See [Known issues](#known-issues).
 - **Play on a Windows PC over the USB cable**, with sound. The phone encodes the game picture and our
   own viewer shows it; the phone screen goes black and its speaker mutes while the viewer is
   connected.
-- Turn on **PC mirror (experimental)** in the in-game menu and start `xdroid-viewer.exe` on the PC,
+- Turn on **PC mirror (experimental)** in the library (every game then starts with the mirror on,
+  handy with a controller connected) or in the in-game menu, and start `xdroid-viewer.exe` on the PC,
   in either order. The viewer is an optional download in each release (unsigned, SHA-256 in the
   release notes); its full source is in `xdroid-viewer/` if you prefer to build it.
 - Needs USB debugging on the phone and Google's platform-tools (`adb`) on the PC.

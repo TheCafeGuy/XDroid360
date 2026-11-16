@@ -12,6 +12,7 @@
     <string name="resume">Resume</string>
     <string name="report_glitch">Report glitch</string>
     <string name="pc_mirror">PC mirror (experimental)</string>
+    <string name="pc_mirror_hint">Games start with the mirror on. Needs xdroid-viewer on a PC, over USB.</string>
     <string name="exit_game">Exit game</string>
     <string name="exit_title">Exit game?</string>
     <string name="exit_message">Progress since the last save will be lost.</string>
